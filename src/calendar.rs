@@ -12,6 +12,19 @@ pub const CALENDAR_URL: &str = "https://nfs.faireconomy.media/ff_calendar_thiswe
 /// Default file name for the local disk cache.
 pub const DEFAULT_CACHE_FILENAME: &str = "economic_calendar.json";
 
+/// Default User-Agent header used for calendar HTTP requests.
+///
+/// FairEconomy / ForexFactory endpoints block generic bot User-Agents (including the default
+/// reqwest header) with HTTP 403. This standard browser User-Agent is used by default to ensure
+/// reliable retrieval.
+///
+/// Note: Scraping third-party feeds under a spoofed browser User-Agent carries ToS and reliability
+/// risks if upstream providers employ more aggressive fingerprinting or rate limiting.
+/// Callers who prefer explicit custom identification or compliant client configurations can use
+/// [`CalendarClient::with_options`] or [`CalendarClient::with_user_agent`].
+pub const DEFAULT_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
 /// Metadata associated with cached economic calendar data.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CacheMetadata {
@@ -98,7 +111,7 @@ impl CalendarClient {
         Self::with_options(
             Client::builder()
                 .timeout(Duration::from_secs(30))
-                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .user_agent(DEFAULT_USER_AGENT)
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             CALENDAR_URL,
@@ -113,13 +126,28 @@ impl CalendarClient {
         Self::with_options(
             Client::builder()
                 .timeout(Duration::from_secs(30))
-                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .user_agent(DEFAULT_USER_AGENT)
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             CALENDAR_URL,
             None,
             Duration::from_secs(30),
         )
+    }
+
+    /// Create a new `CalendarClient` with a custom User-Agent string.
+    pub fn with_user_agent(cache_dir: Option<PathBuf>, user_agent: &str) -> Result<Self> {
+        let dir = cache_dir.or_else(|| Some(Self::default_cache_dir()));
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .user_agent(user_agent)
+            .build()?;
+        Ok(Self::with_options(
+            client,
+            CALENDAR_URL,
+            dir,
+            Duration::from_secs(30),
+        ))
     }
 
     /// Create with custom options.
@@ -201,9 +229,9 @@ impl CalendarClient {
         }
 
         let now = Utc::now();
-        let expires_at = self.cache_ttl.and_then(|ttl| {
-            chrono::Duration::from_std(ttl).ok().map(|d| now + d)
-        });
+        let expires_at = self
+            .cache_ttl
+            .and_then(|ttl| chrono::Duration::from_std(ttl).ok().map(|d| now + d));
 
         let cached_data = CachedCalendarData {
             metadata: CacheMetadata {
@@ -326,7 +354,10 @@ pub fn parse_event_datetime(raw: &RawCalendarEvent) -> Option<DateTime<Utc>> {
 
     // 3. Handle "All Day" or "Tentative" events
     if raw.is_all_day() || raw.is_tentative() {
-        let date_part = date_trimmed.split_whitespace().next().unwrap_or(date_trimmed);
+        let date_part = date_trimmed
+            .split_whitespace()
+            .next()
+            .unwrap_or(date_trimmed);
         let date_formats = ["%Y-%m-%d", "%m-%d-%Y", "%m/%d/%Y", "%Y/%m/%d"];
         for fmt in date_formats {
             if let Ok(naive_date) = chrono::NaiveDate::parse_from_str(date_part, fmt) {
@@ -417,7 +448,9 @@ mod tests {
         assert_eq!(loaded[0].title, "FOMC Rate Decision");
 
         // Verify metadata
-        let structured = client.load_cache_data().expect("structured cache should load");
+        let structured = client
+            .load_cache_data()
+            .expect("structured cache should load");
         assert_eq!(structured.metadata.version, 1);
         assert_eq!(structured.metadata.event_count, 1);
         assert!(client.is_cache_valid());
@@ -455,7 +488,9 @@ mod tests {
         ]"#;
         std::fs::write(&cache_file, legacy_json).unwrap();
 
-        let loaded = client.load_cache().expect("legacy cache should be supported");
+        let loaded = client
+            .load_cache()
+            .expect("legacy cache should be supported");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].title, "Legacy CPI");
     }
@@ -481,7 +516,8 @@ mod tests {
             impact: "Medium".into(),
         };
         assert!(tentative.is_tentative());
-        let parsed_tentative = parse_event_datetime(&tentative).expect("should parse tentative event");
+        let parsed_tentative =
+            parse_event_datetime(&tentative).expect("should parse tentative event");
         assert_eq!(parsed_tentative.to_rfc3339(), "2026-07-10T00:00:00+00:00");
     }
 
@@ -510,5 +546,11 @@ mod tests {
         let parsed_summer = parse_event_datetime(&summer).unwrap();
         // 08:30 EDT (-04:00) is 12:30 UTC
         assert_eq!(parsed_summer.to_rfc3339(), "2026-07-15T12:30:00+00:00");
+    }
+
+    #[test]
+    fn test_calendar_client_custom_user_agent() {
+        let client = CalendarClient::with_user_agent(None, "custom-agent/1.0.0");
+        assert!(client.is_ok());
     }
 }

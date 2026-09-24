@@ -421,6 +421,7 @@ redfolder sync
 | :--- | :--- | :--- |
 | `new` | `fn(Option<PathBuf>) -> Self` | Creates client with standard browser User-Agent and default cache. |
 | `without_cache` | `fn() -> Self` | Creates client strictly performing live network requests. |
+| `with_user_agent` | `fn(Option<PathBuf>, &str) -> Result<Self>` | Creates client with custom User-Agent and optional cache directory. |
 | `fetch_remote` | `async fn(&self) -> Result<Vec<RawCalendarEvent>>` | Performs HTTP GET against FairEconomy weekly feed. |
 | `fetch_or_cached` | `async fn(&self) -> Result<Vec<RawCalendarEvent>>` | Fetches remote schedule, persisting cache or falling back to disk on failure. |
 | `save_cache` | `fn(&self, &[RawCalendarEvent]) -> Result<()>` | Writes JSON-serialized events to local disk. |
@@ -431,13 +432,13 @@ redfolder sync
 - **`RedFolderEvent`**: Typed enum (`BlackoutWarning`, `BlackoutStarted`, `BlackoutEnded`, `CalendarUpdated`).
 - **`BlackoutWindow`**: Struct containing `start: DateTime<Utc>`, `end: DateTime<Utc>`, and `events: Vec<WindowEvent>`. Provides helper methods `remaining_minutes()`, `duration_minutes()`, `is_active()`, and `summary_title()`.
 - **`Impact`**: Enum with variants `High`, `Medium`, `Low`, `NonEconomic`, `Custom(String)`. Supports case-insensitive string matching (`"red"`, `"high"`).
-- **`WeekendMode`**: Enum with variants `Short` (Friday evening window) and `Weekend` (Friday evening through Monday 00:00 UTC).
+- **`WeekendMode`**: Enum with variants `Short` (Friday evening window) and `Weekend` (Friday evening through Monday 00:00 UTC). Validated strictly on parse (rejecting typos or unknown strings with a descriptive error).
 
 ---
 
 ## Testing & Quality Assurance
 
-`redfolder` includes an automated test battery with 20 unit and integration tests covering interval calculations, state machines, and resilience guarantees.
+`redfolder` includes an automated test battery with 33 unit and integration tests covering interval calculations, state machines, and resilience guarantees.
 
 Run the test suite:
 

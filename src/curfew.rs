@@ -24,13 +24,17 @@ impl fmt::Display for WeekendMode {
 }
 
 impl FromStr for WeekendMode {
-    type Err = std::convert::Infallible;
+    type Err = RedFolderError;
 
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+    fn from_str(s: &str) -> Result<Self> {
         if s.eq_ignore_ascii_case("weekend") {
             Ok(WeekendMode::Weekend)
-        } else {
+        } else if s.eq_ignore_ascii_case("short") {
             Ok(WeekendMode::Short)
+        } else {
+            Err(RedFolderError::Curfew(format!(
+                "invalid weekend mode '{s}': expected 'short' or 'weekend'"
+            )))
         }
     }
 }
@@ -38,12 +42,6 @@ impl FromStr for WeekendMode {
 impl From<WeekendMode> for String {
     fn from(m: WeekendMode) -> Self {
         m.to_string()
-    }
-}
-
-impl From<&str> for WeekendMode {
-    fn from(s: &str) -> Self {
-        s.parse().unwrap()
     }
 }
 
@@ -77,7 +75,7 @@ pub fn next_weekend_window(
     mode: &str,
 ) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
     let (sh, sm) = parse_time(start_str)?;
-    let parsed_mode = mode.parse::<WeekendMode>().unwrap_or(WeekendMode::Short);
+    let parsed_mode: WeekendMode = mode.parse()?;
 
     let now = Utc::now();
     // Monday = 0 .. Friday = 4 .. Sunday = 6
@@ -178,5 +176,18 @@ mod tests {
             weekend_window_title("20:30", "21:00", "short"),
             "Weekend Curfew (20:30-21:00 UTC)"
         );
+    }
+
+    #[test]
+    fn test_next_weekend_window_invalid_mode() {
+        // Typos like "weeknd" or unrecognized strings should fail explicitly rather than silently falling back
+        let err = next_weekend_window("20:30", "21:00", "weeknd").unwrap_err();
+        assert!(matches!(err, RedFolderError::Curfew(_)));
+        assert!(err.to_string().contains("invalid weekend mode 'weeknd'"));
+
+        assert!("short".parse::<WeekendMode>().is_ok());
+        assert!("weekend".parse::<WeekendMode>().is_ok());
+        assert!("WEEKEND".parse::<WeekendMode>().is_ok());
+        assert!("invalid".parse::<WeekendMode>().is_err());
     }
 }

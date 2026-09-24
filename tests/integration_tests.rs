@@ -197,7 +197,9 @@ async fn test_multi_worker_buffer_isolation_in_service() {
         .weekend_curfew(false, "20:00", "21:00", "short")
         .build();
 
-    let _scalper_rx = service.register_worker("scalper", scalper_cfg.clone()).await;
+    let _scalper_rx = service
+        .register_worker("scalper", scalper_cfg.clone())
+        .await;
     let _swing_rx = service.register_worker("swing", swing_cfg.clone()).await;
 
     let now = Utc::now();
@@ -219,7 +221,9 @@ async fn test_multi_worker_buffer_isolation_in_service() {
 
     // Verify Swing (30m buffer) IS in blackout 15m before event
     assert!(engine.is_blackout(&swing_cfg));
-    let swing_window = engine.current_window(&swing_cfg).expect("swing window should exist");
+    let swing_window = engine
+        .current_window(&swing_cfg)
+        .expect("swing window should exist");
     assert_eq!(swing_window.events[0].title, "US CPI Release");
 }
 

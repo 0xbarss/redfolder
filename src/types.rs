@@ -326,7 +326,10 @@ mod tests {
         assert_eq!("usd".parse::<Currency>().unwrap(), Currency::USD);
         assert_eq!("eur".parse::<Currency>().unwrap(), Currency::EUR);
         assert_eq!("ALL".parse::<Currency>().unwrap(), Currency::All);
-        assert_eq!("XAU".parse::<Currency>().unwrap(), Currency::Custom("XAU".into()));
+        assert_eq!(
+            "XAU".parse::<Currency>().unwrap(),
+            Currency::Custom("XAU".into())
+        );
 
         let usd = Currency::USD;
         assert!(usd.matches_str("USD"));

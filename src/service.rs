@@ -14,8 +14,8 @@ use tracing::{debug, info, warn};
 /// Internal state tracking for an individual registered worker or strategy.
 struct WorkerState {
     config: RedFolderConfig,
-    legacy_sender: mpsc::UnboundedSender<BlackoutNotification>,
-    event_sender: mpsc::UnboundedSender<RedFolderEvent>,
+    legacy_sender: Option<mpsc::UnboundedSender<BlackoutNotification>>,
+    event_sender: Option<mpsc::UnboundedSender<RedFolderEvent>>,
     in_blackout: bool,
     last_warned_window_start: Option<DateTime<Utc>>,
 }
@@ -76,12 +76,14 @@ impl ServiceInner {
                 };
 
                 // Legacy notification
-                ws.legacy_sender
-                    .send(BlackoutNotification {
-                        active: is_active,
-                        window: window.clone(),
-                    })
-                    .ok();
+                if let Some(ref sender) = ws.legacy_sender {
+                    sender
+                        .send(BlackoutNotification {
+                            active: is_active,
+                            window: window.clone(),
+                        })
+                        .ok();
+                }
 
                 if is_active {
                     if let Some(w) = window {
@@ -91,7 +93,9 @@ impl ServiceInner {
                             window: w,
                             worker_id: Some(worker_id.clone()),
                         };
-                        ws.event_sender.send(ev.clone()).ok();
+                        if let Some(ref sender) = ws.event_sender {
+                            sender.send(ev.clone()).ok();
+                        }
                         events_to_dispatch.push(ev);
                     }
                 } else {
@@ -106,7 +110,9 @@ impl ServiceInner {
                         window: dummy_window,
                         worker_id: Some(worker_id.clone()),
                     };
-                    ws.event_sender.send(ev.clone()).ok();
+                    if let Some(ref sender) = ws.event_sender {
+                        sender.send(ev.clone()).ok();
+                    }
                     events_to_dispatch.push(ev);
                 }
             }
@@ -130,7 +136,9 @@ impl ServiceInner {
                                     minutes_until_start: mins_until_start,
                                     worker_id: Some(worker_id.clone()),
                                 };
-                                ws.event_sender.send(ev.clone()).ok();
+                                if let Some(ref sender) = ws.event_sender {
+                                    sender.send(ev.clone()).ok();
+                                }
                                 events_to_dispatch.push(ev);
                             }
                         }
@@ -215,14 +223,13 @@ impl RedFolderService {
     ) -> mpsc::UnboundedReceiver<BlackoutNotification> {
         let worker_id = worker_id.into();
         let (legacy_tx, legacy_rx) = mpsc::unbounded_channel();
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
 
         self.inner.lock().await.workers.insert(
             worker_id.clone(),
             WorkerState {
                 config,
-                legacy_sender: legacy_tx,
-                event_sender: event_tx,
+                legacy_sender: Some(legacy_tx),
+                event_sender: None,
                 in_blackout: false,
                 last_warned_window_start: None,
             },
@@ -239,15 +246,14 @@ impl RedFolderService {
         config: RedFolderConfig,
     ) -> mpsc::UnboundedReceiver<RedFolderEvent> {
         let worker_id = worker_id.into();
-        let (legacy_tx, _legacy_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         self.inner.lock().await.workers.insert(
             worker_id.clone(),
             WorkerState {
                 config,
-                legacy_sender: legacy_tx,
-                event_sender: event_tx,
+                legacy_sender: None,
+                event_sender: Some(event_tx),
                 in_blackout: false,
                 last_warned_window_start: None,
             },

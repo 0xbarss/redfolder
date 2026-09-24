@@ -127,14 +127,13 @@ impl BlackoutEngine {
 
         let before_min = config.before_min;
         let after_min = config.after_min;
-        let cutoff = now + Duration::hours(48);
         let lower_cutoff = now - Duration::minutes(after_min);
 
         let mut individual: Vec<(DateTime<Utc>, DateTime<Utc>, WindowEvent)> = Vec::new();
 
         // 1. Process parsed economic releases matching this worker config
         for event in &self.parsed_events {
-            if event.datetime < lower_cutoff || event.datetime > cutoff {
+            if event.datetime < lower_cutoff {
                 continue;
             }
 
@@ -157,10 +156,12 @@ impl BlackoutEngine {
 
         // 2. Add weekend curfew if enabled for this worker
         if config.weekend_enabled {
-            if let Ok((start, end)) =
-                next_weekend_window(&config.weekend_start, &config.weekend_end, &config.weekend_mode)
-            {
-                if end >= now && start <= cutoff {
+            if let Ok((start, end)) = next_weekend_window(
+                &config.weekend_start,
+                &config.weekend_end,
+                &config.weekend_mode,
+            ) {
+                if end >= now {
                     let title = weekend_window_title(
                         &config.weekend_start,
                         &config.weekend_end,
@@ -477,8 +478,7 @@ mod tests {
     #[test]
     fn test_weekend_and_news_overlap() {
         // Find upcoming Friday 20:15 UTC (15 mins before weekend curfew at 20:30 UTC)
-        let (curfew_start, _curfew_end) =
-            next_weekend_window("20:30", "21:00", "weekend").unwrap();
+        let (curfew_start, _curfew_end) = next_weekend_window("20:30", "21:00", "weekend").unwrap();
         let news_time = curfew_start - Duration::minutes(15);
 
         let raw = vec![RawCalendarEvent {
@@ -508,5 +508,39 @@ mod tests {
         assert_eq!(merged.start, news_time - Duration::minutes(30));
         // And window should contain both news and curfew events
         assert!(merged.events.len() >= 2);
+    }
+
+    #[test]
+    fn test_upcoming_blackouts_horizon_beyond_48h() {
+        let now = Utc::now();
+        let event_time = now + Duration::hours(60);
+
+        let raw = vec![RawCalendarEvent {
+            title: "Extended Horizon Rate Decision".into(),
+            country: "USD".into(),
+            date: event_time.to_rfc3339(),
+            time: "".into(),
+            impact: "High".into(),
+        }];
+
+        let config = RedFolderConfig::builder()
+            .currencies(vec!["USD"])
+            .impacts(vec!["High"])
+            .weekend_curfew(false, "20:00", "21:00", "short")
+            .build();
+
+        let engine = BlackoutEngine::compile(&raw, &[&config], now);
+
+        // Within 48 hours: should NOT be included
+        let upcoming_48 = engine.upcoming_blackouts(&config, 48);
+        assert_eq!(upcoming_48.len(), 0);
+
+        // Within 72 hours: should be included and not silently truncated
+        let upcoming_72 = engine.upcoming_blackouts(&config, 72);
+        assert_eq!(upcoming_72.len(), 1);
+        assert_eq!(
+            upcoming_72[0].events[0].title,
+            "Extended Horizon Rate Decision"
+        );
     }
 }

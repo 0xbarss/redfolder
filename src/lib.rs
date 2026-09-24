@@ -16,7 +16,7 @@ pub mod service;
 pub mod types;
 
 pub use calendar::{
-    CalendarClient, CacheMetadata, CachedCalendarData, RawCalendarEvent, CALENDAR_URL,
+    CacheMetadata, CachedCalendarData, CalendarClient, RawCalendarEvent, CALENDAR_URL,
     DEFAULT_CACHE_FILENAME,
 };
 pub use config::{NewsConfig, RedFolderConfig, RedFolderConfigBuilder};
