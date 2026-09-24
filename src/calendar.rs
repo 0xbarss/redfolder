@@ -103,36 +103,53 @@ impl CalendarClient {
             .unwrap_or_else(|| std::env::temp_dir().join("redfolder_cache"))
     }
 
+    /// Create a new `CalendarClient` with an optional cache directory fallibly.
+    pub fn try_new(cache_dir: Option<PathBuf>) -> Result<Self> {
+        let dir = cache_dir.or_else(|| Some(Self::default_cache_dir()));
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .user_agent(DEFAULT_USER_AGENT)
+            .build()?;
+        Ok(Self::with_options(
+            client,
+            CALENDAR_URL,
+            dir,
+            Duration::from_secs(30),
+        ))
+    }
+
     /// Create a new `CalendarClient` with an optional cache directory.
     /// If `None`, defaults to `CalendarClient::default_cache_dir()`.
     #[must_use]
     pub fn new(cache_dir: Option<PathBuf>) -> Self {
-        let dir = cache_dir.or_else(|| Some(Self::default_cache_dir()));
-        Self::with_options(
-            Client::builder()
-                .timeout(Duration::from_secs(30))
-                .user_agent(DEFAULT_USER_AGENT)
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+        Self::try_new(cache_dir.clone()).unwrap_or_else(|err| {
+            error!(err=%err, "failed to build configured HTTP client; falling back to default");
+            let dir = cache_dir.or_else(|| Some(Self::default_cache_dir()));
+            Self::with_options(Client::new(), CALENDAR_URL, dir, Duration::from_secs(30))
+        })
+    }
+
+    /// Create a new `CalendarClient` without any local disk caching fallibly.
+    pub fn try_without_cache() -> Result<Self> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .user_agent(DEFAULT_USER_AGENT)
+            .build()?;
+        Ok(Self::with_options(
+            client,
             CALENDAR_URL,
-            dir,
+            None,
             Duration::from_secs(30),
-        )
+        ))
     }
 
     /// Create a new `CalendarClient` without any local disk caching.
     #[must_use]
     pub fn without_cache() -> Self {
-        Self::with_options(
-            Client::builder()
-                .timeout(Duration::from_secs(30))
-                .user_agent(DEFAULT_USER_AGENT)
-                .build()
-                .unwrap_or_else(|_| Client::new()),
-            CALENDAR_URL,
-            None,
-            Duration::from_secs(30),
-        )
+        Self::try_without_cache().unwrap_or_else(|err| {
+            error!(err=%err, "failed to build configured HTTP client; falling back to default");
+            Self::with_options(Client::new(), CALENDAR_URL, None, Duration::from_secs(30))
+        })
     }
 
     /// Create a new `CalendarClient` with a custom User-Agent string.
@@ -196,26 +213,91 @@ impl CalendarClient {
         self.cache_path.as_deref()
     }
 
-    /// Fetch fresh calendar events directly from the remote API.
+    /// Fetch fresh calendar events directly from the remote API with bounded retry for transient errors.
     pub async fn fetch_remote(&self) -> Result<Vec<RawCalendarEvent>> {
         debug!(url=%self.calendar_url, "fetching economic calendar");
-        let resp = self
-            .client
-            .get(&self.calendar_url)
-            .timeout(self.request_timeout)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Vec<serde_json::Value>>()
-            .await?;
+        let max_retries = 2;
+        let mut last_error = None;
 
-        let events: Vec<RawCalendarEvent> = resp
-            .into_iter()
-            .filter_map(|v| serde_json::from_value(v).ok())
-            .collect();
+        for attempt in 0..=max_retries {
+            if attempt > 0 {
+                let delay = Duration::from_millis(500 * (1 << (attempt - 1)));
+                tokio::time::sleep(delay).await;
+                debug!(attempt, "retrying calendar fetch");
+            }
 
-        info!(count = %events.len(), "downloaded calendar events successfully");
-        Ok(events)
+            match self
+                .client
+                .get(&self.calendar_url)
+                .timeout(self.request_timeout)
+                .send()
+                .await
+            {
+                Ok(resp) => match resp.error_for_status() {
+                    Ok(resp) => match resp.json::<Vec<serde_json::Value>>().await {
+                        Ok(raw_items) => {
+                            let total_count = raw_items.len();
+                            let mut events = Vec::with_capacity(total_count);
+                            let mut malformed_count = 0;
+
+                            for item in raw_items {
+                                match serde_json::from_value::<RawCalendarEvent>(item) {
+                                    Ok(ev) => {
+                                        if ev.date.trim().is_empty() {
+                                            malformed_count += 1;
+                                        } else {
+                                            events.push(ev);
+                                        }
+                                    }
+                                    Err(_) => {
+                                        malformed_count += 1;
+                                    }
+                                }
+                            }
+
+                            if total_count > 0 && malformed_count == total_count {
+                                return Err(crate::error::RedFolderError::Calendar(
+                                    "all upstream calendar events were malformed".to_string(),
+                                ));
+                            }
+
+                            if malformed_count > 0 {
+                                warn!(
+                                    malformed = %malformed_count,
+                                    total = %total_count,
+                                    "some upstream events failed validation"
+                                );
+                                if malformed_count * 5 > total_count {
+                                    return Err(crate::error::RedFolderError::Calendar(format!(
+                                        "upstream response corrupted: {malformed_count}/{total_count} events malformed"
+                                    )));
+                                }
+                            }
+
+                            info!(count = %events.len(), "downloaded calendar events successfully");
+                            return Ok(events);
+                        }
+                        Err(e) => {
+                            last_error = Some(crate::error::RedFolderError::Http(e));
+                        }
+                    },
+                    Err(e) => {
+                        let is_server_err = e.status().is_some_and(|s| s.is_server_error());
+                        last_error = Some(crate::error::RedFolderError::Http(e));
+                        if !is_server_err {
+                            break;
+                        }
+                    }
+                },
+                Err(e) => {
+                    last_error = Some(crate::error::RedFolderError::Http(e));
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            crate::error::RedFolderError::Calendar("fetch failed after retries".into())
+        }))
     }
 
     /// Save raw calendar events to the local disk cache (if cache path is set).
@@ -266,8 +348,12 @@ impl CalendarClient {
 
         // 1. Try parsing full CachedCalendarData with metadata
         if let Ok(cached) = serde_json::from_str::<CachedCalendarData>(&data) {
-            debug!(path=%path.display(), version=%cached.metadata.version, count=%cached.events.len(), "loaded structured calendar cache");
-            return Some(cached);
+            if cached.metadata.version == 1 {
+                debug!(path=%path.display(), version=%cached.metadata.version, count=%cached.events.len(), "loaded structured calendar cache v1");
+                return Some(cached);
+            } else {
+                warn!(path=%path.display(), version=%cached.metadata.version, "unsupported cache version; ignoring");
+            }
         }
 
         // 2. Fall back to parsing legacy raw Vec<RawCalendarEvent> for backwards compatibility
@@ -311,22 +397,46 @@ impl CalendarClient {
 
     /// Fetch fresh events from the remote API, automatically saving to cache on success,
     /// or falling back to local cache if the remote request fails.
+    ///
+    /// Respects configured cache TTL and protects against empty responses overwriting good data.
     pub async fn fetch_or_cached(&self) -> Result<Vec<RawCalendarEvent>> {
+        // 1. If TTL is active and disk cache is valid and non-empty, use cache
+        if self.cache_ttl.is_some() && self.is_cache_valid() {
+            if let Some(cached) = self.load_cache() {
+                if !cached.is_empty() {
+                    debug!(count=%cached.len(), "serving calendar from valid local cache (TTL active)");
+                    return Ok(cached);
+                }
+            }
+        }
+
+        // 2. Otherwise fetch from remote with protection against empty / failed responses
         match self.fetch_remote().await {
             Ok(events) => {
-                if let Err(e) = self.save_cache(&events) {
-                    warn!(err=%e, "failed to persist calendar cache");
+                if events.is_empty() {
+                    warn!("remote calendar returned 0 events; checking disk cache to protect existing data");
+                    if let Some(cached) = self.load_cache() {
+                        if !cached.is_empty() {
+                            warn!(count=%cached.len(), "preserved valid disk cache instead of overwriting with empty remote response");
+                            return Ok(cached);
+                        }
+                    }
+                    Ok(events)
+                } else {
+                    if let Err(e) = self.save_cache(&events) {
+                        warn!(err=%e, "failed to persist calendar cache");
+                    }
+                    Ok(events)
                 }
-                Ok(events)
             }
             Err(e) => {
                 error!(err=%e, "failed to download calendar; checking disk cache");
                 match self.load_cache() {
-                    Some(cached) => {
+                    Some(cached) if !cached.is_empty() => {
                         warn!(count=%cached.len(), "using fallback cached calendar data");
                         Ok(cached)
                     }
-                    None => Err(e),
+                    _ => Err(e),
                 }
             }
         }

@@ -17,6 +17,7 @@ struct WorkerState {
     legacy_sender: Option<mpsc::UnboundedSender<BlackoutNotification>>,
     event_sender: Option<mpsc::UnboundedSender<RedFolderEvent>>,
     in_blackout: bool,
+    active_window: Option<BlackoutWindow>,
     last_warned_window_start: Option<DateTime<Utc>>,
 }
 
@@ -29,6 +30,7 @@ struct ServiceInner {
     check_interval: std::time::Duration,
     broadcast_tx: broadcast::Sender<RedFolderEvent>,
     listeners: Vec<Arc<dyn EventListener>>,
+    is_running: bool,
 }
 
 impl ServiceInner {
@@ -45,13 +47,14 @@ impl ServiceInner {
             check_interval,
             broadcast_tx,
             listeners: Vec::new(),
+            is_running: false,
         }
     }
 
     /// Evaluates blackout status and warnings for all registered workers,
     /// broadcasting domain events on transitions.
     fn check_and_notify_workers(&mut self) {
-        if self.engine.is_empty() {
+        if self.workers.is_empty() {
             return;
         }
 
@@ -86,6 +89,7 @@ impl ServiceInner {
                 }
 
                 if is_active {
+                    ws.active_window = window.clone();
                     if let Some(w) = window {
                         let end_str = w.end.format("%H:%M UTC").to_string();
                         warn!(worker=%worker_id, until=%end_str, "ENTERING news blackout window");
@@ -100,14 +104,14 @@ impl ServiceInner {
                     }
                 } else {
                     info!(worker=%worker_id, "EXITING news blackout window");
-                    // Send dummy or latest window for clearance
-                    let dummy_window = BlackoutWindow {
+                    // Send the actual window that concluded (or fallback dummy if none tracked)
+                    let ended_window = ws.active_window.take().unwrap_or_else(|| BlackoutWindow {
                         start: now,
                         end: now,
                         events: vec![],
-                    };
+                    });
                     let ev = RedFolderEvent::BlackoutEnded {
-                        window: dummy_window,
+                        window: ended_window,
                         worker_id: Some(worker_id.clone()),
                     };
                     if let Some(ref sender) = ws.event_sender {
@@ -215,6 +219,16 @@ impl RedFolderService {
         self.inner.lock().await.check_interval = interval;
     }
 
+    /// Manually trigger blackout evaluation and worker notifications immediately.
+    pub async fn evaluate_and_notify(&self) {
+        self.inner.lock().await.check_and_notify_workers();
+    }
+
+    /// Set an explicit `BlackoutEngine` instance for testing or simulation.
+    pub async fn set_engine(&self, engine: BlackoutEngine) {
+        self.inner.lock().await.engine = engine;
+    }
+
     /// Register a worker or trading strategy, returning a legacy `BlackoutNotification` receiver.
     pub async fn register_worker(
         &self,
@@ -231,6 +245,7 @@ impl RedFolderService {
                 legacy_sender: Some(legacy_tx),
                 event_sender: None,
                 in_blackout: false,
+                active_window: None,
                 last_warned_window_start: None,
             },
         );
@@ -255,6 +270,7 @@ impl RedFolderService {
                 legacy_sender: None,
                 event_sender: Some(event_tx),
                 in_blackout: false,
+                active_window: None,
                 last_warned_window_start: None,
             },
         );
@@ -268,10 +284,20 @@ impl RedFolderService {
         self.inner.lock().await.workers.remove(worker_id);
     }
 
+    /// Whether the background worker tasks are currently running.
+    pub async fn is_running(&self) -> bool {
+        self.inner.lock().await.is_running
+    }
+
     /// Start the background synchronization and evaluation loops.
     pub async fn start(&self) -> Result<()> {
         {
-            let inner = self.inner.lock().await;
+            let mut inner = self.inner.lock().await;
+            if inner.is_running {
+                return Err(crate::error::RedFolderError::Service(
+                    "service is already running".to_string(),
+                ));
+            }
             if inner.workers.is_empty() {
                 warn!("no workers registered — RedFolderService not starting");
                 return Ok(());
@@ -280,7 +306,11 @@ impl RedFolderService {
                 info!("all registered worker blackout configs are disabled");
                 return Ok(());
             }
+            inner.is_running = true;
         }
+
+        // Reset shutdown signal to false so background loops run, even after prior stop()
+        self.shutdown_tx.send(false).ok();
 
         // Perform initial calendar synchronization
         self.refresh().await?;
@@ -301,26 +331,34 @@ impl RedFolderService {
 
                     tokio::select! {
                         _ = tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)) => {
-                            let _ = Self::fetch_and_compile(&inner_arc).await;
+                            let _ = Self::fetch_and_compile(&inner_arc, false).await;
                         }
-                        _ = shutdown.changed() => break,
+                        _ = shutdown.changed() => {
+                            if *shutdown.borrow() {
+                                break;
+                            }
+                        }
                     }
                 }
             });
         }
 
-        // 2. Periodic blackout evaluation loop
+        // 2. Periodic blackout evaluation loop (observes dynamic interval changes)
         {
             let inner_arc = self.inner.clone();
             let mut shutdown = self.shutdown_tx.subscribe();
-            let interval = self.inner.lock().await.check_interval;
             tokio::spawn(async move {
                 loop {
+                    let interval = inner_arc.lock().await.check_interval;
                     tokio::select! {
                         _ = tokio::time::sleep(interval) => {
                             inner_arc.lock().await.check_and_notify_workers();
                         }
-                        _ = shutdown.changed() => break,
+                        _ = shutdown.changed() => {
+                            if *shutdown.borrow() {
+                                break;
+                            }
+                        }
                     }
                 }
             });
@@ -332,21 +370,31 @@ impl RedFolderService {
 
     /// Stop all background tasks gracefully.
     pub async fn stop(&self) {
+        let mut inner = self.inner.lock().await;
+        if !inner.is_running {
+            return;
+        }
+        inner.is_running = false;
         info!("stopping RedFolderService");
         self.shutdown_tx.send(true).ok();
     }
 
-    /// Manually trigger a calendar download and recompile blackout windows.
+    /// Manually trigger a forced calendar download and recompile blackout windows.
     pub async fn refresh(&self) -> Result<()> {
-        Self::fetch_and_compile(&self.inner).await
+        Self::fetch_and_compile(&self.inner, true).await
+    }
+
+    /// Force a fresh calendar fetch and window compilation, bypassing daily cache.
+    pub async fn force_refresh(&self) -> Result<()> {
+        self.refresh().await
     }
 
     /// Internal helper that fetches events and compiles windows without holding mutex across network I/O.
-    async fn fetch_and_compile(inner: &Arc<Mutex<ServiceInner>>) -> Result<()> {
+    async fn fetch_and_compile(inner: &Arc<Mutex<ServiceInner>>, force: bool) -> Result<()> {
         let today = Utc::now().date_naive();
 
-        // 1. Check if already fetched today under lock
-        {
+        // 1. Check if already fetched today under lock (unless force refresh is requested)
+        if !force {
             let state = inner.lock().await;
             if state.last_fetch_date == Some(today) && !state.engine.is_empty() {
                 debug!("calendar already fetched and compiled for today");

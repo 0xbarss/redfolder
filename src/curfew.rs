@@ -64,12 +64,17 @@ pub fn parse_time(s: &str) -> Result<(u32, u32)> {
     Err(RedFolderError::ParseTime(s.to_string()))
 }
 
-/// Calculates the next weekend market close blackout window based on current UTC time.
+/// Calculates the weekend market close blackout window for a given timestamp.
 ///
+/// If `at` is currently inside the active weekend window, returns that active window.
+/// If `at` is outside (or past) the previous window, returns the next upcoming window.
+///
+/// - `at`: The evaluation timestamp in UTC (enables 100% deterministic queries/backtesting).
 /// - `start_str`: Time in UTC when curfew begins on Friday (e.g. "20:30").
-/// - `end_str`: Time in UTC when curfew ends on Friday (e.g. "21:00") for "short" mode.
-/// - `mode`: "short" (ends same day at `end_str`) or "weekend" (runs through to Monday 00:00 UTC).
-pub fn next_weekend_window(
+/// - `end_str`: Time in UTC when curfew ends on Friday (or Saturday if cross-midnight) for "short" mode.
+/// - `mode`: "short" or "weekend" (runs through to Monday 00:00 UTC).
+pub fn weekend_window_at(
+    at: DateTime<Utc>,
     start_str: &str,
     end_str: &str,
     mode: &str,
@@ -77,34 +82,21 @@ pub fn next_weekend_window(
     let (sh, sm) = parse_time(start_str)?;
     let parsed_mode: WeekendMode = mode.parse()?;
 
-    let now = Utc::now();
     // Monday = 0 .. Friday = 4 .. Sunday = 6
-    let weekday_num = now.weekday().num_days_from_monday() as i64;
-    let days_ahead = (4 - weekday_num).rem_euclid(7);
+    let weekday_num = at.weekday().num_days_from_monday() as i64;
+    let days_since_friday = (weekday_num + 3).rem_euclid(7);
 
-    let target_friday = (now + Duration::days(days_ahead)).date_naive();
-    let mut start = DateTime::<Utc>::from_naive_utc_and_offset(
-        target_friday
+    let recent_friday = (at - Duration::days(days_since_friday)).date_naive();
+    let recent_start = DateTime::<Utc>::from_naive_utc_and_offset(
+        recent_friday
             .and_hms_opt(sh, sm, 0)
             .ok_or_else(|| RedFolderError::Curfew("invalid start timestamp".to_string()))?,
         Utc,
     );
 
-    // If today is Friday (days_ahead == 0) and current time is already past start, advance to next Friday
-    if days_ahead == 0 && now >= start {
-        let next_friday = (now + Duration::days(7)).date_naive();
-        start = DateTime::<Utc>::from_naive_utc_and_offset(
-            next_friday.and_hms_opt(sh, sm, 0).ok_or_else(|| {
-                RedFolderError::Curfew("invalid next start timestamp".to_string())
-            })?,
-            Utc,
-        );
-    }
-
-    let end = match parsed_mode {
+    let recent_end = match parsed_mode {
         WeekendMode::Weekend => {
-            // End at Monday 00:00 UTC (3 days after Friday)
-            let monday_date = (start + Duration::days(3)).date_naive();
+            let monday_date = recent_friday + Duration::days(3);
             DateTime::<Utc>::from_naive_utc_and_offset(
                 monday_date.and_hms_opt(0, 0, 0).ok_or_else(|| {
                     RedFolderError::Curfew("invalid monday timestamp".to_string())
@@ -114,9 +106,15 @@ pub fn next_weekend_window(
         }
         WeekendMode::Short => {
             let (eh, em) = parse_time(end_str)?;
+            // Support cross-midnight short curfews (e.g. 23:00 -> 01:00 extends into Saturday)
+            let end_date = if (eh, em) <= (sh, sm) {
+                recent_friday + Duration::days(1)
+            } else {
+                recent_friday
+            };
+
             DateTime::<Utc>::from_naive_utc_and_offset(
-                start
-                    .date_naive()
+                end_date
                     .and_hms_opt(eh, em, 0)
                     .ok_or_else(|| RedFolderError::Curfew("invalid end timestamp".to_string()))?,
                 Utc,
@@ -124,7 +122,26 @@ pub fn next_weekend_window(
         }
     };
 
-    Ok((start, end))
+    if at <= recent_end {
+        Ok((recent_start, recent_end))
+    } else {
+        // Recent window has already passed; advance to next week's window
+        Ok((
+            recent_start + Duration::days(7),
+            recent_end + Duration::days(7),
+        ))
+    }
+}
+
+/// Calculates the next weekend market close blackout window based on current UTC time.
+///
+/// Backwards-compatible convenience wrapper around [`weekend_window_at`].
+pub fn next_weekend_window(
+    start_str: &str,
+    end_str: &str,
+    mode: &str,
+) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+    weekend_window_at(Utc::now(), start_str, end_str, mode)
 }
 
 /// Helper that generates human-readable description for weekend curfew.

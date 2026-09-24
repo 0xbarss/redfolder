@@ -151,6 +151,44 @@ impl RedFolderConfig {
             warning_before_min: Some(30),
         }
     }
+
+    /// Validates the configuration parameters, ensuring non-negative buffers and valid curfew formats.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if self.before_min < 0 {
+            return Err(crate::error::RedFolderError::Config(format!(
+                "before_min cannot be negative (got {})",
+                self.before_min
+            )));
+        }
+        if self.after_min < 0 {
+            return Err(crate::error::RedFolderError::Config(format!(
+                "after_min cannot be negative (got {})",
+                self.after_min
+            )));
+        }
+        if self.merge_threshold_min < 0 {
+            return Err(crate::error::RedFolderError::Config(format!(
+                "merge_threshold_min cannot be negative (got {})",
+                self.merge_threshold_min
+            )));
+        }
+        if let Some(warn) = self.warning_before_min {
+            if warn < 0 {
+                return Err(crate::error::RedFolderError::Config(format!(
+                    "warning_before_min cannot be negative (got {})",
+                    warn
+                )));
+            }
+        }
+        if self.weekend_enabled {
+            crate::curfew::parse_time(&self.weekend_start)?;
+            let mode: crate::curfew::WeekendMode = self.weekend_mode.parse()?;
+            if mode == crate::curfew::WeekendMode::Short {
+                crate::curfew::parse_time(&self.weekend_end)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Builder for `RedFolderConfig`.
@@ -244,9 +282,17 @@ impl RedFolderConfigBuilder {
         self
     }
 
+    /// Builds the configuration, panicking if parameters are invalid.
     #[must_use]
     pub fn build(self) -> RedFolderConfig {
-        self.config
+        self.try_build()
+            .expect("invalid RedFolderConfig parameters")
+    }
+
+    /// Validates and builds the configuration safely without panicking.
+    pub fn try_build(self) -> crate::error::Result<RedFolderConfig> {
+        self.config.validate()?;
+        Ok(self.config)
     }
 }
 

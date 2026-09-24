@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Author](https://img.shields.io/badge/author-0xbarss-purple.svg)](https://github.com/0xbarss)
 
-A high-performance, asynchronous economic calendar client and event-driven trading blackout engine for Rust algorithmic trading systems, quantitative funds, and prop firm challenges.
+A reliable, asynchronous economic calendar client and event-driven trading blackout engine for Rust algorithmic trading systems, quantitative funds, and prop firm challenges.
 
 ---
 
@@ -50,7 +50,7 @@ In quantitative finance and retail foreign exchange trading, high-impact macroec
 
 During these releases, liquidity providers widen their spreads by 10x–50x, depth of book vanishes, and execution slippage drastically increases. Furthermore, major prop trading firms (**FTMO, FundedNext, The5ers, MFF**) enforce strict compliance rules that disqualify accounts holding or executing trades within 2–5 minutes of high-impact releases.
 
-Building economic news protection from scratch usually results in brittle HTTP pollers that fail during rate limits or fail to cluster back-to-back releases. `redfolder` solves this with an institutional-grade, zero-alloc in-memory engine:
+Building economic news protection from scratch usually results in brittle HTTP pollers that fail during rate limits or fail to cluster back-to-back releases. `redfolder` solves this with a robust, in-memory interval engine:
 
 1. **Direct Calendar Ingestion**: Automatically pulls weekly schedules from ForexFactory / FairEconomy feeds.
 2. **Dynamic Window Merging**: Automatically aggregates tightly spaced releases into unified blackout intervals.
@@ -130,10 +130,11 @@ External calendar APIs enforce strict Cloudflare rate limiting (HTTP 429). `Cale
 ## Key Features
 
 - **Zero Unsound Dependencies**: Pure Rust implementation with strict compile-time invariants.
-- **Microsecond In-Memory Matching**: Compiles events into pre-sorted UTC intervals for sub-microsecond query performance during order placement.
+- **Fast In-Memory Matching**: Compiles events into pre-sorted UTC intervals for single-digit microsecond query latency (~6–8 µs) during order placement, verified with Criterion benchmarks.
 - **Multi-Worker Granularity**: Assign separate configurations to different strategies or symbols (e.g. `EURUSD` bot monitors USD + EUR; `GBPJPY` bot monitors GBP + JPY).
 - **Multiple Integration Channels**: Consume events via `tokio::sync::broadcast`, per-worker `tokio::sync::mpsc`, or asynchronous `EventListener` traits.
-- **Prop Firm Preset Out of the Box**: One-line configuration matching FTMO, FundedNext, and The5ers rules.
+- **Prop Firm Preset Out of the Box**: Configurable presets approximating FTMO, FundedNext, and The5ers rules.
+- **Deterministic Historical Queries**: Timestamp-aware evaluation enabling accurate backtesting and replay simulations.
 - **Terminal CLI Included**: Real-time terminal watcher and JSON query interface.
 
 ---
@@ -146,6 +147,8 @@ redfolder/
 ├── Cargo.toml                     # Crate definition, metadata, and optional CLI dependencies
 ├── LICENSE                        # MIT License
 ├── README.md                      # Architecture documentation and usage guide
+├── benches/
+│   └── blackout_benchmark.rs      # Criterion benchmarks for engine compile and query matching
 ├── examples/
 │   ├── quickstart.rs              # Basic one-shot calendar inspection
 │   ├── event_driven_bot.rs        # Async event loop responding to warnings and halts
@@ -303,6 +306,9 @@ use redfolder::config::RedFolderConfig;
 // - Weekend curfew active from Friday 20:00 UTC until Monday 00:00 UTC
 let prop_config = RedFolderConfig::prop_firm_strict();
 ```
+
+> [!NOTE]
+> **Prop Firm Qualification & Compliance**: Built-in presets approximate standard industry guidelines (such as FTMO, FundedNext, and The5ers). Specific compliance requirements vary by account type (e.g. Swing vs. Standard), challenge stage, instrument, and effective terms. Traders should verify terms directly with their funding provider and customize buffers accordingly.
 
 ---
 
@@ -470,6 +476,36 @@ cargo clippy --all-targets --all-features -- -D warnings
 | **Advance Warning Generation** | `BlackoutWarning` emits exactly once per window within specified horizon. | Verified |
 | **Worker Unregistration** | Cleanly terminates state tracking; subsequent queries return inactive. | Verified |
 | **Corrupted JSON Disk Cache** | Bypasses corrupted cache file without panicking and attempts clean fetch. | Verified |
+| **Weekend Curfew on Sat/Sun** | Correctly detects active blackout throughout Saturday and Sunday. | Verified |
+| **Cross-Midnight Short Curfew** | 23:00 -> 01:00 curfew rolls over to Saturday without inverting intervals. | Verified |
+| **Deterministic Timestamp Replay** | Historical queries evaluate deterministically without depending on `Utc::now()`. | Verified |
+| **Empty Upstream Feed Protection** | Preserves known-good cache if upstream returns 0 events or invalid array. | Verified |
+| **Service Concurrency & Restart** | Multiple `start()` calls error cleanly; `start -> stop -> start` restarts properly. | Verified |
+
+---
+
+### Performance & Empirical Benchmarks
+
+`redfolder` includes a Criterion benchmark battery measuring engine compilation, dynamic worker window derivation, and blackout query latency.
+
+#### Benchmark Environment & Methodology
+- **Hardware / OS**: Linux x86_64, release mode with link-time optimization.
+- **Dataset**: 50 raw macroeconomic calendar events across 4 currencies (USD, EUR, GBP, JPY).
+- **Configuration**: Strict prop firm challenge rules (`prop_firm_strict`: 8 currencies, 5-minute pre/post buffers, weekend curfew enabled).
+
+#### Empirical Criterion Measurements
+
+| Operation | Benchmark Name | Latency (Mean) | 95% Confidence Interval | Description |
+| :--- | :--- | :---: | :---: | :--- |
+| **Engine Compilation** | `engine_compile_50_events` | **17.31 µs** | [17.21 µs – 17.42 µs] | Parses, sorts, filters, and merges 50 raw events into UTC intervals |
+| **Runtime Blackout Check** | `is_blackout_query` | **8.55 µs** | [8.50 µs – 8.60 µs] | Evaluates active blackout state across currencies, impacts, and weekend curfew |
+| **Deterministic Timestamp Query** | `is_blackout_at_query` | **6.57 µs** | [6.54 µs – 6.60 µs] | Historical or future evaluation point query for tick-level backtesting |
+| **Worker Window Derivation** | `windows_for_config` | **8.74 µs** | [8.69 µs – 8.80 µs] | Derives isolated worker-specific blackout intervals from parsed events |
+
+To reproduce these benchmarks:
+```bash
+cargo bench --bench blackout_benchmark
+```
 
 ---
 

@@ -24,4 +24,10 @@ pub enum RedFolderError {
 
     #[error("Curfew calculation error: {0}")]
     Curfew(String),
+
+    #[error("Configuration error: {0}")]
+    Config(String),
+
+    #[error("Calendar error: {0}")]
+    Calendar(String),
 }

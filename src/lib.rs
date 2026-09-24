@@ -20,7 +20,9 @@ pub use calendar::{
     DEFAULT_CACHE_FILENAME,
 };
 pub use config::{NewsConfig, RedFolderConfig, RedFolderConfigBuilder};
-pub use curfew::{next_weekend_window, parse_time, weekend_window_title, WeekendMode};
+pub use curfew::{
+    next_weekend_window, parse_time, weekend_window_at, weekend_window_title, WeekendMode,
+};
 pub use engine::{
     current_window_for_config, event_matches_config, event_matches_economic_event,
     is_blackout_for_config, BlackoutEngine,

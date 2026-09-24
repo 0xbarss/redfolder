@@ -1,9 +1,9 @@
 use crate::calendar::{parse_event_datetime, RawCalendarEvent};
 use crate::config::RedFolderConfig;
-use crate::curfew::{next_weekend_window, weekend_window_title};
+use crate::curfew::{weekend_window_at, weekend_window_title};
 use crate::types::{BlackoutWindow, EconomicEvent, WindowEvent};
 use chrono::{DateTime, Duration, Utc};
-use tracing::info;
+use tracing::{error, info};
 
 /// In-memory engine that manages calendar events and derives per-worker blackout windows.
 #[derive(Debug, Clone, Default)]
@@ -106,10 +106,22 @@ impl BlackoutEngine {
         &self.windows
     }
 
-    /// Whether the engine contains no events and no windows.
+    /// Whether the engine contains no source raw events and no precompiled windows.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.raw_events.is_empty() && self.windows.is_empty()
+    }
+
+    /// Whether the engine has any source economic events loaded.
+    #[must_use]
+    pub fn has_events(&self) -> bool {
+        !self.raw_events.is_empty()
+    }
+
+    /// Whether the engine has any compiled reference windows.
+    #[must_use]
+    pub fn has_windows(&self) -> bool {
+        !self.windows.is_empty()
     }
 
     /// Derives worker-specific blackout windows at runtime using the worker's own
@@ -156,28 +168,40 @@ impl BlackoutEngine {
 
         // 2. Add weekend curfew if enabled for this worker
         if config.weekend_enabled {
-            if let Ok((start, end)) = next_weekend_window(
+            match weekend_window_at(
+                now,
                 &config.weekend_start,
                 &config.weekend_end,
                 &config.weekend_mode,
             ) {
-                if end >= now {
-                    let title = weekend_window_title(
-                        &config.weekend_start,
-                        &config.weekend_end,
-                        &config.weekend_mode,
+                Ok((start, end)) => {
+                    if end >= now {
+                        let title = weekend_window_title(
+                            &config.weekend_start,
+                            &config.weekend_end,
+                            &config.weekend_mode,
+                        );
+                        individual.push((
+                            start,
+                            end,
+                            WindowEvent {
+                                is_custom: true,
+                                event_time: start,
+                                country: "Global".into(),
+                                impact: "High".into(),
+                                title,
+                            },
+                        ));
+                    }
+                }
+                Err(err) => {
+                    error!(
+                        err = %err,
+                        start = %config.weekend_start,
+                        end = %config.weekend_end,
+                        mode = %config.weekend_mode,
+                        "failed to calculate weekend curfew window; check configuration"
                     );
-                    individual.push((
-                        start,
-                        end,
-                        WindowEvent {
-                            is_custom: true,
-                            event_time: start,
-                            country: "Global".into(),
-                            impact: "High".into(),
-                            title,
-                        },
-                    ));
                 }
             }
         }
@@ -354,6 +378,7 @@ pub fn event_matches_config(event: &WindowEvent, config: &RedFolderConfig) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::curfew::next_weekend_window;
 
     #[test]
     fn test_overlapping_event_merging() {
