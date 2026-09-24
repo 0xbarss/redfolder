@@ -43,15 +43,40 @@ impl Default for CalendarClient {
 }
 
 impl CalendarClient {
+    /// Returns the default platform cache directory for redfolder.
+    pub fn default_cache_dir() -> PathBuf {
+        std::env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(h).join(".cache").join("redfolder"))
+            .unwrap_or_else(|| std::env::temp_dir().join("redfolder_cache"))
+    }
+
     /// Create a new `CalendarClient` with an optional cache directory.
+    /// If `None`, defaults to `CalendarClient::default_cache_dir()`.
     pub fn new(cache_dir: Option<PathBuf>) -> Self {
+        let dir = cache_dir.or_else(|| Some(Self::default_cache_dir()));
         Self::with_options(
             Client::builder()
                 .timeout(Duration::from_secs(30))
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             CALENDAR_URL,
-            cache_dir,
+            dir,
+            Duration::from_secs(30),
+        )
+    }
+
+    /// Create a new `CalendarClient` without any local disk caching.
+    pub fn without_cache() -> Self {
+        Self::with_options(
+            Client::builder()
+                .timeout(Duration::from_secs(30))
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .build()
+                .unwrap_or_else(|_| Client::new()),
+            CALENDAR_URL,
+            None,
             Duration::from_secs(30),
         )
     }
