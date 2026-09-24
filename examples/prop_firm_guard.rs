@@ -25,7 +25,10 @@ async fn main() -> Result<()> {
 
     println!("--- RedFolder Prop Firm Risk Guard ---");
     println!("Currencies monitored: {:?}", prop_config.currencies);
-    println!("Buffer: {}m before, {}m after", prop_config.before_min, prop_config.after_min);
+    println!(
+        "Buffer: {}m before, {}m after",
+        prop_config.before_min, prop_config.after_min
+    );
     println!("Weekend Curfew Mode: {}", prop_config.weekend_mode);
 
     let engine = BlackoutEngine::compile(&events, &[&prop_config], chrono::Utc::now());

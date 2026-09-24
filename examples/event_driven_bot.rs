@@ -30,7 +30,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     // 3. Register our worker bot and receive its typed event stream
-    let mut event_rx = service.register_worker_events("eurusd_scalper", config).await;
+    let mut event_rx = service
+        .register_worker_events("eurusd_scalper", config)
+        .await;
 
     // 4. Also demonstrate subscribing a global listener (e.g. for Telegram/Discord alerts or logging)
     let mut global_bus = service.subscribe();
@@ -39,17 +41,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         while let Ok(event) = global_bus.recv().await {
             match &event {
-                RedFolderEvent::CalendarUpdated { total_events, total_windows } => {
-                    println!("[Audit Log] Economic calendar refreshed: {} events, {} active windows.", total_events, total_windows);
+                RedFolderEvent::CalendarUpdated {
+                    total_events,
+                    total_windows,
+                } => {
+                    println!(
+                        "[Audit Log] Economic calendar refreshed: {} events, {} active windows.",
+                        total_events, total_windows
+                    );
                 }
-                RedFolderEvent::BlackoutWarning { window, minutes_until_start, worker_id } => {
-                    println!("[Risk Alert] Worker {:?}: Window '{}' begins in {} minutes!", worker_id, window.summary_title(), minutes_until_start);
+                RedFolderEvent::BlackoutWarning {
+                    window,
+                    minutes_until_start,
+                    worker_id,
+                } => {
+                    println!(
+                        "[Risk Alert] Worker {:?}: Window '{}' begins in {} minutes!",
+                        worker_id,
+                        window.summary_title(),
+                        minutes_until_start
+                    );
                 }
                 RedFolderEvent::BlackoutStarted { window, worker_id } => {
-                    println!("[Risk Alert] Worker {:?}: ENTERED blackout '{}'.", worker_id, window.summary_title());
+                    println!(
+                        "[Risk Alert] Worker {:?}: ENTERED blackout '{}'.",
+                        worker_id,
+                        window.summary_title()
+                    );
                 }
                 RedFolderEvent::BlackoutEnded { window, worker_id } => {
-                    println!("[Risk Alert] Worker {:?}: EXITED blackout '{}'.", worker_id, window.summary_title());
+                    println!(
+                        "[Risk Alert] Worker {:?}: EXITED blackout '{}'.",
+                        worker_id,
+                        window.summary_title()
+                    );
                 }
             }
         }
@@ -61,14 +86,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
             match event {
-                RedFolderEvent::BlackoutWarning { window, minutes_until_start, .. } => {
-                    println!("\n⚠️  [BOT ACTION] ADVANCE WARNING: Blackout starts in {} minutes!", minutes_until_start);
+                RedFolderEvent::BlackoutWarning {
+                    window,
+                    minutes_until_start,
+                    ..
+                } => {
+                    println!(
+                        "\n⚠️  [BOT ACTION] ADVANCE WARNING: Blackout starts in {} minutes!",
+                        minutes_until_start
+                    );
                     println!("    Window: {}", window.summary_title());
                     println!("    -> Action: Cancelling pending limit orders...");
                     println!("    -> Action: Tightening stop-loss on open positions...");
                 }
                 RedFolderEvent::BlackoutStarted { window, .. } => {
-                    println!("\n🚨 [BOT ACTION] HARD BLACKOUT ACTIVE: {}", window.summary_title());
+                    println!(
+                        "\n🚨 [BOT ACTION] HARD BLACKOUT ACTIVE: {}",
+                        window.summary_title()
+                    );
                     println!("    Remaining: {} minutes", window.remaining_minutes());
                     println!("    -> Action: HALTING strategy execution.");
                     println!("    -> Action: Rejecting all new buy/sell signals.");
