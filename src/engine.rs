@@ -41,7 +41,8 @@ impl BlackoutEngine {
             all_impacts.extend(cfg.impacts.iter().cloned());
             max_before = Some(max_before.map_or(cfg.before_min, |m| m.max(cfg.before_min)));
             max_after = Some(max_after.map_or(cfg.after_min, |m| m.max(cfg.after_min)));
-            max_merge = Some(max_merge.map_or(cfg.merge_threshold_min, |m| m.max(cfg.merge_threshold_min)));
+            max_merge =
+                Some(max_merge.map_or(cfg.merge_threshold_min, |m| m.max(cfg.merge_threshold_min)));
         }
 
         if all_currencies.is_empty() {
@@ -175,11 +176,7 @@ impl BlackoutEngine {
     }
 
     /// Returns upcoming blackout windows within `hours` hours matching the configuration.
-    pub fn upcoming_blackouts(
-        &self,
-        config: &RedFolderConfig,
-        hours: u32,
-    ) -> Vec<BlackoutWindow> {
+    pub fn upcoming_blackouts(&self, config: &RedFolderConfig, hours: u32) -> Vec<BlackoutWindow> {
         let now = Utc::now();
         let cutoff = now + Duration::hours(hours as i64);
 
@@ -266,9 +263,10 @@ pub fn event_matches_config(event: &WindowEvent, config: &RedFolderConfig) -> bo
     if event.is_custom {
         config.weekend_enabled
     } else {
-        let currency_match = config.currencies.iter().any(|c| {
-            c.eq_ignore_ascii_case(&event.country) || c.eq_ignore_ascii_case("All")
-        });
+        let currency_match = config
+            .currencies
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&event.country) || c.eq_ignore_ascii_case("All"));
         let impact_match = config
             .impacts
             .iter()
@@ -338,7 +336,11 @@ mod tests {
             .impacts(vec!["High"])
             .build();
 
-        assert!(is_blackout_for_config(&usd_config, &[window.clone()], now));
+        assert!(is_blackout_for_config(
+            &usd_config,
+            std::slice::from_ref(&window),
+            now
+        ));
         assert!(!is_blackout_for_config(&eur_config, &[window], now));
     }
 }

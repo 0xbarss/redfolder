@@ -398,11 +398,7 @@ impl RedFolderService {
     }
 
     /// Return upcoming blackout windows for a specific worker within `hours` hours.
-    pub async fn get_upcoming_blackouts(
-        &self,
-        worker_id: &str,
-        hours: u32,
-    ) -> Vec<BlackoutWindow> {
+    pub async fn get_upcoming_blackouts(&self, worker_id: &str, hours: u32) -> Vec<BlackoutWindow> {
         let inner = self.inner.lock().await;
         let Some(worker) = inner.workers.get(worker_id) else {
             return Vec::new();
@@ -455,12 +451,16 @@ mod tests {
         }
 
         // Verify worker event channel received BlackoutWarning
-        let ev = worker_events.try_recv().expect("should receive warning event");
+        let ev = worker_events
+            .try_recv()
+            .expect("should receive warning event");
         assert!(ev.is_warning());
         assert_eq!(ev.worker_id(), Some("worker_usd"));
 
         // Verify global broadcast bus received warning
-        let bus_ev = broadcast_rx.try_recv().expect("broadcast should receive warning");
+        let bus_ev = broadcast_rx
+            .try_recv()
+            .expect("broadcast should receive warning");
         assert!(bus_ev.is_warning());
     }
 }

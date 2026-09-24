@@ -130,7 +130,11 @@ impl BlackoutWindow {
         } else if self.events.len() == 1 {
             self.events[0].title.clone()
         } else {
-            format!("{} (+{} events)", self.events[0].title, self.events.len() - 1)
+            format!(
+                "{} (+{} events)",
+                self.events[0].title,
+                self.events.len() - 1
+            )
         }
     }
 }

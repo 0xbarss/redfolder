@@ -82,9 +82,9 @@ pub fn next_weekend_window(
     if days_ahead == 0 && now >= start {
         let next_friday = (now + Duration::days(7)).date_naive();
         start = DateTime::<Utc>::from_naive_utc_and_offset(
-            next_friday
-                .and_hms_opt(sh, sm, 0)
-                .ok_or_else(|| RedFolderError::Curfew("invalid next start timestamp".to_string()))?,
+            next_friday.and_hms_opt(sh, sm, 0).ok_or_else(|| {
+                RedFolderError::Curfew("invalid next start timestamp".to_string())
+            })?,
             Utc,
         );
     }
@@ -94,9 +94,9 @@ pub fn next_weekend_window(
             // End at Monday 00:00 UTC (3 days after Friday)
             let monday_date = (start + Duration::days(3)).date_naive();
             DateTime::<Utc>::from_naive_utc_and_offset(
-                monday_date
-                    .and_hms_opt(0, 0, 0)
-                    .ok_or_else(|| RedFolderError::Curfew("invalid monday timestamp".to_string()))?,
+                monday_date.and_hms_opt(0, 0, 0).ok_or_else(|| {
+                    RedFolderError::Curfew("invalid monday timestamp".to_string())
+                })?,
                 Utc,
             )
         }

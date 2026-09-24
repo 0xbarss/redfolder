@@ -116,11 +116,33 @@ async fn main() -> Result<()> {
             } else {
                 match current {
                     Some(window) => {
-                        println!("\n{}", "========================================================".red().bold());
-                        println!(" {} {}", "🔴 STATUS:".bold(), "TRADING BLACKOUT ACTIVE".red().bold());
-                        println!("{}", "========================================================".red().bold());
-                        println!(" {} {} minutes", "Remaining Time:".bold(), window.remaining_minutes().to_string().yellow().bold());
-                        println!(" {} until {}", window.start.format("%Y-%m-%d %H:%M UTC"), window.end.format("%H:%M UTC").to_string().cyan());
+                        println!(
+                            "\n{}",
+                            "========================================================"
+                                .red()
+                                .bold()
+                        );
+                        println!(
+                            " {} {}",
+                            "🔴 STATUS:".bold(),
+                            "TRADING BLACKOUT ACTIVE".red().bold()
+                        );
+                        println!(
+                            "{}",
+                            "========================================================"
+                                .red()
+                                .bold()
+                        );
+                        println!(
+                            " {} {} minutes",
+                            "Remaining Time:".bold(),
+                            window.remaining_minutes().to_string().yellow().bold()
+                        );
+                        println!(
+                            " {} until {}",
+                            window.start.format("%Y-%m-%d %H:%M UTC"),
+                            window.end.format("%H:%M UTC").to_string().cyan()
+                        );
                         println!("\n {}", "Triggered Events:".bold());
                         for ev in &window.events {
                             println!(
@@ -134,14 +156,32 @@ async fn main() -> Result<()> {
                         println!();
                     }
                     None => {
-                        println!("\n{}", "========================================================".green().bold());
-                        println!(" {} {}", "🟢 STATUS:".bold(), "TRADING PERMITTED (NO ACTIVE BLACKOUT)".green().bold());
-                        println!("{}", "========================================================".green().bold());
+                        println!(
+                            "\n{}",
+                            "========================================================"
+                                .green()
+                                .bold()
+                        );
+                        println!(
+                            " {} {}",
+                            "🟢 STATUS:".bold(),
+                            "TRADING PERMITTED (NO ACTIVE BLACKOUT)".green().bold()
+                        );
+                        println!(
+                            "{}",
+                            "========================================================"
+                                .green()
+                                .bold()
+                        );
                         println!(" Currency: {}", currency.cyan());
                         let upcoming = engine.upcoming_blackouts(&config, 12);
                         if let Some(next) = upcoming.first() {
                             let mins_until = (next.start - chrono::Utc::now()).num_minutes();
-                            println!(" Next Blackout in: {} mins ({})", mins_until.to_string().yellow().bold(), next.summary_title());
+                            println!(
+                                " Next Blackout in: {} mins ({})",
+                                mins_until.to_string().yellow().bold(),
+                                next.summary_title()
+                            );
                         } else {
                             println!(" No blackouts scheduled within next 12 hours.");
                         }
@@ -169,9 +209,17 @@ async fn main() -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&upcoming)?);
             } else {
-                println!("\n{}", format!("── Upcoming Blackout Windows (Next {hours} Hours, {currency}) ──").cyan().bold());
+                println!(
+                    "\n{}",
+                    format!("── Upcoming Blackout Windows (Next {hours} Hours, {currency}) ──")
+                        .cyan()
+                        .bold()
+                );
                 if upcoming.is_empty() {
-                    println!(" {}", "No upcoming blackout windows in this time window.".green());
+                    println!(
+                        " {}",
+                        "No upcoming blackout windows in this time window.".green()
+                    );
                 } else {
                     for (i, w) in upcoming.iter().enumerate() {
                         let mins_until = (w.start - chrono::Utc::now()).num_minutes();
@@ -188,7 +236,12 @@ async fn main() -> Result<()> {
                             w.end.format("%H:%M UTC")
                         );
                         for ev in &w.events {
-                            println!("    • [{}] {} [{}]", ev.country.yellow(), ev.title, ev.impact.red());
+                            println!(
+                                "    • [{}] {} [{}]",
+                                ev.country.yellow(),
+                                ev.title,
+                                ev.impact.red()
+                            );
                         }
                     }
                 }
@@ -197,7 +250,10 @@ async fn main() -> Result<()> {
         }
 
         Commands::Sync => {
-            println!("{}", "Syncing economic calendar from ForexFactory...".cyan());
+            println!(
+                "{}",
+                "Syncing economic calendar from ForexFactory...".cyan()
+            );
             let events = client.fetch_remote().await?;
             client.save_cache(&events)?;
             println!(
@@ -215,7 +271,10 @@ async fn main() -> Result<()> {
             currency,
             impact,
         } => {
-            println!("{}", "Starting live RedFolder watcher (press Ctrl+C to exit)...".cyan());
+            println!(
+                "{}",
+                "Starting live RedFolder watcher (press Ctrl+C to exit)...".cyan()
+            );
             let config = RedFolderConfig::builder()
                 .currencies(vec![currency.clone()])
                 .impacts(vec![impact])
@@ -233,9 +292,17 @@ async fn main() -> Result<()> {
                 if in_blackout != last_status {
                     last_status = in_blackout;
                     if in_blackout {
-                        println!("\n[{}] 🚨 {}", now_str, "ENTERING BLACKOUT WINDOW!".red().bold());
+                        println!(
+                            "\n[{}] 🚨 {}",
+                            now_str,
+                            "ENTERING BLACKOUT WINDOW!".red().bold()
+                        );
                     } else {
-                        println!("\n[{}] 🟢 {}", now_str, "BLACKOUT CLEARED. TRADING PERMITTED.".green().bold());
+                        println!(
+                            "\n[{}] 🟢 {}",
+                            now_str,
+                            "BLACKOUT CLEARED. TRADING PERMITTED.".green().bold()
+                        );
                     }
                 }
 
@@ -257,7 +324,10 @@ async fn main() -> Result<()> {
                             next.summary_title().dimmed()
                         );
                     } else {
-                        print!("\r[{}] 🟢 CLEAR: no blackout scheduled in next 12h   ", now_str);
+                        print!(
+                            "\r[{}] 🟢 CLEAR: no blackout scheduled in next 12h   ",
+                            now_str
+                        );
                     }
                 }
                 std::io::Write::flush(&mut std::io::stdout()).ok();
