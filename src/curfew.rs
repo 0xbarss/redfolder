@@ -122,7 +122,7 @@ pub fn weekend_window_at(
         }
     };
 
-    if at <= recent_end {
+    if at < recent_end {
         Ok((recent_start, recent_end))
     } else {
         // Recent window has already passed; advance to next week's window
@@ -206,5 +206,24 @@ mod tests {
         assert!("weekend".parse::<WeekendMode>().is_ok());
         assert!("WEEKEND".parse::<WeekendMode>().is_ok());
         assert!("invalid".parse::<WeekendMode>().is_err());
+    }
+
+    #[test]
+    fn test_weekend_window_exact_end_boundary() {
+        use chrono::TimeZone;
+        // Friday 2026-06-05 20:30 UTC to Monday 2026-06-08 00:00 UTC
+        let fri_start = Utc.with_ymd_and_hms(2026, 6, 5, 20, 30, 0).unwrap();
+        let mon_end = Utc.with_ymd_and_hms(2026, 6, 8, 0, 0, 0).unwrap();
+
+        // One second before Monday midnight: still in current weekend window
+        let just_before = mon_end - Duration::seconds(1);
+        let (start1, end1) = weekend_window_at(just_before, "20:30", "21:00", "weekend").unwrap();
+        assert_eq!(start1, fri_start);
+        assert_eq!(end1, mon_end);
+
+        // Exactly at Monday 00:00:00 UTC: window has ended, must return next weekend's window
+        let (start2, end2) = weekend_window_at(mon_end, "20:30", "21:00", "weekend").unwrap();
+        assert_eq!(start2, fri_start + Duration::days(7));
+        assert_eq!(end2, mon_end + Duration::days(7));
     }
 }

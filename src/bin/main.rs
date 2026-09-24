@@ -254,13 +254,21 @@ async fn main() -> Result<()> {
                 "{}",
                 "Syncing economic calendar from ForexFactory...".cyan()
             );
-            let events = client.fetch_remote().await?;
-            client.save_cache(&events)?;
-            println!(
-                "{} Downloaded and cached {} economic events.",
-                "✔".green().bold(),
-                events.len().to_string().yellow().bold()
-            );
+            let events = client.force_fetch().await?;
+            if events.is_empty() {
+                println!(
+                    "{} {}",
+                    "⚠".yellow().bold(),
+                    "Remote calendar returned 0 events; preserved existing cache if present."
+                        .yellow()
+                );
+            } else {
+                println!(
+                    "{} Downloaded and cached {} economic events.",
+                    "✔".green().bold(),
+                    events.len().to_string().yellow().bold()
+                );
+            }
             if let Some(path) = client.cache_path() {
                 println!("  Cache file: {}", path.display().to_string().dimmed());
             }

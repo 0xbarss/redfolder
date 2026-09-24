@@ -1,7 +1,7 @@
 use crate::calendar::{parse_event_timing, RawCalendarEvent};
 use crate::config::RedFolderConfig;
 use crate::curfew::{weekend_window_at, weekend_window_title};
-use crate::types::{BlackoutWindow, EconomicEvent, EventTiming, WindowEvent};
+use crate::types::{BlackoutWindow, Currency, EconomicEvent, EventTiming, Impact, WindowEvent};
 use chrono::{DateTime, Duration, Utc};
 use tracing::{error, info};
 
@@ -14,6 +14,8 @@ pub struct BlackoutEngine {
     parsed_events: Vec<EconomicEvent>,
     /// Precompiled windows for backwards-compatible reference and single-worker setups.
     windows: Vec<BlackoutWindow>,
+    /// Configured source timezone for naive and all-day timestamps.
+    timezone: Option<chrono_tz::Tz>,
 }
 
 impl BlackoutEngine {
@@ -24,6 +26,7 @@ impl BlackoutEngine {
             raw_events: Vec::new(),
             parsed_events: Vec::new(),
             windows: Vec::new(),
+            timezone: None,
         }
     }
 
@@ -46,8 +49,7 @@ impl BlackoutEngine {
                 let dt = match &timing {
                     EventTiming::Exact(dt) => *dt,
                     EventTiming::AllDay(d) | EventTiming::TentativeDate(d) => {
-                        let naive = d.and_hms_opt(0, 0, 0)?;
-                        DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc)
+                        crate::calendar::date_to_utc_start(*d, default_tz)?
                     }
                 };
                 Some(EconomicEvent {
@@ -64,6 +66,7 @@ impl BlackoutEngine {
             raw_events: raw_events.to_vec(),
             parsed_events,
             windows: Vec::new(),
+            timezone: default_tz,
         }
     }
 
@@ -158,6 +161,12 @@ impl BlackoutEngine {
         !self.windows.is_empty()
     }
 
+    /// Access the source timezone configured for naive timestamps and all-day events, if any.
+    #[must_use]
+    pub fn timezone(&self) -> Option<chrono_tz::Tz> {
+        self.timezone
+    }
+
     /// Derives worker-specific blackout windows at runtime using the worker's own
     /// timing buffers (`before_min`, `after_min`), merge threshold, currencies, impacts,
     /// and weekend curfew configuration.
@@ -204,9 +213,14 @@ impl BlackoutEngine {
                 }
                 EventTiming::AllDay(date) => {
                     if config.include_all_day {
-                        if let Some(start_dt) = date.and_hms_opt(0, 0, 0) {
-                            let start = DateTime::<Utc>::from_naive_utc_and_offset(start_dt, Utc);
-                            let end = start + Duration::days(1);
+                        if let Some(start) =
+                            crate::calendar::date_to_utc_start(*date, self.timezone)
+                        {
+                            let end = crate::calendar::date_to_utc_start(
+                                *date + Duration::days(1),
+                                self.timezone,
+                            )
+                            .unwrap_or(start + Duration::days(1));
                             if end >= now {
                                 individual.push((
                                     start,
@@ -225,9 +239,14 @@ impl BlackoutEngine {
                 }
                 EventTiming::TentativeDate(date) => {
                     if config.include_tentative {
-                        if let Some(start_dt) = date.and_hms_opt(0, 0, 0) {
-                            let start = DateTime::<Utc>::from_naive_utc_and_offset(start_dt, Utc);
-                            let end = start + Duration::days(1);
+                        if let Some(start) =
+                            crate::calendar::date_to_utc_start(*date, self.timezone)
+                        {
+                            let end = crate::calendar::date_to_utc_start(
+                                *date + Duration::days(1),
+                                self.timezone,
+                            )
+                            .unwrap_or(start + Duration::days(1));
                             if end >= now {
                                 individual.push((
                                     start,
@@ -423,14 +442,15 @@ pub fn current_window_for_config(
 pub fn event_matches_economic_event(event: &EconomicEvent, config: &RedFolderConfig) -> bool {
     let currency_match = event.country.eq_ignore_ascii_case("All")
         || event.country.eq_ignore_ascii_case("Global")
-        || config
-            .currencies
-            .iter()
-            .any(|c| c.eq_ignore_ascii_case(&event.country) || c.eq_ignore_ascii_case("All"));
-    let impact_match = config
-        .impacts
-        .iter()
-        .any(|i| i.eq_ignore_ascii_case(&event.impact));
+        || config.currencies.iter().any(|c| {
+            let cfg_c: Currency = c.parse().unwrap();
+            cfg_c.matches_str(&event.country)
+        });
+    let event_impact: Impact = event.impact.parse().unwrap();
+    let impact_match = config.impacts.iter().any(|i| {
+        let cfg_i: Impact = i.parse().unwrap();
+        cfg_i == event_impact || cfg_i.matches_str(&event.impact)
+    });
 
     currency_match && impact_match
 }
@@ -443,14 +463,15 @@ pub fn event_matches_config(event: &WindowEvent, config: &RedFolderConfig) -> bo
     } else {
         let currency_match = event.country.eq_ignore_ascii_case("All")
             || event.country.eq_ignore_ascii_case("Global")
-            || config
-                .currencies
-                .iter()
-                .any(|c| c.eq_ignore_ascii_case(&event.country) || c.eq_ignore_ascii_case("All"));
-        let impact_match = config
-            .impacts
-            .iter()
-            .any(|i| i.eq_ignore_ascii_case(&event.impact));
+            || config.currencies.iter().any(|c| {
+                let cfg_c: Currency = c.parse().unwrap();
+                cfg_c.matches_str(&event.country)
+            });
+        let event_impact: Impact = event.impact.parse().unwrap();
+        let impact_match = config.impacts.iter().any(|i| {
+            let cfg_i: Impact = i.parse().unwrap();
+            cfg_i == event_impact || cfg_i.matches_str(&event.impact)
+        });
 
         currency_match && impact_match
     }

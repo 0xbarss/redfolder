@@ -96,6 +96,15 @@ impl Default for CalendarClient {
     }
 }
 
+/// Builds a fallback `reqwest::Client` ensuring the configured User-Agent is preserved.
+fn fallback_client() -> Client {
+    Client::builder()
+        .user_agent(DEFAULT_USER_AGENT)
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap_or_default()
+}
+
 impl CalendarClient {
     /// Returns the default platform cache directory for redfolder.
     #[must_use]
@@ -126,9 +135,9 @@ impl CalendarClient {
     #[must_use]
     pub fn new(cache_dir: Option<PathBuf>) -> Self {
         Self::try_new(cache_dir.clone()).unwrap_or_else(|err| {
-            error!(err=%err, "failed to build configured HTTP client; falling back to default");
+            error!(err=%err, "failed to build configured HTTP client; falling back to default with User-Agent");
             let dir = cache_dir.or_else(|| Some(Self::default_cache_dir()));
-            Self::with_options(Client::new(), CALENDAR_URL, dir, Duration::from_secs(30))
+            Self::with_options(fallback_client(), CALENDAR_URL, dir, Duration::from_secs(30))
         })
     }
 
@@ -150,8 +159,8 @@ impl CalendarClient {
     #[must_use]
     pub fn without_cache() -> Self {
         Self::try_without_cache().unwrap_or_else(|err| {
-            error!(err=%err, "failed to build configured HTTP client; falling back to default");
-            Self::with_options(Client::new(), CALENDAR_URL, None, Duration::from_secs(30))
+            error!(err=%err, "failed to build configured HTTP client; falling back to default with User-Agent");
+            Self::with_options(fallback_client(), CALENDAR_URL, None, Duration::from_secs(30))
         })
     }
 
@@ -342,7 +351,7 @@ impl CalendarClient {
         }))
     }
 
-    /// Save raw calendar events to the local disk cache (if cache path is set).
+    /// Save raw calendar events to the local disk cache atomically (if cache path is set).
     pub fn save_cache(&self, events: &[RawCalendarEvent]) -> Result<()> {
         let Some(path) = &self.cache_path else {
             return Ok(());
@@ -368,8 +377,24 @@ impl CalendarClient {
         };
 
         let json = serde_json::to_string_pretty(&cached_data)?;
-        std::fs::write(path, json)?;
-        debug!(path=%path.display(), count=%events.len(), "saved calendar cache with metadata");
+
+        // Atomic write: write to sibling temp file, flush to disk, then rename
+        let temp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+        let write_result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&temp_path)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&temp_path, path)?;
+            Ok(())
+        })();
+
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(crate::error::RedFolderError::Io(e));
+        }
+
+        debug!(path=%path.display(), count=%events.len(), "saved calendar cache atomically with metadata");
         Ok(())
     }
 
@@ -414,7 +439,7 @@ impl CalendarClient {
             return Some(CachedCalendarData {
                 metadata: CacheMetadata {
                     version: 0,
-                    fetched_at: Utc::now(),
+                    fetched_at: DateTime::<Utc>::UNIX_EPOCH,
                     expires_at: None,
                     event_count: events.len(),
                 },
@@ -434,16 +459,44 @@ impl CalendarClient {
     }
 
     /// Checks whether the disk cache exists and is within its configured TTL.
+    ///
+    /// Legacy caches (version 0) lacking fetch timestamps are rejected.
     #[must_use]
     pub fn is_cache_valid(&self) -> bool {
         let Some(data) = self.load_cache_data() else {
             return false;
         };
 
+        // Legacy cache (version 0) has no fetch timestamp or expiration; cannot verify validity
+        if data.metadata.version == 0 {
+            return false;
+        }
+
         if let Some(expires_at) = data.metadata.expires_at {
             Utc::now() <= expires_at
         } else {
             true
+        }
+    }
+
+    /// Fetch fresh calendar events directly from the remote API, bypassing cache,
+    /// protecting against empty responses overwriting good data, and saving to cache on success.
+    pub async fn force_fetch(&self) -> Result<Vec<RawCalendarEvent>> {
+        let events = self.fetch_remote().await?;
+        if events.is_empty() {
+            warn!("remote calendar returned 0 events during forced fetch; checking disk cache to protect existing data");
+            if let Some(cached) = self.load_cache() {
+                if !cached.is_empty() {
+                    warn!(count=%cached.len(), "preserved valid disk cache instead of overwriting with empty remote response");
+                    return Ok(cached);
+                }
+            }
+            Ok(events)
+        } else {
+            if let Err(e) = self.save_cache(&events) {
+                warn!(err=%e, "failed to persist calendar cache");
+            }
+            Ok(events)
         }
     }
 
@@ -485,6 +538,14 @@ impl CalendarClient {
                 error!(err=%e, "failed to download calendar; checking disk cache fallback");
                 if let Some(cached_data) = self.load_cache_data() {
                     if !cached_data.events.is_empty() {
+                        if cached_data.metadata.version == 0 {
+                            warn!(
+                                path = %self.cache_path.as_deref().unwrap_or(Path::new("")).display(),
+                                "legacy cache lacks fetch timestamp; rejecting as stale fallback"
+                            );
+                            return Err(e);
+                        }
+
                         let is_acceptable = if let Some(max_stale) = self.max_stale_cache_age {
                             let max_stale_chrono = chrono::Duration::from_std(max_stale)
                                 .unwrap_or_else(|_| chrono::Duration::hours(36));
@@ -602,8 +663,36 @@ pub fn parse_event_timing(
     None
 }
 
+/// Converts a naive calendar date to the start of that day (00:00:00) in the given timezone,
+/// converted to UTC. If no timezone is provided, defaults to 00:00:00 UTC.
+pub fn date_to_utc_start(
+    date: chrono::NaiveDate,
+    default_tz: Option<chrono_tz::Tz>,
+) -> Option<DateTime<Utc>> {
+    let naive = date.and_hms_opt(0, 0, 0)?;
+    if let Some(tz) = default_tz {
+        match tz.from_local_datetime(&naive) {
+            chrono::LocalResult::Single(dt) => Some(dt.with_timezone(&Utc)),
+            chrono::LocalResult::Ambiguous(earliest, _) => Some(earliest.with_timezone(&Utc)),
+            chrono::LocalResult::None => {
+                // If 00:00 does not exist due to DST spring-forward transition, advance to 01:00:00
+                date.and_hms_opt(1, 0, 0)
+                    .and_then(|alt| match tz.from_local_datetime(&alt) {
+                        chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => {
+                            Some(dt.with_timezone(&Utc))
+                        }
+                        chrono::LocalResult::None => None,
+                    })
+                    .or_else(|| Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc)))
+            }
+        }
+    } else {
+        Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+    }
+}
+
 /// Parse the date and time strings of a `RawCalendarEvent` into a UTC `DateTime`,
-/// using an optional default source timezone for naive timestamps.
+/// using an optional default source timezone for naive timestamps and all-day/tentative events.
 pub fn parse_event_datetime_with_tz(
     raw: &RawCalendarEvent,
     default_tz: Option<chrono_tz::Tz>,
@@ -611,9 +700,7 @@ pub fn parse_event_datetime_with_tz(
     let timing = parse_event_timing(raw, default_tz)?;
     match timing {
         EventTiming::Exact(dt) => Some(dt),
-        EventTiming::AllDay(d) | EventTiming::TentativeDate(d) => d
-            .and_hms_opt(0, 0, 0)
-            .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc)),
+        EventTiming::AllDay(d) | EventTiming::TentativeDate(d) => date_to_utc_start(d, default_tz),
     }
 }
 

@@ -322,14 +322,26 @@ impl RedFolderConfigBuilder {
         self
     }
 
-    /// Builds the configuration, panicking if parameters are invalid.
+    /// Builds the configuration, panicking if parameters fail validation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if configuration validation fails (e.g., empty currencies/impacts,
+    /// negative durations, or malformed curfew timestamps).
+    ///
+    /// For production use cases where configuration is loaded from untrusted external sources
+    /// (environment variables, TOML/JSON files, user input), prefer [`try_build`](Self::try_build)
+    /// to handle validation errors gracefully without panicking.
     #[must_use]
     pub fn build(self) -> RedFolderConfig {
-        self.try_build()
-            .expect("invalid RedFolderConfig parameters")
+        self.try_build().expect(
+            "invalid RedFolderConfig parameters: use try_build() for fallible initialization",
+        )
     }
 
     /// Validates and builds the configuration safely without panicking.
+    ///
+    /// Recommended for production applications to handle runtime configuration errors gracefully.
     pub fn try_build(self) -> crate::error::Result<RedFolderConfig> {
         self.config.validate()?;
         Ok(self.config)

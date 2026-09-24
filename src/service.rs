@@ -192,21 +192,26 @@ impl ServiceInner {
 
         // 2. Dispatch events to global broadcast bus and registered event listeners (with timeout guard)
         for ev in events_to_dispatch {
-            self.broadcast_tx.send(ev.clone()).ok();
-            for listener in &self.listeners {
-                let listener_clone = listener.clone();
-                let ev_clone = ev.clone();
-                tokio::spawn(async move {
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_secs(10),
-                        listener_clone.on_event(&ev_clone),
-                    )
-                    .await;
-                });
-            }
+            self.dispatch_event(ev);
         }
 
         next_transition
+    }
+
+    /// Dispatches an event to the global broadcast bus and registered event listeners.
+    fn dispatch_event(&self, event: RedFolderEvent) {
+        self.broadcast_tx.send(event.clone()).ok();
+        for listener in &self.listeners {
+            let listener_clone = listener.clone();
+            let ev_clone = event.clone();
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    listener_clone.on_event(&ev_clone),
+                )
+                .await;
+            });
+        }
     }
 }
 
@@ -221,6 +226,7 @@ impl ServiceInner {
 /// - Deterministic lifecycle management with `CancellationToken` and tracked join handles.
 pub struct RedFolderService {
     inner: Arc<Mutex<ServiceInner>>,
+    refresh_lock: Arc<Mutex<()>>,
     broadcast_tx: broadcast::Sender<RedFolderEvent>,
     cancel_token: Arc<Mutex<Option<CancellationToken>>>,
     task_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
@@ -244,6 +250,7 @@ impl RedFolderService {
                 broadcast_tx.clone(),
                 notify.clone(),
             ))),
+            refresh_lock: Arc::new(Mutex::new(())),
             broadcast_tx,
             cancel_token: Arc::new(Mutex::new(None)),
             task_handles: Arc::new(Mutex::new(Vec::new())),
@@ -422,7 +429,8 @@ impl RedFolderService {
         }
 
         // Perform initial calendar synchronization fallibly
-        if let Err(e) = self.refresh().await {
+        if let Err(e) = Self::fetch_and_compile(&self.inner, &self.refresh_lock, false, false).await
+        {
             let mut inner = self.inner.lock().await;
             inner.state = ServiceState::Stopped;
             return Err(e);
@@ -436,6 +444,7 @@ impl RedFolderService {
         // 1. Daily midnight fetch loop
         {
             let inner_arc = self.inner.clone();
+            let refresh_lock_arc = self.refresh_lock.clone();
             let token = cancel_token.child_token();
             let handle = tokio::spawn(async move {
                 loop {
@@ -449,7 +458,12 @@ impl RedFolderService {
 
                     tokio::select! {
                         _ = tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)) => {
-                            let _ = Self::fetch_and_compile(&inner_arc, false).await;
+                            tokio::select! {
+                                _ = Self::fetch_and_compile(&inner_arc, &refresh_lock_arc, false, true) => {}
+                                _ = token.cancelled() => {
+                                    break;
+                                }
+                            }
                         }
                         _ = token.cancelled() => {
                             break;
@@ -521,9 +535,13 @@ impl RedFolderService {
         }
         self.notify.notify_waiters();
 
-        let handles: Vec<_> = self.task_handles.lock().await.drain(..).collect();
-        for handle in handles {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        let mut handles: Vec<_> = self.task_handles.lock().await.drain(..).collect();
+        for handle in &mut handles {
+            let res = tokio::time::timeout(std::time::Duration::from_secs(3), &mut *handle).await;
+            if res.is_err() {
+                handle.abort();
+                let _ = handle.await;
+            }
         }
 
         {
@@ -532,22 +550,28 @@ impl RedFolderService {
         }
     }
 
-    /// Manually trigger a forced calendar download and recompile blackout windows.
+    /// Manually trigger a calendar download and recompile blackout windows.
     pub async fn refresh(&self) -> Result<()> {
-        Self::fetch_and_compile(&self.inner, true).await
+        Self::fetch_and_compile(&self.inner, &self.refresh_lock, false, false).await
     }
 
-    /// Force a fresh calendar fetch and window compilation, bypassing daily cache.
+    /// Force a fresh calendar fetch from the remote API, bypassing cache.
     pub async fn force_refresh(&self) -> Result<()> {
-        self.refresh().await
+        Self::fetch_and_compile(&self.inner, &self.refresh_lock, true, false).await
     }
 
     /// Internal helper that fetches events and compiles windows without holding mutex across network I/O.
-    async fn fetch_and_compile(inner: &Arc<Mutex<ServiceInner>>, force: bool) -> Result<()> {
+    async fn fetch_and_compile(
+        inner: &Arc<Mutex<ServiceInner>>,
+        refresh_lock: &Arc<Mutex<()>>,
+        force_remote: bool,
+        skip_if_already_fetched_today: bool,
+    ) -> Result<()> {
+        let _refresh_guard = refresh_lock.lock().await;
         let today = Utc::now().date_naive();
 
-        // 1. Check if already fetched today under lock (unless force refresh is requested)
-        if !force {
+        // 1. Check if already fetched today under lock (if requested by scheduled loop)
+        if skip_if_already_fetched_today {
             let state = inner.lock().await;
             if state.last_fetch_date == Some(today) && !state.engine.is_empty() {
                 debug!("calendar already fetched and compiled for today");
@@ -560,7 +584,11 @@ impl RedFolderService {
             let state = inner.lock().await;
             (state.client.clone(), state.client.calendar_timezone())
         };
-        let raw = client.fetch_or_cached().await?;
+        let raw = if force_remote {
+            client.force_fetch().await?
+        } else {
+            client.fetch_or_cached().await?
+        };
 
         // 3. Re-acquire lock to compile windows into engine
         let mut state = inner.lock().await;
@@ -574,19 +602,19 @@ impl RedFolderService {
 
         state.engine = BlackoutEngine::compile_with_tz(&raw, &config_refs, Utc::now(), client_tz);
         state.last_fetch_date = Some(today);
+
+        // Immediately reconcile worker states with newly compiled engine
+        state.check_and_notify_workers();
         state.notify.notify_waiters();
 
         let total_windows = state.engine.windows().len();
         info!(windows=%total_windows, "refreshed economic calendar windows");
 
-        // Broadcast CalendarUpdated event
-        state
-            .broadcast_tx
-            .send(RedFolderEvent::CalendarUpdated {
-                total_events: raw.len(),
-                total_windows,
-            })
-            .ok();
+        // Centralized dispatch to both broadcast channel and EventListeners
+        state.dispatch_event(RedFolderEvent::CalendarUpdated {
+            total_events: raw.len(),
+            total_windows,
+        });
 
         Ok(())
     }

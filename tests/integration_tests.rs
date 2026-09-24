@@ -967,3 +967,460 @@ async fn test_windows_for_worker_isolation() {
     // Swing buffer is 30 + 30 = 60 minutes
     assert_eq!(swing_windows[0].duration_minutes(), 60);
 }
+
+#[tokio::test]
+async fn test_calendar_updated_reaches_both_broadcast_and_event_listener() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+
+    let good_events = vec![redfolder::calendar::RawCalendarEvent {
+        title: "Initial CPI".into(),
+        country: "USD".into(),
+        date: "2026-06-15T12:30:00Z".into(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+    let client = redfolder::calendar::CalendarClient::new(Some(cache_dir));
+    client.save_cache(&good_events).unwrap();
+
+    let service = RedFolderService::with_client(client);
+
+    let listener = Arc::new(MockAuditListener::new());
+    service.add_listener(listener.clone()).await;
+
+    let mut broadcast_rx = service.subscribe();
+
+    let config = RedFolderConfig::default();
+    let _rx = service.register_worker("w1", config).await;
+
+    // Trigger refresh
+    service.refresh().await.expect("refresh should succeed");
+
+    // Broadcast bus must receive CalendarUpdated
+    let ev = broadcast_rx
+        .recv()
+        .await
+        .expect("broadcast should receive event");
+    assert!(matches!(ev, RedFolderEvent::CalendarUpdated { .. }));
+
+    // Allow tokio tasks to run listener callbacks
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Problem 1 verification: CalendarUpdated reached EventListener!
+    assert!(
+        listener.calendars.load(Ordering::SeqCst) >= 1,
+        "CalendarUpdated event must reach registered EventListener"
+    );
+}
+
+#[tokio::test]
+async fn test_legacy_cache_older_than_max_stale_age_rejected() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+    let cache_file = cache_dir.join(redfolder::DEFAULT_CACHE_FILENAME);
+
+    // Write unversioned legacy JSON array
+    let legacy_json = r#"[
+        {
+            "title": "Old Legacy Event",
+            "country": "USD",
+            "date": "2025-01-01T12:00:00Z",
+            "time": "",
+            "impact": "High"
+        }
+    ]"#;
+    std::fs::write(&cache_file, legacy_json).unwrap();
+
+    // Client with unreachable URL and max_stale_age = 24h
+    let client = redfolder::calendar::CalendarClient::with_options(
+        reqwest::Client::new(),
+        "http://127.0.0.1:9/unreachable",
+        Some(cache_dir),
+        std::time::Duration::from_millis(50),
+    )
+    .with_max_stale_age(Some(std::time::Duration::from_secs(24 * 3600)));
+
+    // Problem 3 verification: legacy cache must NOT bypass stale cache check!
+    let res = client.fetch_or_cached().await;
+    assert!(
+        res.is_err(),
+        "legacy cache without verified timestamp must be rejected as stale fallback"
+    );
+}
+
+#[tokio::test]
+async fn test_force_refresh_bypasses_cache_with_mock_server() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+
+    // 1. Populate cache with Event A
+    let initial_events = vec![redfolder::calendar::RawCalendarEvent {
+        title: "Cached Event A".into(),
+        country: "USD".into(),
+        date: "2026-06-10T12:00:00Z".into(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+    let setup_client = redfolder::calendar::CalendarClient::new(Some(cache_dir.clone()));
+    setup_client.save_cache(&initial_events).unwrap();
+
+    // 2. Mock server returning Event B
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock_url = format!("http://{}", addr);
+
+    let future_time = (Utc::now() + Duration::hours(2)).to_rfc3339();
+    let server_task = tokio::spawn(async move {
+        if let Ok((mut socket, _)) = listener.accept().await {
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let body = format!(
+                r#"[{{"title":"Remote Event B","country":"USD","date":"{}","time":"","impact":"High"}}]"#,
+                future_time
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(resp.as_bytes()).await;
+        }
+    });
+
+    let client = redfolder::calendar::CalendarClient::with_options(
+        reqwest::Client::new(),
+        mock_url,
+        Some(cache_dir),
+        std::time::Duration::from_secs(2),
+    );
+    let service = RedFolderService::with_client(client);
+    let cfg = RedFolderConfig::builder()
+        .weekend_curfew(false, "20:00", "21:00", "short")
+        .build();
+    let _rx = service.register_worker("w_force", cfg).await;
+
+    // Problem 4 verification: force_refresh() must hit remote and return Event B, not cached Event A!
+    service
+        .force_refresh()
+        .await
+        .expect("force refresh should succeed");
+    server_task.await.unwrap();
+
+    let windows = service.windows_for_worker("w_force").await;
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0].events[0].title, "Remote Event B");
+}
+
+#[tokio::test]
+async fn test_concurrent_refreshes_are_serialized() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+
+    let good_events = vec![redfolder::calendar::RawCalendarEvent {
+        title: "Concurrent CPI".into(),
+        country: "USD".into(),
+        date: "2026-06-15T12:30:00Z".into(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+    let client = redfolder::calendar::CalendarClient::new(Some(cache_dir));
+    client.save_cache(&good_events).unwrap();
+
+    let service = Arc::new(RedFolderService::with_client(client));
+    let cfg = RedFolderConfig::default();
+    let _rx = service.register_worker("w_concurrent", cfg).await;
+
+    // Problem 5 verification: 5 concurrent refresh tasks run without racing or panic
+    let mut handles = Vec::new();
+    for _ in 0..5 {
+        let s = service.clone();
+        handles.push(tokio::spawn(async move { s.refresh().await }));
+    }
+
+    for h in handles {
+        let res = h.await.unwrap();
+        assert!(res.is_ok(), "concurrent refresh must succeed");
+    }
+}
+
+#[test]
+fn test_impact_aliases_high_vs_red_normalization() {
+    use redfolder::types::EconomicEvent;
+
+    let now = Utc::now();
+    let event_high = EconomicEvent {
+        title: "US CPI".into(),
+        country: "USD".into(),
+        impact: "High".into(),
+        datetime: now,
+        timing: redfolder::types::EventTiming::Exact(now),
+    };
+    let event_red = EconomicEvent {
+        title: "US NFP".into(),
+        country: "USD".into(),
+        impact: "Red".into(),
+        datetime: now,
+        timing: redfolder::types::EventTiming::Exact(now),
+    };
+
+    // Config with impact "Red" must match event with impact "High"
+    let cfg_red = RedFolderConfig::builder()
+        .currencies(vec!["USD"])
+        .impacts(vec!["Red"])
+        .build();
+    assert!(
+        redfolder::engine::event_matches_economic_event(&event_high, &cfg_red),
+        "Config with impact 'Red' must match event with impact 'High'"
+    );
+
+    // Config with impact "High" must match event with impact "Red"
+    let cfg_high = RedFolderConfig::builder()
+        .currencies(vec!["USD"])
+        .impacts(vec!["High"])
+        .build();
+    assert!(
+        redfolder::engine::event_matches_economic_event(&event_red, &cfg_high),
+        "Config with impact 'High' must match event with impact 'Red'"
+    );
+
+    // Config with impact "med" must match event with impact "Medium"
+    let event_med = EconomicEvent {
+        title: "ECB Speech".into(),
+        country: "EUR".into(),
+        impact: "Medium".into(),
+        datetime: now,
+        timing: redfolder::types::EventTiming::Exact(now),
+    };
+    let cfg_med = RedFolderConfig::builder()
+        .currencies(vec!["EUR"])
+        .impacts(vec!["med"])
+        .build();
+    assert!(
+        redfolder::engine::event_matches_economic_event(&event_med, &cfg_med),
+        "Config with impact 'med' must match event with impact 'Medium'"
+    );
+}
+
+#[test]
+fn test_all_day_events_in_non_utc_timezone() {
+    // Problem 9 verification: all-day event in America/New_York (EDT, UTC-4)
+    let raw = vec![redfolder::calendar::RawCalendarEvent {
+        title: "US Independence Day".into(),
+        country: "USD".into(),
+        date: "2026-07-04".into(),
+        time: "All Day".into(),
+        impact: "High".into(),
+    }];
+
+    let ny_tz = chrono_tz::America::New_York;
+    let now = chrono::NaiveDate::from_ymd_opt(2026, 7, 4)
+        .unwrap()
+        .and_hms_opt(5, 0, 0)
+        .unwrap()
+        .and_utc();
+
+    let cfg = RedFolderConfig::builder()
+        .currencies(vec!["USD"])
+        .impacts(vec!["High"])
+        .weekend_curfew(false, "20:00", "21:00", "short")
+        .include_all_day(true)
+        .build();
+
+    let engine = BlackoutEngine::compile_with_tz(&raw, &[&cfg], now, Some(ny_tz));
+    let windows = engine.windows_for_config(&cfg, now);
+
+    assert_eq!(windows.len(), 1);
+    // Midnight in New York (EDT, UTC-4) is 04:00 UTC
+    assert_eq!(
+        windows[0].start.format("%H:%M UTC").to_string(),
+        "04:00 UTC"
+    );
+    assert_eq!(windows[0].end.format("%H:%M UTC").to_string(), "04:00 UTC");
+    assert_eq!(windows[0].duration_minutes(), 1440);
+}
+
+#[tokio::test]
+async fn test_empty_remote_feed_preserves_cache_on_force_fetch() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+
+    // 1. Populate cache with valid event
+    let good_events = vec![redfolder::calendar::RawCalendarEvent {
+        title: "Good CPI".into(),
+        country: "USD".into(),
+        date: "2026-06-15T12:30:00Z".into(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+    let client_setup = redfolder::calendar::CalendarClient::new(Some(cache_dir.clone()));
+    client_setup.save_cache(&good_events).unwrap();
+
+    // 2. Mock server returning empty array `[]`
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock_url = format!("http://{}", addr);
+
+    let _server = tokio::spawn(async move {
+        if let Ok((mut socket, _)) = listener.accept().await {
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]";
+            let _ = socket.write_all(resp.as_bytes()).await;
+        }
+    });
+
+    let client = redfolder::calendar::CalendarClient::with_options(
+        reqwest::Client::new(),
+        mock_url,
+        Some(cache_dir),
+        std::time::Duration::from_secs(2),
+    );
+
+    // Problem 8 verification: force_fetch preserves cached event when remote returns []
+    let events = client
+        .force_fetch()
+        .await
+        .expect("should return preserved cache");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].title, "Good CPI");
+}
+
+#[tokio::test]
+async fn test_refresh_reconciles_worker_state_immediately() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+
+    let client = redfolder::calendar::CalendarClient::new(Some(cache_dir.clone()));
+    let service = RedFolderService::with_client(client);
+
+    let cfg = RedFolderConfig::builder()
+        .currencies(vec!["USD"])
+        .impacts(vec!["High"])
+        .buffer_minutes(15, 15)
+        .build();
+
+    let mut event_rx = service.register_worker_events("w_lag", cfg).await;
+    assert!(!service.is_blackout("w_lag").await);
+
+    // Save event that is happening right now into cache
+    let now = Utc::now();
+    let active_event = vec![redfolder::calendar::RawCalendarEvent {
+        title: "Active FOMC".into(),
+        country: "USD".into(),
+        date: now.to_rfc3339(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+    let client2 = redfolder::calendar::CalendarClient::new(Some(cache_dir));
+    client2.save_cache(&active_event).unwrap();
+
+    // Refresh calendar
+    service.refresh().await.unwrap();
+
+    // Problem 10 verification: worker blackout state is reconciled IMMEDIATELY after refresh()
+    assert!(
+        service.is_blackout("w_lag").await,
+        "worker state must be immediately in blackout after refresh without background lag"
+    );
+
+    let ev = event_rx
+        .try_recv()
+        .expect("should receive BlackoutStarted event");
+    assert!(ev.is_blackout_started());
+}
+
+#[test]
+fn test_atomic_cache_write_leaves_no_temporary_files() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+
+    let client = redfolder::calendar::CalendarClient::new(Some(cache_dir.clone()));
+    let events = vec![redfolder::calendar::RawCalendarEvent {
+        title: "Atomic Test".into(),
+        country: "USD".into(),
+        date: "2026-06-15T12:00:00Z".into(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+
+    // Problem 7 verification: atomic save_cache succeeds and cleans up temporary file
+    client
+        .save_cache(&events)
+        .expect("atomic save should succeed");
+
+    let cache_file = cache_dir.join(redfolder::DEFAULT_CACHE_FILENAME);
+    assert!(cache_file.exists());
+
+    // Verify no leftover .tmp files
+    let mut tmp_count = 0;
+    for entry in std::fs::read_dir(&cache_dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.contains(".tmp") {
+            tmp_count += 1;
+        }
+    }
+    assert_eq!(
+        tmp_count, 0,
+        "atomic write must clean up any temporary files"
+    );
+}
+
+#[tokio::test]
+async fn test_stop_during_delayed_http_request() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+
+    // Mock server that accepts connection but delays response by 5 seconds
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock_url = format!("http://{}", addr);
+
+    let _server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]";
+                let _ = socket.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let client = redfolder::calendar::CalendarClient::with_options(
+        reqwest::Client::new(),
+        mock_url,
+        Some(cache_dir),
+        std::time::Duration::from_secs(10),
+    );
+
+    let service = Arc::new(RedFolderService::with_client(client));
+    let cfg = RedFolderConfig::default();
+    let _rx = service.register_worker("w_slow", cfg).await;
+
+    // Spawn a long-running refresh task in background
+    let s_clone = service.clone();
+    let refresh_task = tokio::spawn(async move { s_clone.refresh().await });
+
+    // Wait 50ms for request to begin
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Problem 2 verification: stop() must complete promptly even during in-flight I/O
+    let start_stop = tokio::time::Instant::now();
+    service.stop().await;
+    let elapsed = start_stop.elapsed();
+
+    assert!(elapsed < std::time::Duration::from_secs(4));
+    assert_eq!(service.state().await, ServiceState::Stopped);
+
+    let _ = refresh_task.await;
+}
