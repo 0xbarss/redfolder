@@ -1,5 +1,6 @@
 use crate::error::Result;
-use chrono::{DateTime, NaiveDateTime, Utc};
+use crate::types::EventTiming;
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -85,6 +86,8 @@ pub struct CalendarClient {
     cache_path: Option<PathBuf>,
     request_timeout: Duration,
     cache_ttl: Option<Duration>,
+    calendar_timezone: Option<chrono_tz::Tz>,
+    max_stale_cache_age: Option<Duration>,
 }
 
 impl Default for CalendarClient {
@@ -181,7 +184,46 @@ impl CalendarClient {
             cache_path,
             request_timeout,
             cache_ttl: None,
+            calendar_timezone: None,
+            max_stale_cache_age: Some(Duration::from_secs(36 * 3600)),
         }
+    }
+
+    /// Configure the default source timezone for naive calendar timestamps.
+    #[must_use]
+    pub fn with_timezone(mut self, tz: chrono_tz::Tz) -> Self {
+        self.calendar_timezone = Some(tz);
+        self
+    }
+
+    /// Set the default source timezone for naive calendar timestamps.
+    pub fn set_calendar_timezone(&mut self, tz: Option<chrono_tz::Tz>) {
+        self.calendar_timezone = tz;
+    }
+
+    /// Default source timezone if configured.
+    #[must_use]
+    pub fn calendar_timezone(&self) -> Option<chrono_tz::Tz> {
+        self.calendar_timezone
+    }
+
+    /// Configure the maximum allowable age for stale cache fallback on network failures.
+    /// If `None`, stale cache fallback is disabled.
+    #[must_use]
+    pub fn with_max_stale_age(mut self, max_age: Option<Duration>) -> Self {
+        self.max_stale_cache_age = max_age;
+        self
+    }
+
+    /// Set maximum allowable age for stale cache fallback.
+    pub fn set_max_stale_cache_age(&mut self, max_age: Option<Duration>) {
+        self.max_stale_cache_age = max_age;
+    }
+
+    /// Configured maximum stale cache age.
+    #[must_use]
+    pub fn max_stale_cache_age(&self) -> Option<Duration> {
+        self.max_stale_cache_age
     }
 
     /// Configure an optional Time-To-Live (TTL) for the local disk cache.
@@ -349,10 +391,20 @@ impl CalendarClient {
         // 1. Try parsing full CachedCalendarData with metadata
         if let Ok(cached) = serde_json::from_str::<CachedCalendarData>(&data) {
             if cached.metadata.version == 1 {
+                if cached.metadata.event_count != cached.events.len() {
+                    warn!(
+                        path = %path.display(),
+                        expected = cached.metadata.event_count,
+                        actual = cached.events.len(),
+                        "calendar cache event count mismatch; rejecting corrupted cache"
+                    );
+                    return None;
+                }
                 debug!(path=%path.display(), version=%cached.metadata.version, count=%cached.events.len(), "loaded structured calendar cache v1");
                 return Some(cached);
             } else {
                 warn!(path=%path.display(), version=%cached.metadata.version, "unsupported cache version; ignoring");
+                return None;
             }
         }
 
@@ -430,40 +482,51 @@ impl CalendarClient {
                 }
             }
             Err(e) => {
-                error!(err=%e, "failed to download calendar; checking disk cache");
-                match self.load_cache() {
-                    Some(cached) if !cached.is_empty() => {
-                        warn!(count=%cached.len(), "using fallback cached calendar data");
-                        Ok(cached)
+                error!(err=%e, "failed to download calendar; checking disk cache fallback");
+                if let Some(cached_data) = self.load_cache_data() {
+                    if !cached_data.events.is_empty() {
+                        let is_acceptable = if let Some(max_stale) = self.max_stale_cache_age {
+                            let max_stale_chrono = chrono::Duration::from_std(max_stale)
+                                .unwrap_or_else(|_| chrono::Duration::hours(36));
+                            let age = Utc::now() - cached_data.metadata.fetched_at;
+                            age <= max_stale_chrono
+                        } else {
+                            false
+                        };
+
+                        if is_acceptable {
+                            warn!(count=%cached_data.events.len(), "using fallback cached calendar data");
+                            return Ok(cached_data.events);
+                        } else {
+                            warn!(
+                                fetched_at = %cached_data.metadata.fetched_at,
+                                "cached calendar data is too stale or stale fallback disabled; rejecting fallback"
+                            );
+                        }
                     }
-                    _ => Err(e),
                 }
+                Err(e)
             }
         }
     }
 }
 
-/// Parse the date and time strings of a `RawCalendarEvent` into a UTC `DateTime`.
-/// Supports RFC-3339 timestamps (with timezone offset) as well as 12-hour AM/PM formats,
-/// all-day events, and tentative releases.
-pub fn parse_event_datetime(raw: &RawCalendarEvent) -> Option<DateTime<Utc>> {
+/// Parse the timing structure of a `RawCalendarEvent`.
+///
+/// Distinguishes between exact releases, tentative releases, and all-day events.
+/// If `default_tz` is provided and the timestamp is naive, interprets the time in that timezone
+/// with automatic Daylight Saving Time (DST) adjustment.
+pub fn parse_event_timing(
+    raw: &RawCalendarEvent,
+    default_tz: Option<chrono_tz::Tz>,
+) -> Option<EventTiming> {
     let date_trimmed = raw.date.trim();
     if date_trimmed.is_empty() {
         return None;
     }
 
-    // 1. Try timezone-aware RFC3339 string (e.g. "2024-06-10T12:30:00-04:00")
-    if let Ok(dt) = DateTime::parse_from_rfc3339(date_trimmed) {
-        return Some(dt.with_timezone(&Utc));
-    }
-
-    // 2. Try standard ISO8601 with offset or Z
-    if let Ok(dt) = DateTime::parse_from_str(date_trimmed, "%+") {
-        return Some(dt.with_timezone(&Utc));
-    }
-
-    // 3. Handle "All Day" or "Tentative" events
-    if raw.is_all_day() || raw.is_tentative() {
+    // 1. All-Day events
+    if raw.is_all_day() {
         let date_part = date_trimmed
             .split_whitespace()
             .next()
@@ -471,14 +534,36 @@ pub fn parse_event_datetime(raw: &RawCalendarEvent) -> Option<DateTime<Utc>> {
         let date_formats = ["%Y-%m-%d", "%m-%d-%Y", "%m/%d/%Y", "%Y/%m/%d"];
         for fmt in date_formats {
             if let Ok(naive_date) = chrono::NaiveDate::parse_from_str(date_part, fmt) {
-                if let Some(naive_dt) = naive_date.and_hms_opt(0, 0, 0) {
-                    return Some(DateTime::<Utc>::from_naive_utc_and_offset(naive_dt, Utc));
-                }
+                return Some(EventTiming::AllDay(naive_date));
             }
         }
     }
 
-    // 4. Combine date + time (e.g. "06-10-2024 8:30am" or "2024-06-10 14:30")
+    // 2. Tentative events
+    if raw.is_tentative() {
+        let date_part = date_trimmed
+            .split_whitespace()
+            .next()
+            .unwrap_or(date_trimmed);
+        let date_formats = ["%Y-%m-%d", "%m-%d-%Y", "%m/%d/%Y", "%Y/%m/%d"];
+        for fmt in date_formats {
+            if let Ok(naive_date) = chrono::NaiveDate::parse_from_str(date_part, fmt) {
+                return Some(EventTiming::TentativeDate(naive_date));
+            }
+        }
+    }
+
+    // 3. Timezone-aware RFC3339 string (e.g. "2026-06-05T12:30:00-04:00")
+    if let Ok(dt) = DateTime::parse_from_rfc3339(date_trimmed) {
+        return Some(EventTiming::Exact(dt.with_timezone(&Utc)));
+    }
+
+    // 4. Standard ISO8601 with offset or Z
+    if let Ok(dt) = DateTime::parse_from_str(date_trimmed, "%+") {
+        return Some(EventTiming::Exact(dt.with_timezone(&Utc)));
+    }
+
+    // 5. Combine naive date + time (e.g. "06-10-2026 8:30am" or "2026-06-10 14:30")
     let time_str = if raw.time.trim().is_empty() {
         "12:00am"
     } else {
@@ -486,7 +571,6 @@ pub fn parse_event_datetime(raw: &RawCalendarEvent) -> Option<DateTime<Utc>> {
     };
     let dt_str = format!("{date_trimmed} {time_str}");
 
-    // Try common date/time formats
     let formats = [
         "%m-%d-%Y %I:%M%p",
         "%Y-%m-%d %I:%M%p",
@@ -500,11 +584,44 @@ pub fn parse_event_datetime(raw: &RawCalendarEvent) -> Option<DateTime<Utc>> {
 
     for fmt in formats {
         if let Ok(naive) = NaiveDateTime::parse_from_str(&dt_str, fmt) {
-            return Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc));
+            let utc_dt = if let Some(tz) = default_tz {
+                match tz.from_local_datetime(&naive) {
+                    chrono::LocalResult::Single(dt) => dt.with_timezone(&Utc),
+                    chrono::LocalResult::Ambiguous(earliest, _) => earliest.with_timezone(&Utc),
+                    chrono::LocalResult::None => {
+                        DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc)
+                    }
+                }
+            } else {
+                DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc)
+            };
+            return Some(EventTiming::Exact(utc_dt));
         }
     }
 
     None
+}
+
+/// Parse the date and time strings of a `RawCalendarEvent` into a UTC `DateTime`,
+/// using an optional default source timezone for naive timestamps.
+pub fn parse_event_datetime_with_tz(
+    raw: &RawCalendarEvent,
+    default_tz: Option<chrono_tz::Tz>,
+) -> Option<DateTime<Utc>> {
+    let timing = parse_event_timing(raw, default_tz)?;
+    match timing {
+        EventTiming::Exact(dt) => Some(dt),
+        EventTiming::AllDay(d) | EventTiming::TentativeDate(d) => d
+            .and_hms_opt(0, 0, 0)
+            .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc)),
+    }
+}
+
+/// Parse the date and time strings of a `RawCalendarEvent` into a UTC `DateTime`.
+/// Supports RFC-3339 timestamps (with timezone offset) as well as 12-hour AM/PM formats,
+/// all-day events, and tentative releases (defaulting naive timestamps to UTC).
+pub fn parse_event_datetime(raw: &RawCalendarEvent) -> Option<DateTime<Utc>> {
+    parse_event_datetime_with_tz(raw, None)
 }
 
 #[cfg(test)]

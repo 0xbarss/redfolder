@@ -1,7 +1,7 @@
-use crate::calendar::{parse_event_datetime, RawCalendarEvent};
+use crate::calendar::{parse_event_timing, RawCalendarEvent};
 use crate::config::RedFolderConfig;
 use crate::curfew::{weekend_window_at, weekend_window_title};
-use crate::types::{BlackoutWindow, EconomicEvent, WindowEvent};
+use crate::types::{BlackoutWindow, EconomicEvent, EventTiming, WindowEvent};
 use chrono::{DateTime, Duration, Utc};
 use tracing::{error, info};
 
@@ -27,18 +27,35 @@ impl BlackoutEngine {
         }
     }
 
-    /// Construct engine from raw calendar events.
+    /// Construct engine from raw calendar events using default UTC for naive timestamps.
     #[must_use]
     pub fn from_events(raw_events: &[RawCalendarEvent]) -> Self {
+        Self::from_events_with_tz(raw_events, None)
+    }
+
+    /// Construct engine from raw calendar events with an optional default source timezone.
+    #[must_use]
+    pub fn from_events_with_tz(
+        raw_events: &[RawCalendarEvent],
+        default_tz: Option<chrono_tz::Tz>,
+    ) -> Self {
         let parsed_events: Vec<EconomicEvent> = raw_events
             .iter()
             .filter_map(|raw| {
-                let dt = parse_event_datetime(raw)?;
+                let timing = parse_event_timing(raw, default_tz)?;
+                let dt = match &timing {
+                    EventTiming::Exact(dt) => *dt,
+                    EventTiming::AllDay(d) | EventTiming::TentativeDate(d) => {
+                        let naive = d.and_hms_opt(0, 0, 0)?;
+                        DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc)
+                    }
+                };
                 Some(EconomicEvent {
                     title: raw.title.clone(),
                     country: raw.country.clone(),
                     impact: raw.impact.clone(),
                     datetime: dt,
+                    timing,
                 })
             })
             .collect();
@@ -60,7 +77,19 @@ impl BlackoutEngine {
         configs: &[&RedFolderConfig],
         now: DateTime<Utc>,
     ) -> Self {
-        let mut engine = Self::from_events(raw_events);
+        Self::compile_with_tz(raw_events, configs, now, None)
+    }
+
+    /// Compile raw calendar events and worker configurations into blackout windows
+    /// with an optional default source timezone for naive timestamps.
+    #[must_use]
+    pub fn compile_with_tz(
+        raw_events: &[RawCalendarEvent],
+        configs: &[&RedFolderConfig],
+        now: DateTime<Utc>,
+        default_tz: Option<chrono_tz::Tz>,
+    ) -> Self {
+        let mut engine = Self::from_events_with_tz(raw_events, default_tz);
 
         if !configs.is_empty() {
             if configs.len() == 1 {
@@ -101,6 +130,11 @@ impl BlackoutEngine {
     }
 
     /// Access reference precompiled windows.
+    ///
+    /// Note: In multi-worker environments with differing timing buffers, this collection contains
+    /// pooled windows across all workers for diagnostic or backwards-compatible reference.
+    /// To query exact blackout windows for a specific worker configuration, use
+    /// [`BlackoutEngine::windows_for_config`].
     #[must_use]
     pub fn windows(&self) -> &[BlackoutWindow] {
         &self.windows
@@ -145,24 +179,71 @@ impl BlackoutEngine {
 
         // 1. Process parsed economic releases matching this worker config
         for event in &self.parsed_events {
-            if event.datetime < lower_cutoff {
+            if !event_matches_economic_event(event, config) {
                 continue;
             }
 
-            if event_matches_economic_event(event, config) {
-                let start = event.datetime - Duration::minutes(before_min);
-                let end = event.datetime + Duration::minutes(after_min);
-                individual.push((
-                    start,
-                    end,
-                    WindowEvent {
-                        is_custom: false,
-                        event_time: event.datetime,
-                        country: event.country.clone(),
-                        impact: event.impact.clone(),
-                        title: event.title.clone(),
-                    },
-                ));
+            match &event.timing {
+                EventTiming::Exact(dt) => {
+                    if *dt < lower_cutoff {
+                        continue;
+                    }
+                    let start = *dt - Duration::minutes(before_min);
+                    let end = *dt + Duration::minutes(after_min);
+                    individual.push((
+                        start,
+                        end,
+                        WindowEvent {
+                            is_custom: false,
+                            event_time: *dt,
+                            country: event.country.clone(),
+                            impact: event.impact.clone(),
+                            title: event.title.clone(),
+                        },
+                    ));
+                }
+                EventTiming::AllDay(date) => {
+                    if config.include_all_day {
+                        if let Some(start_dt) = date.and_hms_opt(0, 0, 0) {
+                            let start = DateTime::<Utc>::from_naive_utc_and_offset(start_dt, Utc);
+                            let end = start + Duration::days(1);
+                            if end >= now {
+                                individual.push((
+                                    start,
+                                    end,
+                                    WindowEvent {
+                                        is_custom: false,
+                                        event_time: start,
+                                        country: event.country.clone(),
+                                        impact: event.impact.clone(),
+                                        title: format!("{} [All Day]", event.title),
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                }
+                EventTiming::TentativeDate(date) => {
+                    if config.include_tentative {
+                        if let Some(start_dt) = date.and_hms_opt(0, 0, 0) {
+                            let start = DateTime::<Utc>::from_naive_utc_and_offset(start_dt, Utc);
+                            let end = start + Duration::days(1);
+                            if end >= now {
+                                individual.push((
+                                    start,
+                                    end,
+                                    WindowEvent {
+                                        is_custom: false,
+                                        event_time: start,
+                                        country: event.country.clone(),
+                                        impact: event.impact.clone(),
+                                        title: format!("{} [Tentative]", event.title),
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                }
             }
         }
 

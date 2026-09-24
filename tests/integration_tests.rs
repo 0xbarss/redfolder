@@ -298,8 +298,8 @@ fn test_weekend_boundaries_and_determinism() {
     // 5. Sunday: MUST be in blackout (Problem 1 verification!)
     assert!(engine.is_blackout_at(&cfg, sun));
 
-    // 6. Monday 00:00:00 UTC (exact end boundary): in blackout
-    assert!(engine.is_blackout_at(&cfg, mon_end));
+    // 6. Monday 00:00:00 UTC (exact end boundary): out of blackout under [start, end) half-open semantics
+    assert!(!engine.is_blackout_at(&cfg, mon_end));
 
     // 7. Monday 00:00:01 UTC: out of blackout
     assert!(!engine.is_blackout_at(&cfg, mon_after));
@@ -323,13 +323,15 @@ fn test_cross_midnight_short_curfew() {
     let fri_before = Utc.with_ymd_and_hms(2026, 6, 5, 22, 59, 0).unwrap();
     let fri_inside = Utc.with_ymd_and_hms(2026, 6, 5, 23, 30, 0).unwrap();
     let sat_inside = Utc.with_ymd_and_hms(2026, 6, 6, 0, 30, 0).unwrap();
+    let sat_inside_late = Utc.with_ymd_and_hms(2026, 6, 6, 0, 59, 59).unwrap();
     let sat_end = Utc.with_ymd_and_hms(2026, 6, 6, 1, 0, 0).unwrap();
     let sat_after = Utc.with_ymd_and_hms(2026, 6, 6, 1, 5, 0).unwrap();
 
     assert!(!engine.is_blackout_at(&cfg, fri_before));
     assert!(engine.is_blackout_at(&cfg, fri_inside));
     assert!(engine.is_blackout_at(&cfg, sat_inside));
-    assert!(engine.is_blackout_at(&cfg, sat_end));
+    assert!(engine.is_blackout_at(&cfg, sat_inside_late));
+    assert!(!engine.is_blackout_at(&cfg, sat_end));
     assert!(!engine.is_blackout_at(&cfg, sat_after));
 }
 
@@ -556,4 +558,412 @@ async fn test_cache_preservation_on_empty_response() {
         client.load_cache_data().is_none(),
         "version 99 cache must be rejected"
     );
+}
+
+#[tokio::test]
+async fn test_failed_startup_does_not_remain_running_and_can_retry() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+
+    // Client with unreachable URL and empty cache directory
+    let broken_client = redfolder::calendar::CalendarClient::with_options(
+        reqwest::Client::new(),
+        "http://127.0.0.1:9/unreachable",
+        Some(cache_dir.clone()),
+        std::time::Duration::from_millis(50),
+    );
+
+    let service = RedFolderService::with_client(broken_client);
+
+    let config = RedFolderConfig::builder()
+        .currencies(vec!["USD"])
+        .impacts(vec!["High"])
+        .build();
+
+    let _rx = service.register_worker("bot_retry", config).await;
+
+    // 1. Initial start fails due to network failure and missing cache
+    let err = service.start().await;
+    assert!(
+        err.is_err(),
+        "startup must fail when calendar refresh fails"
+    );
+
+    // AUDIT-001 Verification: State must be Stopped, not stuck in Running/Starting
+    assert_eq!(service.state().await, ServiceState::Stopped);
+    assert!(!service.is_running().await);
+
+    // 2. Populate disk cache so subsequent start succeeds
+    let good_events = vec![redfolder::calendar::RawCalendarEvent {
+        title: "US CPI Release".into(),
+        country: "USD".into(),
+        date: "2026-06-10T12:30:00Z".into(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+    let client = redfolder::calendar::CalendarClient::new(Some(cache_dir));
+    client.save_cache(&good_events).unwrap();
+
+    // 3. Retry startup - MUST succeed without "already running" error!
+    let retry = service.start().await;
+    assert!(retry.is_ok(), "retry after failed start must succeed");
+    assert_eq!(service.state().await, ServiceState::Running);
+    assert!(service.is_running().await);
+
+    service.stop().await;
+    assert_eq!(service.state().await, ServiceState::Stopped);
+}
+
+#[tokio::test]
+async fn test_stop_waits_for_background_tasks_and_rapid_restart() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+
+    let good_events = vec![redfolder::calendar::RawCalendarEvent {
+        title: "US Non-Farm Payrolls".into(),
+        country: "USD".into(),
+        date: "2026-06-05T12:30:00Z".into(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+    let client = redfolder::calendar::CalendarClient::new(Some(cache_dir));
+    client.save_cache(&good_events).unwrap();
+
+    let service = RedFolderService::with_client(client);
+    let config = RedFolderConfig::default();
+    let _rx = service.register_worker("w_rapid", config).await;
+
+    // Start -> Stop -> Rapid Start -> Stop
+    service.start().await.expect("start should succeed");
+    assert!(service.is_running().await);
+
+    service.stop().await;
+    assert_eq!(service.state().await, ServiceState::Stopped);
+
+    // AUDIT-002 Verification: Rapid restart after stop terminates cleanly without duplicate tasks
+    service.start().await.expect("rapid restart must succeed");
+    assert!(service.is_running().await);
+
+    service.stop().await;
+    assert_eq!(service.state().await, ServiceState::Stopped);
+}
+
+#[test]
+fn test_cache_rejects_event_count_mismatch() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+    let client = redfolder::calendar::CalendarClient::new(Some(cache_dir.clone()));
+
+    // Cache with event_count = 10, but only 1 event in array (corrupted / truncated)
+    let mismatch_cache = redfolder::calendar::CachedCalendarData {
+        metadata: redfolder::calendar::CacheMetadata {
+            version: 1,
+            fetched_at: Utc::now(),
+            expires_at: None,
+            event_count: 10,
+        },
+        events: vec![redfolder::calendar::RawCalendarEvent {
+            title: "Corrupt Test Event".into(),
+            country: "USD".into(),
+            date: "2026-06-10T12:30:00Z".into(),
+            time: "".into(),
+            impact: "High".into(),
+        }],
+    };
+
+    let json = serde_json::to_string(&mismatch_cache).unwrap();
+    std::fs::write(cache_dir.join(redfolder::DEFAULT_CACHE_FILENAME), json).unwrap();
+
+    // AUDIT-006 Verification: event_count mismatch must be rejected
+    assert!(
+        client.load_cache_data().is_none(),
+        "event_count mismatch must be rejected by cache loader"
+    );
+    assert!(
+        client.load_cache().is_none(),
+        "load_cache must return None for mismatched cache"
+    );
+}
+
+#[tokio::test]
+async fn test_stale_cache_policy_enforcement() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+
+    // Write a cache with fetched_at set to 48 hours ago
+    let old_fetched_at = Utc::now() - chrono::Duration::hours(48);
+    let old_cache = redfolder::calendar::CachedCalendarData {
+        metadata: redfolder::calendar::CacheMetadata {
+            version: 1,
+            fetched_at: old_fetched_at,
+            expires_at: None,
+            event_count: 1,
+        },
+        events: vec![redfolder::calendar::RawCalendarEvent {
+            title: "Stale NFP".into(),
+            country: "USD".into(),
+            date: "2026-06-05T12:30:00Z".into(),
+            time: "".into(),
+            impact: "High".into(),
+        }],
+    };
+    let json = serde_json::to_string(&old_cache).unwrap();
+    std::fs::write(cache_dir.join(redfolder::DEFAULT_CACHE_FILENAME), json).unwrap();
+
+    // 1. Client with max_stale_age = 24h (cache is 48h old, so it MUST be rejected)
+    let client_strict = redfolder::calendar::CalendarClient::with_options(
+        reqwest::Client::new(),
+        "http://127.0.0.1:9/unreachable",
+        Some(cache_dir.clone()),
+        std::time::Duration::from_millis(50),
+    )
+    .with_max_stale_age(Some(std::time::Duration::from_secs(24 * 3600)));
+
+    // AUDIT-007 Verification: 48h old cache is rejected when max allowed is 24h
+    let res_strict = client_strict.fetch_or_cached().await;
+    assert!(
+        res_strict.is_err(),
+        "stale cache exceeding max age must be rejected"
+    );
+
+    // 2. Client with max_stale_age = 72h (cache is 48h old, so it is accepted as fallback)
+    let client_lenient = redfolder::calendar::CalendarClient::with_options(
+        reqwest::Client::new(),
+        "http://127.0.0.1:9/unreachable",
+        Some(cache_dir),
+        std::time::Duration::from_millis(50),
+    )
+    .with_max_stale_age(Some(std::time::Duration::from_secs(72 * 3600)));
+
+    let res_lenient = client_lenient.fetch_or_cached().await;
+    assert!(
+        res_lenient.is_ok(),
+        "stale cache within max age should be accepted as fallback"
+    );
+    assert_eq!(res_lenient.unwrap()[0].title, "Stale NFP");
+}
+
+#[test]
+fn test_empty_currency_and_impact_filters_are_rejected() {
+    // AUDIT-008 Verification: empty currency filter is rejected
+    let empty_cur = RedFolderConfig::builder()
+        .currencies(Vec::<String>::new())
+        .try_build();
+    assert!(
+        empty_cur.is_err(),
+        "empty currencies filter must be rejected"
+    );
+    assert!(empty_cur
+        .unwrap_err()
+        .to_string()
+        .contains("currencies filter cannot be empty"));
+
+    // AUDIT-008 Verification: empty impact filter is rejected
+    let empty_imp = RedFolderConfig::builder()
+        .impacts(Vec::<String>::new())
+        .try_build();
+    assert!(empty_imp.is_err(), "empty impacts filter must be rejected");
+    assert!(empty_imp
+        .unwrap_err()
+        .to_string()
+        .contains("impacts filter cannot be empty"));
+}
+
+#[test]
+fn test_all_day_and_tentative_event_policies() {
+    let now = Utc::now();
+    let tomorrow_str = (now.date_naive() + chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    let day_after_str = (now.date_naive() + chrono::Duration::days(2))
+        .format("%Y-%m-%d")
+        .to_string();
+
+    let raw = vec![
+        redfolder::calendar::RawCalendarEvent {
+            title: "US Labor Day Bank Holiday".into(),
+            country: "USD".into(),
+            date: tomorrow_str,
+            time: "All Day".into(),
+            impact: "High".into(),
+        },
+        redfolder::calendar::RawCalendarEvent {
+            title: "Chinese Trade Balance".into(),
+            country: "CNY".into(),
+            date: day_after_str,
+            time: "Tentative".into(),
+            impact: "High".into(),
+        },
+    ];
+
+    // AUDIT-005 Verification: Default config (include_all_day = false, include_tentative = false)
+    // MUST NOT create false midnight blackout spikes!
+    let default_cfg = RedFolderConfig::builder()
+        .currencies(vec!["USD", "CNY"])
+        .impacts(vec!["High"])
+        .weekend_curfew(false, "20:00", "21:00", "short")
+        .build();
+
+    let engine = BlackoutEngine::compile(&raw, &[&default_cfg], now);
+    let windows = engine.windows_for_config(&default_cfg, now);
+    assert_eq!(
+        windows.len(),
+        0,
+        "all-day and tentative events must not create midnight blackout windows by default"
+    );
+
+    // If explicitly enabled, all-day event covers the 24-hour day
+    let all_day_cfg = RedFolderConfig::builder()
+        .currencies(vec!["USD"])
+        .impacts(vec!["High"])
+        .weekend_curfew(false, "20:00", "21:00", "short")
+        .include_all_day(true)
+        .build();
+
+    let all_day_windows = engine.windows_for_config(&all_day_cfg, now);
+    assert_eq!(all_day_windows.len(), 1);
+    assert_eq!(
+        all_day_windows[0].duration_minutes(),
+        1440,
+        "all-day blackout window must span 24 hours (1440 minutes)"
+    );
+}
+
+#[test]
+fn test_timezone_aware_naive_timestamp_and_dst() {
+    use redfolder::calendar::parse_event_timing;
+
+    // AUDIT-004 Verification: Naive timestamps interpreted with America/New_York
+    let tz = chrono_tz::America::New_York;
+
+    // Summer EDT (UTC-4): 2026-07-10 8:30am
+    let summer_raw = redfolder::calendar::RawCalendarEvent {
+        title: "US PPI (Summer)".into(),
+        country: "USD".into(),
+        date: "07-10-2026".into(),
+        time: "8:30am".into(),
+        impact: "High".into(),
+    };
+    let summer_timing = parse_event_timing(&summer_raw, Some(tz)).unwrap();
+    let summer_dt = summer_timing.exact_time().unwrap();
+    // 8:30 AM EDT is 12:30 UTC
+    assert_eq!(summer_dt.format("%H:%M UTC").to_string(), "12:30 UTC");
+
+    // Winter EST (UTC-5): 2026-01-10 8:30am
+    let winter_raw = redfolder::calendar::RawCalendarEvent {
+        title: "US PPI (Winter)".into(),
+        country: "USD".into(),
+        date: "01-10-2026".into(),
+        time: "8:30am".into(),
+        impact: "High".into(),
+    };
+    let winter_timing = parse_event_timing(&winter_raw, Some(tz)).unwrap();
+    let winter_dt = winter_timing.exact_time().unwrap();
+    // 8:30 AM EST is 13:30 UTC
+    assert_eq!(winter_dt.format("%H:%M UTC").to_string(), "13:30 UTC");
+
+    // Explicit RFC3339 offset overrides default timezone
+    let explicit_raw = redfolder::calendar::RawCalendarEvent {
+        title: "Explicit Offset".into(),
+        country: "USD".into(),
+        date: "2026-07-10T08:30:00Z".into(),
+        time: "".into(),
+        impact: "High".into(),
+    };
+    let explicit_timing = parse_event_timing(&explicit_raw, Some(tz)).unwrap();
+    let explicit_dt = explicit_timing.exact_time().unwrap();
+    assert_eq!(explicit_dt.format("%H:%M UTC").to_string(), "08:30 UTC");
+}
+
+#[tokio::test]
+async fn test_immediate_notification_for_worker_registered_during_blackout() {
+    let now = Utc::now();
+    let raw = vec![redfolder::calendar::RawCalendarEvent {
+        title: "FOMC Rate Announcement".into(),
+        country: "USD".into(),
+        date: now.to_rfc3339(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+
+    let service = RedFolderService::new(None);
+    let cfg = RedFolderConfig::builder()
+        .currencies(vec!["USD"])
+        .impacts(vec!["High"])
+        .buffer_minutes(10, 10)
+        .build();
+
+    // Set engine with an active blackout right now
+    service
+        .set_engine(BlackoutEngine::compile(&raw, &[&cfg], now))
+        .await;
+
+    // Register worker while blackout is already in progress
+    let mut legacy_rx = service.register_worker("late_worker", cfg.clone()).await;
+    let mut event_rx = service.register_worker_events("late_worker_ev", cfg).await;
+
+    // Both should receive immediate active notification without waiting for next evaluation tick!
+    let legacy_notif = legacy_rx
+        .try_recv()
+        .expect("should receive immediate notification");
+    assert!(legacy_notif.active);
+    assert!(legacy_notif.window.is_some());
+
+    let event_notif = event_rx
+        .try_recv()
+        .expect("should receive immediate BlackoutStarted");
+    assert!(event_notif.is_blackout_started());
+}
+
+#[tokio::test]
+async fn test_windows_for_worker_isolation() {
+    let now = Utc::now();
+    let raw = vec![redfolder::calendar::RawCalendarEvent {
+        title: "US CPI Release".into(),
+        country: "USD".into(),
+        date: (now + Duration::minutes(20)).to_rfc3339(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+
+    let service = RedFolderService::new(None);
+
+    let scalper_cfg = RedFolderConfig::builder()
+        .currency(Currency::USD)
+        .impact(Impact::High)
+        .buffer_minutes(5, 5)
+        .weekend_curfew(false, "20:00", "21:00", "short")
+        .build();
+
+    let swing_cfg = RedFolderConfig::builder()
+        .currency(Currency::USD)
+        .impact(Impact::High)
+        .buffer_minutes(30, 30)
+        .weekend_curfew(false, "20:00", "21:00", "short")
+        .build();
+
+    let _rx1 = service
+        .register_worker("scalper", scalper_cfg.clone())
+        .await;
+    let _rx2 = service.register_worker("swing", swing_cfg.clone()).await;
+
+    service
+        .set_engine(BlackoutEngine::compile(
+            &raw,
+            &[&scalper_cfg, &swing_cfg],
+            now,
+        ))
+        .await;
+
+    // AUDIT-010 Verification: windows_for_worker returns worker-specific windows
+    let scalper_windows = service.windows_for_worker("scalper").await;
+    let swing_windows = service.windows_for_worker("swing").await;
+
+    assert_eq!(scalper_windows.len(), 1);
+    assert_eq!(swing_windows.len(), 1);
+
+    // Scalper buffer is 5 + 5 = 10 minutes
+    assert_eq!(scalper_windows[0].duration_minutes(), 10);
+    // Swing buffer is 30 + 30 = 60 minutes
+    assert_eq!(swing_windows[0].duration_minutes(), 60);
 }

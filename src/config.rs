@@ -49,6 +49,16 @@ pub struct RedFolderConfig {
     /// If configured, `RedFolderEvent::BlackoutWarning` will be emitted in advance.
     #[serde(default)]
     pub warning_before_min: Option<i64>,
+
+    /// Whether all-day events create a 24-hour blackout window (00:00 to 24:00 UTC).
+    /// Defaults to `false` to avoid inaccurate midnight spikes for economic holidays.
+    #[serde(default)]
+    pub include_all_day: bool,
+
+    /// Whether tentative events create a blackout window.
+    /// Defaults to `false` to avoid premature blackout timing for unconfirmed releases.
+    #[serde(default)]
+    pub include_tentative: bool,
 }
 
 fn default_true() -> bool {
@@ -93,6 +103,8 @@ impl Default for RedFolderConfig {
             weekend_end: default_weekend_end(),
             weekend_mode: default_weekend_mode(),
             warning_before_min: None,
+            include_all_day: false,
+            include_tentative: false,
         }
     }
 }
@@ -131,6 +143,8 @@ impl RedFolderConfig {
             weekend_end: "21:00".into(),
             weekend_mode: "weekend".into(),
             warning_before_min: Some(15),
+            include_all_day: false,
+            include_tentative: false,
         }
     }
 
@@ -149,11 +163,25 @@ impl RedFolderConfig {
             weekend_end: "21:00".into(),
             weekend_mode: "weekend".into(),
             warning_before_min: Some(30),
+            include_all_day: false,
+            include_tentative: false,
         }
     }
 
     /// Validates the configuration parameters, ensuring non-negative buffers and valid curfew formats.
     pub fn validate(&self) -> crate::error::Result<()> {
+        if self.currencies.is_empty() {
+            return Err(crate::error::RedFolderError::Config(
+                "currencies filter cannot be empty; specify at least one currency or 'All'"
+                    .to_string(),
+            ));
+        }
+        if self.impacts.is_empty() {
+            return Err(crate::error::RedFolderError::Config(
+                "impacts filter cannot be empty; specify at least one impact level (e.g. 'High')"
+                    .to_string(),
+            ));
+        }
         if self.before_min < 0 {
             return Err(crate::error::RedFolderError::Config(format!(
                 "before_min cannot be negative (got {})",
@@ -279,6 +307,18 @@ impl RedFolderConfigBuilder {
     #[must_use]
     pub fn warning_minutes(mut self, minutes: i64) -> Self {
         self.config.warning_before_min = Some(minutes);
+        self
+    }
+
+    #[must_use]
+    pub fn include_all_day(mut self, include: bool) -> Self {
+        self.config.include_all_day = include;
+        self
+    }
+
+    #[must_use]
+    pub fn include_tentative(mut self, include: bool) -> Self {
+        self.config.include_tentative = include;
         self
     }
 

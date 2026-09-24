@@ -70,21 +70,25 @@ Building economic news protection from scratch usually results in brittle HTTP p
                               │ HTTP / JSON (Auto-cached)
 ┌─────────────────────────────▼─────────────────────────────┐
 │                       CalendarClient                      │
-│             (Local Disk Cache + Retry Fallback)           │
+│     - Metadata & Event-Count Validation                   │
+│     - Bounded Stale Cache Fallback Policy                 │
+│     - Source Timezone & DST Support (chrono-tz)           │
 └─────────────────────────────┬─────────────────────────────┘
                               │ RawCalendarEvents
 ┌─────────────────────────────▼─────────────────────────────┐
 │                       BlackoutEngine                      │
-│        - Timezone Normalization (RFC-3339 & AM/PM)        │
+│        - Explicit EventTiming (Exact / All-Day / Tentative)│
 │        - Overlapping Window Merge (Gap Threshold)         │
+│        - Half-Open Interval Semantics: [start, end)       │
 │        - Weekend Curfew Injection (Short / Weekend)       │
 └─────────────────────────────┬─────────────────────────────┘
                               │ Compiled BlackoutWindows
 ┌─────────────────────────────▼─────────────────────────────┐
 │                     RedFolderService                      │
 │        - Daily Midnight UTC Sync Loop                     │
-│        - 15-Second Non-Blocking State Monitor             │
-│        - Advance Warning Generator                        │
+│        - Transition-Driven Evaluation Loop (Exact Timing) │
+│        - CancellationToken & Tracked JoinHandles Lifecycle│
+│        - Immediate State Notification on Worker Register  │
 └───────┬───────────────────────────────┬───────────────────┘
         │                               │
         │ Broadcast Channel             │ Dedicated Worker Stream
@@ -99,9 +103,24 @@ Building economic news protection from scratch usually results in brittle HTTP p
 Rather than forcing trading strategies to poll state flags in a tight loop, `redfolder` operates as an asynchronous event producer. When state changes occur, discrete domain events are broadcast across memory:
 
 - `RedFolderEvent::BlackoutWarning`: Emitted $N$ minutes **prior** to the start of a blackout window. Gives execution bots a clean grace period to cancel pending limit orders, tighten stop-loss thresholds, or scale down leverage before volatility explodes.
-- `RedFolderEvent::BlackoutStarted`: Emitted the instant a blackout window becomes active. Directs execution modules to reject incoming trade signals and pause active scalpers.
-- `RedFolderEvent::BlackoutEnded`: Emitted when the window closes, signaling strategies that market conditions and spreads have normalized.
+- `RedFolderEvent::BlackoutStarted`: Emitted the exact second a blackout window becomes active. Directs execution modules to reject incoming trade signals and pause active scalpers.
+- `RedFolderEvent::BlackoutEnded`: Emitted when the window closes (under standard half-open interval `[start, end)` semantics), signaling strategies that market conditions and spreads have normalized.
 - `RedFolderEvent::CalendarUpdated`: Emitted when new weekly schedules are synchronized and indexed into memory.
+
+### Transition-Driven Event Scheduling vs. Polling
+
+Fixed-interval polling (e.g. every 15s) risks delaying risk alerts by up to 14 seconds during market-moving news releases. `redfolder` employs a **transition-driven scheduler**:
+1. Evaluates all registered workers and determines the exact timestamp of the earliest upcoming state transition (blackout start, blackout end, or warning threshold).
+2. Sleeps directly until `next_transition`, guaranteeing alert emission at the exact second.
+3. Automatically awakens via `tokio::sync::Notify` whenever new workers are registered/unregistered or calendar data is refreshed.
+4. Retains an internal watchdog fallback ensuring configuration changes and periodic checks execute reliably.
+
+### Deterministic Lifecycle & Cancellation Primitives
+
+The service state machine adheres to strict lifecycle transitions:
+`Stopped` -> `Starting` -> `Running` -> `Stopping` -> `Stopped`.
+- **Startup Protection**: If initial calendar synchronization fails, `start()` fails cleanly and leaves the service in `Stopped` state, allowing immediate retry without getting stuck.
+- **Clean Task Termination**: Background loops are spawned with `tokio_util::sync::CancellationToken` and tracked `JoinHandle`s. Calling `stop()` cancels the token, wakes up waiters, and awaits task termination before returning, preventing duplicate concurrent loops across restarts.
 
 ### Dynamic Window Clustering & Merging
 
@@ -110,7 +129,12 @@ Economic events rarely occur in isolation. A single trading day may schedule:
 - 14:00 UTC: FOMC Member Speech
 - 14:15 UTC: Industrial Production
 
-If configured with a 30-minute buffer and a 30-minute merge threshold, `redfolder` automatically identifies that the tail of the first window intersects or lies within the threshold of the next. It clusters all related events into a single unified `BlackoutWindow`, eliminating rapid oscillation between active and inactive states.
+If configured with a 30-minute buffer and a 30-minute merge threshold, `redfolder` automatically identifies that the tail of the first window intersects or lies within the threshold of the next. It clusters all related events into a single unified `BlackoutWindow` using half-open intervals (`[start, end)`), eliminating rapid oscillation between active and inactive states.
+
+### Calendar Event Timing & Timezone Normalization
+
+- **Explicit Event Timing**: Distinguishes between `EventTiming::Exact(DateTime<Utc>)`, `EventTiming::AllDay(NaiveDate)`, and `EventTiming::TentativeDate(NaiveDate)`. All-day events (e.g. Bank Holidays) and tentative releases do not create spurious midnight spikes by default, but can be configured to cover full 24-hour windows via `include_all_day(true)`.
+- **Source Timezone & DST Support**: Supports `chrono_tz::Tz` (e.g. `America/New_York`) to accurately interpret naive calendar date/time strings with automatic Daylight Saving Time (DST) adjustment (EDT vs EST).
 
 ### Weekend Market Close Curfew Engine
 
@@ -121,9 +145,10 @@ Forex markets close on Friday evening and reopen on Sunday afternoon, exposing o
 ### Offline Durability & Rate Limit Resilience
 
 External calendar APIs enforce strict Cloudflare rate limiting (HTTP 429). `CalendarClient` includes a multi-tier fallback mechanism:
-1. Fresh remote synchronization writes a pretty-printed JSON copy to disk (`economic_calendar.json`).
-2. If remote requests return errors, timeouts, or HTTP 429 rate limits, the client automatically loads the cached calendar from disk and emits a warning through `tracing`.
-3. An internal lock-split design ensures network downloads execute without holding the service mutex, guaranteeing that 15-second worker evaluations are never stalled by remote latency.
+1. Fresh remote synchronization writes a pretty-printed JSON copy to disk with schema metadata (`version`, `event_count`, `fetched_at`).
+2. When loading from disk, the client validates that `metadata.event_count == events.len()`, rejecting corrupted or truncated cache files.
+3. Fallback to stale cache on network failure respects a configurable maximum allowable staleness boundary (`max_stale_cache_age`, default 36 hours), preventing ancient calendars from silently driving live trading.
+4. An internal lock-split design ensures network downloads execute without holding the service mutex, guaranteeing that worker evaluations are never stalled by remote latency.
 
 ---
 
@@ -399,13 +424,16 @@ redfolder sync
 | Method | Signature | Description |
 | :--- | :--- | :--- |
 | `new` | `fn(Option<PathBuf>) -> Self` | Initializes service with optional cache directory (defaults to `~/.cache/redfolder/`). |
+| `state` | `async fn(&self) -> ServiceState` | Returns the current lifecycle state (`Stopped`, `Starting`, `Running`, `Stopping`). |
+| `is_running` | `async fn(&self) -> bool` | Checks if background worker tasks are active (`state == ServiceState::Running`). |
 | `subscribe` | `fn(&self) -> broadcast::Receiver<RedFolderEvent>` | Subscribes to global broadcast bus receiving all system events. |
-| `add_listener` | `async fn(&self, Arc<dyn EventListener>)` | Attaches an asynchronous trait-based callback listener. |
-| `register_worker_events` | `async fn(&self, &str, RedFolderConfig) -> mpsc::UnboundedReceiver<RedFolderEvent>` | Registers worker and returns a typed stream of scoped events. |
+| `add_listener` | `async fn(&self, Arc<dyn EventListener>)` | Attaches an asynchronous trait-based callback listener (guarded with execution timeout). |
+| `register_worker_events` | `async fn(&self, &str, RedFolderConfig) -> mpsc::UnboundedReceiver<RedFolderEvent>` | Registers worker, immediate state check, and returns a typed stream of scoped events. |
 | `register_worker` | `async fn(&self, &str, RedFolderConfig) -> mpsc::UnboundedReceiver<BlackoutNotification>` | Legacy worker registration returning state change notifications. |
-| `unregister_worker` | `async fn(&self, &str)` | Unregisters worker and cleans up internal state tracking. |
-| `start` | `async fn(&self) -> Result<()>` | Starts background daily refresh and 15s evaluation tasks. |
-| `stop` | `async fn(&self)` | Gracefully terminates all background tasks. |
+| `unregister_worker` | `async fn(&self, &str)` | Unregisters worker, cleans up state, and recalculates transition schedule. |
+| `windows_for_worker` | `async fn(&self, &str) -> Vec<BlackoutWindow>` | Returns active and upcoming blackout windows derived specifically for the worker's buffers. |
+| `start` | `async fn(&self) -> Result<()>` | Starts background daily refresh and transition-driven evaluation tasks. Reversible on error. |
+| `stop` | `async fn(&self)` | Gracefully terminates all background tasks and awaits their exit. |
 | `refresh` | `async fn(&self) -> Result<()>` | Forces immediate network download and window recompilation. |
 | `is_blackout` | `async fn(&self, &str) -> bool` | Checks if a specific registered worker is currently in blackout. |
 | `current_window` | `async fn(&self, &str) -> Option<BlackoutWindow>` | Returns active window details for a specific worker. |
@@ -415,9 +443,12 @@ redfolder sync
 
 | Method | Signature | Description |
 | :--- | :--- | :--- |
-| `compile` | `fn(&[RawCalendarEvent], &[&RedFolderConfig], DateTime<Utc>) -> Self` | Compiles raw releases and curfew rules into merged blackout intervals. |
+| `compile` | `fn(&[RawCalendarEvent], &[&RedFolderConfig], DateTime<Utc>) -> Self` | Compiles raw releases and curfew rules into merged blackout intervals (defaulting to UTC). |
+| `compile_with_tz` | `fn(&[RawCalendarEvent], &[&RedFolderConfig], DateTime<Utc>, Option<chrono_tz::Tz>) -> Self` | Compiles events using an explicit source timezone for naive timestamps. |
+| `windows_for_config` | `fn(&self, &RedFolderConfig, DateTime<Utc>) -> Vec<BlackoutWindow>` | Derives isolated worker-specific blackout intervals respecting custom buffers and policies. |
+| `windows` | `fn(&self) -> &[BlackoutWindow]` | Accesses pooled precompiled windows across configurations for diagnostic reference. |
 | `is_blackout` | `fn(&self, &RedFolderConfig) -> bool` | Checks if the current UTC time falls within any active window. |
-| `is_blackout_at` | `fn(&self, &RedFolderConfig, DateTime<Utc>) -> bool` | Evaluates blackout status at an arbitrary timestamp. |
+| `is_blackout_at` | `fn(&self, &RedFolderConfig, DateTime<Utc>) -> bool` | Evaluates blackout status at an arbitrary timestamp using half-open `[start, end)`. |
 | `current_window` | `fn(&self, &RedFolderConfig) -> Option<BlackoutWindow>` | Returns the active `BlackoutWindow` matching configuration. |
 | `upcoming_blackouts` | `fn(&self, &RedFolderConfig, u32) -> Vec<BlackoutWindow>` | Lists matching windows starting within $N$ hours. |
 
@@ -428,15 +459,19 @@ redfolder sync
 | `new` | `fn(Option<PathBuf>) -> Self` | Creates client with standard browser User-Agent and default cache. |
 | `without_cache` | `fn() -> Self` | Creates client strictly performing live network requests. |
 | `with_user_agent` | `fn(Option<PathBuf>, &str) -> Result<Self>` | Creates client with custom User-Agent and optional cache directory. |
-| `fetch_remote` | `async fn(&self) -> Result<Vec<RawCalendarEvent>>` | Performs HTTP GET against FairEconomy weekly feed. |
-| `fetch_or_cached` | `async fn(&self) -> Result<Vec<RawCalendarEvent>>` | Fetches remote schedule, persisting cache or falling back to disk on failure. |
-| `save_cache` | `fn(&self, &[RawCalendarEvent]) -> Result<()>` | Writes JSON-serialized events to local disk. |
-| `load_cache` | `fn(&self) -> Option<Vec<RawCalendarEvent>>` | Reads and deserializes cached events from disk. |
+| `with_timezone` | `fn(self, chrono_tz::Tz) -> Self` | Configures default source timezone for resolving naive calendar timestamps. |
+| `with_max_stale_age` | `fn(self, Option<Duration>) -> Self` | Sets maximum allowable cache age for fallback on network failure. |
+| `fetch_remote` | `async fn(&self) -> Result<Vec<RawCalendarEvent>>` | Performs HTTP GET against FairEconomy weekly feed with retry backoff. |
+| `fetch_or_cached` | `async fn(&self) -> Result<Vec<RawCalendarEvent>>` | Fetches remote schedule, verifying cache metadata and bounded staleness on failure. |
+| `save_cache` | `fn(&self, &[RawCalendarEvent]) -> Result<()>` | Writes JSON-serialized events with schema metadata (`version`, `event_count`). |
+| `load_cache_data` | `fn(&self) -> Option<CachedCalendarData>` | Loads structured cache validating `event_count == events.len()`. |
 
 ### Types & Domain Models
 
 - **`RedFolderEvent`**: Typed enum (`BlackoutWarning`, `BlackoutStarted`, `BlackoutEnded`, `CalendarUpdated`).
-- **`BlackoutWindow`**: Struct containing `start: DateTime<Utc>`, `end: DateTime<Utc>`, and `events: Vec<WindowEvent>`. Provides helper methods `remaining_minutes()`, `duration_minutes()`, `is_active()`, and `summary_title()`.
+- **`EventTiming`**: Precision timing enum (`Exact(DateTime<Utc>)`, `AllDay(NaiveDate)`, `TentativeDate(NaiveDate)`).
+- **`ServiceState`**: Service lifecycle enum (`Stopped`, `Starting`, `Running`, `Stopping`).
+- **`BlackoutWindow`**: Struct containing `start: DateTime<Utc>`, `end: DateTime<Utc>`, and `events: Vec<WindowEvent>`. Uses standard half-open interval semantics `[start, end)`. Provides helper methods `remaining_minutes()`, `duration_minutes()`, `is_active()`, and `summary_title()`.
 - **`Impact`**: Enum with variants `High`, `Medium`, `Low`, `NonEconomic`, `Custom(String)`. Supports case-insensitive string matching (`"red"`, `"high"`).
 - **`WeekendMode`**: Enum with variants `Short` (Friday evening window) and `Weekend` (Friday evening through Monday 00:00 UTC). Validated strictly on parse (rejecting typos or unknown strings with a descriptive error).
 
@@ -444,7 +479,7 @@ redfolder sync
 
 ## Testing & Quality Assurance
 
-`redfolder` includes an automated test battery with 33 unit and integration tests covering interval calculations, state machines, and resilience guarantees.
+`redfolder` includes an automated test battery with **49 unit and integration tests** covering interval calculations, state machines, and resilience guarantees.
 
 Run the test suite:
 
@@ -465,19 +500,21 @@ cargo clippy --all-targets --all-features -- -D warnings
 | :--- | :--- | :---: |
 | **HTTP 429 Rate Limit from API** | Intercepts error; falls back to local disk cache without throwing an error. | Verified |
 | **Network Partition / Host Offline** | Transparently serves existing cached calendar until network recovers. | Verified |
+| **Startup Failure (Network & Cache Fail)** | `start()` errors cleanly and resets state to `Stopped`; retries succeed without lockout. | Verified |
+| **Rapid Restart / Task Overlap** | `stop()` cleanly joins previous tasks; restarting creates zero duplicate loops. | Verified |
+| **Transition-Driven Timing** | Emits alerts at exact scheduled second rather than waiting for 15s polling cycle. | Verified |
+| **Cache Event Count Mismatch** | `load_cache_data` detects corrupted/truncated cache (`event_count != len`) and rejects it. | Verified |
+| **Bounded Stale Cache Fallback** | Rejects cache older than `max_stale_cache_age` on network failure; accepts within limit. | Verified |
+| **Empty Currency / Impact Filter** | Builder rejects empty filters (`currencies: []`, `impacts: []`) with descriptive errors. | Verified |
+| **All-Day & Tentative Events** | Default config ignores all-day/tentative events to avoid fake midnight spikes; 24h opt-in. | Verified |
+| **Naive Timestamps & DST Transition** | Converts naive times via configured timezone (`America/New_York`) with EDT/EST DST accuracy. | Verified |
+| **Half-Open Interval Semantics** | Window is active at exact start and inactive at exact end `[start, end)`. | Verified |
+| **Worker Registered in Active Blackout** | Newly registered worker immediately receives active blackout notification. | Verified |
 | **Overlapping Events within Threshold** | Merges closely spaced releases into single uninterrupted `BlackoutWindow`. | Verified |
-| **Events Separated Beyond Threshold** | Preserves distinct blackout windows; does not merge prematurely. | Verified |
 | **Zero Pre-Event Buffer (`before_min: 0`)** | Window begins precisely at scheduled event time; does not default to 30 min. | Verified |
-| **Active Post-Release Window** | Events whose release time passed but post-buffer is active remain indexed. | Verified |
-| **Friday Past Curfew Start** | Rollover logic safely computes window for following Friday without panic. | Verified |
 | **Weekend Curfew in `weekend` Mode** | Extends blackout window 51.5 hours through to Monday 00:00 UTC. | Verified |
-| **Wildcard Currency (`"ALL"` / `"Global"`)** | Event automatically matches all worker currency filters. | Verified |
-| **Case-Insensitive Impact Strings** | `"red"`, `"HIGH"`, and `"High"` all correctly parse to `Impact::High`. | Verified |
-| **Advance Warning Generation** | `BlackoutWarning` emits exactly once per window within specified horizon. | Verified |
-| **Worker Unregistration** | Cleanly terminates state tracking; subsequent queries return inactive. | Verified |
-| **Corrupted JSON Disk Cache** | Bypasses corrupted cache file without panicking and attempts clean fetch. | Verified |
-| **Weekend Curfew on Sat/Sun** | Correctly detects active blackout throughout Saturday and Sunday. | Verified |
 | **Cross-Midnight Short Curfew** | 23:00 -> 01:00 curfew rolls over to Saturday without inverting intervals. | Verified |
+| **Deterministic Timestamp Replay** | Historical queries evaluate deterministically without depending on `Utc::now()`. | Verified |
 | **Deterministic Timestamp Replay** | Historical queries evaluate deterministically without depending on `Utc::now()`. | Verified |
 | **Empty Upstream Feed Protection** | Preserves known-good cache if upstream returns 0 events or invalid array. | Verified |
 | **Service Concurrency & Restart** | Multiple `start()` calls error cleanly; `start -> stop -> start` restarts properly. | Verified |

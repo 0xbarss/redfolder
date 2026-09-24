@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
@@ -199,6 +199,46 @@ impl FromStr for Impact {
     }
 }
 
+/// Timing precision category for an economic calendar event.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EventTiming {
+    /// Exact scheduled release instant.
+    Exact(DateTime<Utc>),
+    /// Tentative release scheduled on a specific date without a confirmed time.
+    TentativeDate(NaiveDate),
+    /// All-day event or multi-day summit covering an entire calendar day.
+    AllDay(NaiveDate),
+}
+
+impl EventTiming {
+    /// Returns the exact timestamp if this event has one.
+    #[must_use]
+    pub fn exact_time(&self) -> Option<DateTime<Utc>> {
+        match self {
+            EventTiming::Exact(dt) => Some(*dt),
+            _ => None,
+        }
+    }
+
+    /// Whether this event has a precise scheduled release timestamp.
+    #[must_use]
+    pub fn is_exact(&self) -> bool {
+        matches!(self, EventTiming::Exact(_))
+    }
+
+    /// Whether this event's timing is tentative.
+    #[must_use]
+    pub fn is_tentative(&self) -> bool {
+        matches!(self, EventTiming::TentativeDate(_))
+    }
+
+    /// Whether this is an all-day event.
+    #[must_use]
+    pub fn is_all_day(&self) -> bool {
+        matches!(self, EventTiming::AllDay(_))
+    }
+}
+
 /// A parsed economic calendar event from the calendar feed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EconomicEvent {
@@ -206,6 +246,36 @@ pub struct EconomicEvent {
     pub country: String,
     pub impact: String,
     pub datetime: DateTime<Utc>,
+    #[serde(default = "default_event_timing")]
+    pub timing: EventTiming,
+}
+
+fn default_event_timing() -> EventTiming {
+    EventTiming::Exact(Utc::now())
+}
+
+impl EconomicEvent {
+    /// Create a new exact economic event.
+    pub fn new_exact(
+        title: impl Into<String>,
+        country: impl Into<String>,
+        impact: impl Into<String>,
+        datetime: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            title: title.into(),
+            country: country.into(),
+            impact: impact.into(),
+            datetime,
+            timing: EventTiming::Exact(datetime),
+        }
+    }
+
+    /// Returns the exact release timestamp if known.
+    #[must_use]
+    pub fn exact_time(&self) -> Option<DateTime<Utc>> {
+        self.timing.exact_time()
+    }
 }
 
 /// Backwards compatibility alias for `EconomicEvent`.
@@ -245,9 +315,10 @@ impl BlackoutWindow {
     }
 
     /// Whether this window is currently active at the specified timestamp.
+    /// Uses standard half-open interval semantics: `[start, end)`.
     #[must_use]
     pub fn is_active_at(&self, time: DateTime<Utc>) -> bool {
-        self.start <= time && time <= self.end
+        self.start <= time && time < self.end
     }
 
     /// Whether this window is currently active right now.
