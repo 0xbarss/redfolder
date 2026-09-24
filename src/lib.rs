@@ -6,10 +6,12 @@
 //! and calculates dynamic trading blackout windows, protecting algorithmic bots and prop firm accounts
 //! against sudden spread spikes and slippage.
 
+pub mod calendar;
 pub mod config;
 pub mod error;
 pub mod types;
 
+pub use calendar::{CalendarClient, RawCalendarEvent, CALENDAR_URL, DEFAULT_CACHE_FILENAME};
 pub use config::{NewsConfig, RedFolderConfig, RedFolderConfigBuilder};
 pub use error::{RedFolderError, Result};
 pub use types::{
