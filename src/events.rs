@@ -38,6 +38,9 @@ pub enum RedFolderEvent {
         total_events: usize,
         total_windows: usize,
     },
+
+    /// Emitted when background or scheduled economic calendar synchronization fails.
+    CalendarSyncFailed { error: String },
 }
 
 impl RedFolderEvent {
@@ -59,6 +62,12 @@ impl RedFolderEvent {
         matches!(self, RedFolderEvent::BlackoutWarning { .. })
     }
 
+    /// Whether this event signals a failed calendar synchronization.
+    #[must_use]
+    pub fn is_sync_failed(&self) -> bool {
+        matches!(self, RedFolderEvent::CalendarSyncFailed { .. })
+    }
+
     /// Returns the associated `BlackoutWindow` if applicable.
     #[must_use]
     pub fn window(&self) -> Option<&BlackoutWindow> {
@@ -66,7 +75,9 @@ impl RedFolderEvent {
             RedFolderEvent::BlackoutWarning { window, .. } => Some(window),
             RedFolderEvent::BlackoutStarted { window, .. } => Some(window),
             RedFolderEvent::BlackoutEnded { window, .. } => Some(window),
-            RedFolderEvent::CalendarUpdated { .. } => None,
+            RedFolderEvent::CalendarUpdated { .. } | RedFolderEvent::CalendarSyncFailed { .. } => {
+                None
+            }
         }
     }
 
@@ -77,7 +88,9 @@ impl RedFolderEvent {
             RedFolderEvent::BlackoutWarning { worker_id, .. } => worker_id.as_deref(),
             RedFolderEvent::BlackoutStarted { worker_id, .. } => worker_id.as_deref(),
             RedFolderEvent::BlackoutEnded { worker_id, .. } => worker_id.as_deref(),
-            RedFolderEvent::CalendarUpdated { .. } => None,
+            RedFolderEvent::CalendarUpdated { .. } | RedFolderEvent::CalendarSyncFailed { .. } => {
+                None
+            }
         }
     }
 }
@@ -125,5 +138,13 @@ mod tests {
             worker_id: None,
         };
         assert!(warning.is_warning());
+
+        let sync_failed = RedFolderEvent::CalendarSyncFailed {
+            error: "connection timeout".into(),
+        };
+        assert!(sync_failed.is_sync_failed());
+        assert!(!sync_failed.is_warning());
+        assert_eq!(sync_failed.worker_id(), None);
+        assert_eq!(sync_failed.window(), None);
     }
 }

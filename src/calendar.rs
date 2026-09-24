@@ -116,12 +116,54 @@ fn fallback_client() -> Client {
 
 impl CalendarClient {
     /// Returns the default platform cache directory for redfolder.
+    ///
+    /// - On Windows: Respects `%LOCALAPPDATA%\redfolder\cache`, `%APPDATA%\redfolder\cache`, or `%USERPROFILE%\.cache\redfolder`.
+    /// - On Linux/Unix: Respects `$XDG_CACHE_HOME/redfolder` or `$HOME/.cache/redfolder`.
+    /// - Fallback: System temporary directory (`redfolder_cache`).
     #[must_use]
     pub fn default_cache_dir() -> PathBuf {
-        std::env::var("HOME")
-            .ok()
-            .map(|h| PathBuf::from(h).join(".cache").join("redfolder"))
-            .unwrap_or_else(|| std::env::temp_dir().join("redfolder_cache"))
+        #[cfg(windows)]
+        {
+            if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+                return PathBuf::from(local_app_data)
+                    .join("redfolder")
+                    .join("cache");
+            }
+            if let Ok(app_data) = std::env::var("APPDATA") {
+                return PathBuf::from(app_data).join("redfolder").join("cache");
+            }
+            if let Ok(user_profile) = std::env::var("USERPROFILE") {
+                return PathBuf::from(user_profile).join(".cache").join("redfolder");
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+                return PathBuf::from(xdg).join("redfolder");
+            }
+            if let Ok(home) = std::env::var("HOME") {
+                return PathBuf::from(home).join(".cache").join("redfolder");
+            }
+        }
+
+        // Generic cross-platform fallback for custom or test environments
+        if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+            return PathBuf::from(xdg).join("redfolder");
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(".cache").join("redfolder");
+        }
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            return PathBuf::from(local_app_data)
+                .join("redfolder")
+                .join("cache");
+        }
+        if let Ok(user_profile) = std::env::var("USERPROFILE") {
+            return PathBuf::from(user_profile).join(".cache").join("redfolder");
+        }
+
+        std::env::temp_dir().join("redfolder_cache")
     }
 
     /// Create a new `CalendarClient` with an optional cache directory fallibly.
@@ -427,8 +469,19 @@ impl CalendarClient {
 
         let json = serde_json::to_string_pretty(&cached_data)?;
 
-        // Atomic write: write to sibling temp file, flush to disk, then rename
-        let temp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+        static CACHE_WRITE_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+
+        // Atomic write: write to unique sibling temp file, flush to disk, then rename.
+        // Combines PID, timestamp nanoseconds, and an atomic counter to prevent collision
+        // when multiple threads or tasks write cache concurrently within the same process.
+        let counter = CACHE_WRITE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let temp_path = path.with_extension(format!("tmp.{pid}.{nanos}.{counter}"));
         let write_result = (|| -> std::io::Result<()> {
             use std::io::Write;
             let mut file = std::fs::File::create(&temp_path)?;
@@ -1058,5 +1111,12 @@ mod tests {
             dt.format("%Y-%m-%d %H:%M UTC").to_string(),
             "2026-08-15 14:30 UTC"
         );
+    }
+
+    #[test]
+    fn test_default_cache_dir() {
+        let dir = CalendarClient::default_cache_dir();
+        assert!(!dir.as_os_str().is_empty());
+        assert!(dir.to_string_lossy().contains("redfolder"));
     }
 }

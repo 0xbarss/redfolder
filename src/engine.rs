@@ -368,6 +368,28 @@ impl BlackoutEngine {
         windows.into_iter().find(|w| w.is_active_at(time))
     }
 
+    /// Returns the active `BlackoutWindow` matching the configuration, if any.
+    ///
+    /// This is the recommended atomic accessor for execution checks (preventing TOCTOU
+    /// race conditions between an `is_blackout` check and a subsequent `current_window` lookup).
+    /// If `Some(window)` is returned, trading is currently blocked by that blackout window.
+    #[must_use]
+    pub fn status(&self, config: &RedFolderConfig) -> Option<BlackoutWindow> {
+        self.current_window(config)
+    }
+
+    /// Returns the active `BlackoutWindow` matching the configuration at a specific timestamp, if any.
+    ///
+    /// Atomic accessor for tick-level historical backtesting and deterministic simulation.
+    #[must_use]
+    pub fn status_at(
+        &self,
+        config: &RedFolderConfig,
+        time: DateTime<Utc>,
+    ) -> Option<BlackoutWindow> {
+        self.current_window_at(config, time)
+    }
+
     /// Returns upcoming blackout windows within `hours` hours matching the configuration.
     #[must_use]
     pub fn upcoming_blackouts(&self, config: &RedFolderConfig, hours: u32) -> Vec<BlackoutWindow> {
@@ -456,6 +478,11 @@ pub fn event_matches_economic_event(event: &EconomicEvent, config: &RedFolderCon
 }
 
 /// Checks if a single `WindowEvent` matches a given worker `RedFolderConfig`.
+///
+/// **Weekend Curfew & Custom Events**: For synthetic or custom events (`is_custom == true`,
+/// such as the weekend market close curfew), this check returns `config.weekend_enabled`.
+/// Currency and impact filters are intentionally bypassed because weekend curfew is a
+/// global market close condition rather than a currency-specific macroeconomic release.
 #[must_use]
 pub fn event_matches_config(event: &WindowEvent, config: &RedFolderConfig) -> bool {
     if event.is_custom {
@@ -668,6 +695,37 @@ mod tests {
         assert_eq!(
             upcoming_72[0].events[0].title,
             "Extended Horizon Rate Decision"
+        );
+    }
+
+    #[test]
+    fn test_status_atomic_accessor() {
+        let now = Utc::now();
+        let raw = vec![RawCalendarEvent {
+            title: "CPI Release".into(),
+            country: "USD".into(),
+            date: now.to_rfc3339(),
+            time: "".into(),
+            impact: "High".into(),
+        }];
+
+        let config = RedFolderConfig::builder()
+            .currencies(vec!["USD"])
+            .impacts(vec!["High"])
+            .buffer_minutes(15, 15)
+            .weekend_curfew(false, "20:00", "21:00", "short")
+            .build();
+
+        let engine = BlackoutEngine::compile(&raw, &[&config], now);
+
+        let status = engine.status(&config);
+        assert!(status.is_some());
+        let win = status.unwrap();
+        assert_eq!(win.events[0].title, "CPI Release");
+
+        assert_eq!(
+            engine.status_at(&config, now),
+            engine.current_window_at(&config, now)
         );
     }
 }

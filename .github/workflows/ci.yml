@@ -51,3 +51,41 @@ jobs:
           components: rustfmt
       - name: Check Formatting
         run: cargo fmt --all -- --check
+
+  test-windows:
+    name: Test Suite (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run Tests
+        run: cargo test --all-targets --all-features --verbose --locked
+
+  msrv:
+    name: MSRV Verification (1.75.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.75.0"
+      - name: Check MSRV
+        run: cargo check --all-targets --all-features --locked
+
+  security-audit:
+    name: Security & Vulnerability Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  bench-check:
+    name: Benchmark Compilation Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check Benchmarks
+        run: cargo bench --no-run --locked

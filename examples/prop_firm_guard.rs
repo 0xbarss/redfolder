@@ -43,8 +43,7 @@ async fn main() -> Result<()> {
             .buffer_minutes(5, 5)
             .build();
 
-        if engine.is_blackout(&pair_cfg) {
-            let win = engine.current_window(&pair_cfg).unwrap();
+        if let Some(win) = engine.status(&pair_cfg) {
             println!(
                 "⛔ REJECT ORDER on {}: Active Red Folder news blackout ({}). Ends in {}m.",
                 symbol,

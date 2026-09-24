@@ -79,17 +79,26 @@ enum Commands {
     },
 }
 
+fn build_cli_config(currency: String, impact: String) -> Result<RedFolderConfig> {
+    RedFolderConfig::builder()
+        .currencies(vec![currency])
+        .impacts(vec![impact])
+        .try_build()
+        .map_err(|e| {
+            eprintln!("{}: {}", "Invalid configuration".red().bold(), e);
+            e
+        })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cache_dir = cli.cache_dir.or_else(|| {
-        std::env::var("HOME")
-            .ok()
-            .map(|h| PathBuf::from(h).join(".cache").join("redfolder"))
-            .or_else(|| Some(std::env::temp_dir().join("redfolder_cache")))
-    });
+    let cache_dir = cli
+        .cache_dir
+        .or_else(|| Some(CalendarClient::default_cache_dir()));
 
-    let client = CalendarClient::new(cache_dir.clone());
+    // Configure a 15-minute default cache TTL to prevent rate limit hammering
+    let client = CalendarClient::new(cache_dir).with_ttl(Duration::from_secs(900));
 
     match cli.command {
         Commands::Status {
@@ -98,13 +107,10 @@ async fn main() -> Result<()> {
             json,
         } => {
             let events = client.fetch_or_cached().await?;
-            let config = RedFolderConfig::builder()
-                .currencies(vec![currency.clone()])
-                .impacts(vec![impact])
-                .build();
+            let config = build_cli_config(currency.clone(), impact)?;
 
             let engine = BlackoutEngine::compile(&events, &[&config], chrono::Utc::now());
-            let current = engine.current_window(&config);
+            let current = engine.status(&config);
 
             if json {
                 let status_json = serde_json::json!({
@@ -198,10 +204,7 @@ async fn main() -> Result<()> {
             json,
         } => {
             let events = client.fetch_or_cached().await?;
-            let config = RedFolderConfig::builder()
-                .currencies(vec![currency.clone()])
-                .impacts(vec![impact])
-                .build();
+            let config = build_cli_config(currency.clone(), impact)?;
 
             let engine = BlackoutEngine::compile(&events, &[&config], chrono::Utc::now());
             let upcoming = engine.upcoming_blackouts(&config, hours);
@@ -283,16 +286,33 @@ async fn main() -> Result<()> {
                 "{}",
                 "Starting live RedFolder watcher (press Ctrl+C to exit)...".cyan()
             );
-            let config = RedFolderConfig::builder()
-                .currencies(vec![currency.clone()])
-                .impacts(vec![impact])
-                .build();
+            let config = build_cli_config(currency.clone(), impact)?;
 
+            let mut events = client.fetch_or_cached().await?;
+            let mut engine = BlackoutEngine::compile(&events, &[&config], chrono::Utc::now());
+            let mut last_fetch = std::time::Instant::now();
             let mut last_status = false;
+
             loop {
-                let events = client.fetch_or_cached().await?;
-                let engine = BlackoutEngine::compile(&events, &[&config], chrono::Utc::now());
-                let current = engine.current_window(&config);
+                // Re-fetch calendar only when cache TTL (15 minutes) expires
+                if last_fetch.elapsed() >= Duration::from_secs(900) {
+                    match client.fetch_or_cached().await {
+                        Ok(new_events) => {
+                            events = new_events;
+                            engine =
+                                BlackoutEngine::compile(&events, &[&config], chrono::Utc::now());
+                            last_fetch = std::time::Instant::now();
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "\n{}: Failed to refresh calendar: {e}",
+                                "Warning".yellow().bold()
+                            );
+                        }
+                    }
+                }
+
+                let current = engine.status(&config);
                 let in_blackout = current.is_some();
 
                 let now_str = chrono::Utc::now().format("%H:%M:%S UTC").to_string();

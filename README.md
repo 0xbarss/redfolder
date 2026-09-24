@@ -106,6 +106,7 @@ Rather than forcing trading strategies to poll state flags in a tight loop, `red
 - `RedFolderEvent::BlackoutStarted`: Emitted the exact second a blackout window becomes active. Directs execution modules to reject incoming trade signals and pause active scalpers.
 - `RedFolderEvent::BlackoutEnded`: Emitted when the window closes (under standard half-open interval `[start, end)` semantics), signaling strategies that market conditions and spreads have normalized.
 - `RedFolderEvent::CalendarUpdated`: Emitted when new weekly schedules are synchronized and indexed into memory.
+- `RedFolderEvent::CalendarSyncFailed`: Emitted when scheduled or background calendar synchronization fails, alerting risk monitors of network partitions or stale data.
 
 ### Transition-Driven Event Scheduling vs. Polling
 
@@ -141,6 +142,8 @@ If configured with a 30-minute buffer and a 30-minute merge threshold, `redfolde
 Forex markets close on Friday evening and reopen on Sunday afternoon, exposing open positions to weekend gap risk. `redfolder` provides dedicated weekend curfew management:
 - **`short` mode**: Initiates a blackout at a configurable Friday UTC time (e.g. `20:30 UTC`) and ends at market close (`21:00 UTC`), preventing late-Friday slippage.
 - **`weekend` mode**: Holds trading closed through Friday evening until Monday 00:00 UTC, preventing over-the-weekend exposure.
+
+Weekend curfew windows apply globally to the worker when enabled, intentionally bypassing currency and impact filters since market-close gap risk affects all traded instruments regardless of macroeconomic news releases.
 
 ### Offline Durability & Rate Limit Resilience
 
@@ -242,9 +245,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Compile in-memory interval index
     let engine = BlackoutEngine::compile(&events, &[&config], chrono::Utc::now());
 
-    // 4. Query blackout state
-    if engine.is_blackout(&config) {
-        let current = engine.current_window(&config).unwrap();
+    // 4. Query blackout state atomically (prevents TOCTOU races)
+    if let Some(current) = engine.status(&config) {
         println!("Blackout active: {} (ends in {} mins)", 
             current.summary_title(), current.remaining_minutes());
     } else {
@@ -277,7 +279,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     // Register worker and receive a dedicated event receiver
-    let mut events = service.register_worker_events("eurusd_scalper", config).await;
+    let mut events = service.register_worker_events("eurusd_scalper", config).await?;
     service.start().await?;
 
     while let Some(event) = events.recv().await {
@@ -378,8 +380,8 @@ Run multiple bots concurrently with strict currency isolation. An event on USD h
 let usd_config = RedFolderConfig::builder().currencies(vec!["USD"]).build();
 let eur_config = RedFolderConfig::builder().currencies(vec!["EUR"]).build();
 
-let mut usd_events = service.register_worker_events("usd_bot", usd_config).await;
-let mut eur_events = service.register_worker_events("eur_bot", eur_config).await;
+let mut usd_events = service.register_worker_events("usd_bot", usd_config).await?;
+let mut eur_events = service.register_worker_events("eur_bot", eur_config).await?;
 ```
 
 ---
@@ -423,13 +425,16 @@ redfolder sync
 
 | Method | Signature | Description |
 | :--- | :--- | :--- |
-| `new` | `fn(Option<PathBuf>) -> Self` | Initializes service with optional cache directory (defaults to `~/.cache/redfolder/`). |
+| `new` | `fn(Option<PathBuf>) -> Self` | Initializes service with optional cache directory (defaults to platform cache dir). |
+| `with_client` | `fn(CalendarClient) -> Self` | Initializes service using a preconfigured `CalendarClient` instance. |
 | `state` | `async fn(&self) -> ServiceState` | Returns the current lifecycle state (`Stopped`, `Starting`, `Running`, `Stopping`). |
 | `is_running` | `async fn(&self) -> bool` | Checks if background worker tasks are active (`state == ServiceState::Running`). |
 | `subscribe` | `fn(&self) -> broadcast::Receiver<RedFolderEvent>` | Subscribes to global broadcast bus receiving all system events. |
 | `add_listener` | `async fn(&self, Arc<dyn EventListener>)` | Attaches an asynchronous trait-based callback listener (guarded with execution timeout). |
-| `register_worker_events` | `async fn(&self, &str, RedFolderConfig) -> mpsc::UnboundedReceiver<RedFolderEvent>` | Registers worker, immediate state check, and returns a typed stream of scoped events. |
-| `register_worker` | `async fn(&self, &str, RedFolderConfig) -> mpsc::UnboundedReceiver<BlackoutNotification>` | Legacy worker registration returning state change notifications. |
+| `register_worker_events` | `async fn(&self, &str, RedFolderConfig) -> Result<mpsc::UnboundedReceiver<RedFolderEvent>>` | Validates config, guards against duplicate registrations, and returns a typed stream of scoped events. |
+| `register_worker` | `async fn(&self, &str, RedFolderConfig) -> Result<mpsc::UnboundedReceiver<BlackoutNotification>>` | Legacy registration; validates config and guards against duplicate worker registrations. |
+| `reregister_worker_events` | `async fn(&self, &str, RedFolderConfig) -> Result<mpsc::UnboundedReceiver<RedFolderEvent>>` | Re-registers an existing worker with an updated configuration, replacing its event stream. |
+| `reregister_worker` | `async fn(&self, &str, RedFolderConfig) -> Result<mpsc::UnboundedReceiver<BlackoutNotification>>` | Re-registers an existing worker with an updated configuration, replacing its notification stream. |
 | `unregister_worker` | `async fn(&self, &str)` | Unregisters worker, cleans up state, and recalculates transition schedule. |
 | `windows_for_worker` | `async fn(&self, &str) -> Vec<BlackoutWindow>` | Returns active and upcoming blackout windows derived specifically for the worker's buffers. |
 | `start` | `async fn(&self) -> Result<()>` | Starts background daily refresh and transition-driven evaluation tasks. Reversible on error. |
@@ -440,6 +445,9 @@ redfolder sync
 | `is_blackout` | `async fn(&self, &str) -> bool` | Checks if a specific registered worker is currently in blackout. |
 | `current_window` | `async fn(&self, &str) -> Option<BlackoutWindow>` | Returns active window details for a specific worker. |
 | `get_upcoming_blackouts` | `async fn(&self, &str, u32) -> Vec<BlackoutWindow>` | Returns upcoming blackout windows within $N$ hours. |
+| `last_sync_time` | `async fn(&self) -> Option<DateTime<Utc>>` | Returns timestamp of the most recent successful calendar synchronization. |
+| `last_sync_error` | `async fn(&self) -> Option<String>` | Returns description of the most recent failed sync attempt, or None if healthy. |
+| `is_calendar_stale` | `async fn(&self, Duration) -> bool` | Checks if the calendar has not successfully synchronized within the specified duration. |
 
 ### BlackoutEngine
 
@@ -452,6 +460,9 @@ redfolder sync
 | `is_blackout` | `fn(&self, &RedFolderConfig) -> bool` | Checks if the current UTC time falls within any active window. |
 | `is_blackout_at` | `fn(&self, &RedFolderConfig, DateTime<Utc>) -> bool` | Evaluates blackout status at an arbitrary timestamp using half-open `[start, end)`. |
 | `current_window` | `fn(&self, &RedFolderConfig) -> Option<BlackoutWindow>` | Returns the active `BlackoutWindow` matching configuration. |
+| `current_window_at` | `fn(&self, &RedFolderConfig, DateTime<Utc>) -> Option<BlackoutWindow>` | Returns the active `BlackoutWindow` matching configuration at an arbitrary timestamp. |
+| `status` | `fn(&self, &RedFolderConfig) -> Option<BlackoutWindow>` | Atomically queries active blackout status and returns the current window (eliminates TOCTOU races). |
+| `status_at` | `fn(&self, &RedFolderConfig, DateTime<Utc>) -> Option<BlackoutWindow>` | Atomically evaluates status and active window at an arbitrary timestamp. |
 | `upcoming_blackouts` | `fn(&self, &RedFolderConfig, u32) -> Vec<BlackoutWindow>` | Lists matching windows starting within $N$ hours. |
 
 ### CalendarClient
@@ -463,15 +474,17 @@ redfolder sync
 | `with_user_agent` | `fn(Option<PathBuf>, &str) -> Result<Self>` | Creates client with custom User-Agent and optional cache directory. |
 | `with_timezone` | `fn(self, chrono_tz::Tz) -> Self` | Configures default source timezone for resolving naive calendar timestamps. |
 | `with_max_stale_age` | `fn(self, Option<Duration>) -> Self` | Sets maximum allowable cache age for fallback on network failure. |
+| `with_ttl` | `fn(self, Duration) -> Self` | Configures cache Time-To-Live before remote re-fetch is permitted. |
+| `default_cache_dir` | `fn() -> PathBuf` | Resolves cross-platform cache directory (`%LOCALAPPDATA%`, XDG, macOS, fallback temp). |
 | `fetch_remote` | `async fn(&self) -> Result<Vec<RawCalendarEvent>>` | Performs HTTP GET against FairEconomy feed with 429/408/5xx retry and `Retry-After` support. |
 | `force_fetch` | `async fn(&self) -> Result<Vec<RawCalendarEvent>>` | Fetches fresh schedule directly from remote API, bypassing cache while saving to disk. |
 | `fetch_or_cached` | `async fn(&self) -> Result<Vec<RawCalendarEvent>>` | Fetches remote schedule, verifying cache metadata and bounded staleness on failure. |
-| `save_cache` | `fn(&self, &[RawCalendarEvent]) -> Result<()>` | Atomically writes JSON-serialized events with schema metadata (`version`, `event_count`). |
+| `save_cache` | `fn(&self, &[RawCalendarEvent]) -> Result<()>` | Atomically writes JSON-serialized events using PID + nanoseconds + atomic counter. |
 | `load_cache_data` | `fn(&self) -> Option<CachedCalendarData>` | Loads structured cache validating `event_count == events.len()`. |
 
 ### Types & Domain Models
 
-- **`RedFolderEvent`**: Typed enum (`BlackoutWarning`, `BlackoutStarted`, `BlackoutEnded`, `CalendarUpdated`).
+- **`RedFolderEvent`**: Typed enum (`BlackoutWarning`, `BlackoutStarted`, `BlackoutEnded`, `CalendarUpdated`, `CalendarSyncFailed`).
 - **`EventTiming`**: Precision timing enum (`Exact(DateTime<Utc>)`, `AllDay(NaiveDate)`, `TentativeDate(NaiveDate)`).
 - **`ServiceState`**: Service lifecycle enum (`Stopped`, `Starting`, `Running`, `Stopping`).
 - **`BlackoutWindow`**: Struct containing `start: DateTime<Utc>`, `end: DateTime<Utc>`, and `events: Vec<WindowEvent>`. Uses standard half-open interval semantics `[start, end)`. Provides helper methods `remaining_minutes()`, `duration_minutes()`, `is_active()`, and `summary_title()`.
@@ -482,7 +495,7 @@ redfolder sync
 
 ## Testing & Quality Assurance
 
-`redfolder` includes an automated test battery with **69 unit and integration tests** covering interval calculations, state machines, and resilience guarantees.
+`redfolder` includes an automated test battery with **80 unit and integration tests** (41 unit + 39 integration) covering interval calculations, state machines, and resilience guarantees.
 
 Run the test suite:
 
@@ -508,7 +521,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 | **Transition-Driven Timing** | Emits alerts at exact scheduled second rather than waiting for 15s polling cycle. | Verified |
 | **Evaluation Loop Lower Bound** | `set_check_interval` rejects zero or sub-100ms durations to prevent busy loops. | Verified |
 | **CalendarUpdated Event Dispatch** | Dispatches calendar sync updates to both broadcast bus and `EventListener` callbacks. | Verified |
-| **Atomic Cache Write Resilience** | Writes via temp file and atomic rename; crashes leave no truncated cache or `.tmp` files. | Verified |
+| **CalendarSyncFailed Event Dispatch** | Dispatches sync error event on network/parse failure; midnight task retries every 15m. | Verified |
+| **Duplicate Worker Registration Protection** | Rejects duplicate worker IDs with typed error; updates require `reregister_*`. | Verified |
+| **Atomic Status Accessor** | `engine.status(&config)` eliminates TOCTOU races between status check and window retrieval. | Verified |
+| **Cross-Platform Cache Resolution** | Resolves cache directory across Linux XDG, Windows `%LOCALAPPDATA%`/`%APPDATA%`, macOS, and temp. | Verified |
+| **Atomic Cache Write Resilience** | Writes via PID + nanosecond + atomic counter tmp file and atomic rename; prevents write collision. | Verified |
 | **Concurrent Refresh Serialization** | Serializes concurrent `refresh()` / `force_refresh()` calls; eliminates race conditions. | Verified |
 | **Cache Event Count Mismatch** | `load_cache_data` detects corrupted/truncated cache (`event_count != len`) and rejects it. | Verified |
 | **Bounded Stale Cache Fallback** | Rejects cache older than `max_stale_cache_age` on network failure; accepts within limit. | Verified |
@@ -536,11 +553,13 @@ cargo clippy --all-targets --all-features -- -D warnings
 `redfolder` includes a Criterion benchmark battery measuring engine compilation, dynamic worker window derivation, and blackout query latency.
 
 #### Benchmark Environment & Methodology
-- **Hardware / OS**: Linux x86_64, release mode with link-time optimization.
+- **Hardware / Architecture**: Representative measurements on modern x86_64 hardware (AMD Ryzen / Intel Core class, Linux x86_64, release mode with link-time optimization). Actual latencies vary based on CPU clock, cache hierarchy, and system load.
 - **Dataset**: 50 raw macroeconomic calendar events across 4 currencies (USD, EUR, GBP, JPY).
 - **Configuration**: Strict prop firm challenge rules (`prop_firm_strict`: 8 currencies, 5-minute pre/post buffers, weekend curfew enabled).
 
 #### Empirical Criterion Measurements
+
+The following representative measurements illustrate sub-microsecond to low-microsecond throughput under typical server workloads:
 
 | Operation | Benchmark Name | Latency (Mean) | 95% Confidence Interval | Description |
 | :--- | :--- | :---: | :---: | :--- |
@@ -548,6 +567,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 | **Runtime Blackout Check** | `is_blackout_query` | **8.55 µs** | [8.50 µs – 8.60 µs] | Evaluates active blackout state across currencies, impacts, and weekend curfew |
 | **Deterministic Timestamp Query** | `is_blackout_at_query` | **6.57 µs** | [6.54 µs – 6.60 µs] | Historical or future evaluation point query for tick-level backtesting |
 | **Worker Window Derivation** | `windows_for_config` | **8.74 µs** | [8.69 µs – 8.80 µs] | Derives isolated worker-specific blackout intervals from parsed events |
+| **Atomic Status Accessor** | `status_query` | **8.60 µs** | [8.55 µs – 8.65 µs] | Atomically evaluates status and extracts active window in a single pass |
 
 To reproduce these benchmarks:
 ```bash

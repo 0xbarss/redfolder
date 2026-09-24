@@ -47,6 +47,8 @@ struct ServiceInner {
     listeners: Vec<Arc<dyn EventListener>>,
     state: ServiceState,
     notify: Arc<Notify>,
+    last_sync_time: Option<DateTime<Utc>>,
+    last_sync_error: Option<String>,
 }
 
 impl ServiceInner {
@@ -66,6 +68,8 @@ impl ServiceInner {
             listeners: Vec::new(),
             state: ServiceState::Stopped,
             notify,
+            last_sync_time: None,
+            last_sync_error: None,
         }
     }
 
@@ -308,15 +312,26 @@ impl RedFolderService {
 
     /// Register a worker or trading strategy, returning a legacy `BlackoutNotification` receiver.
     /// Immediately notifies if worker is currently in blackout.
+    ///
+    /// Validates `config` before registering. If a worker with `worker_id` is already registered,
+    /// returns an error to prevent silent disconnection of existing receivers.
+    /// To deliberately update or replace a worker, use [`reregister_worker`](Self::reregister_worker).
     pub async fn register_worker(
         &self,
         worker_id: impl Into<String>,
         config: RedFolderConfig,
-    ) -> mpsc::UnboundedReceiver<BlackoutNotification> {
+    ) -> Result<mpsc::UnboundedReceiver<BlackoutNotification>> {
+        config.validate()?;
         let worker_id = worker_id.into();
-        let (legacy_tx, legacy_rx) = mpsc::unbounded_channel();
 
         let mut inner = self.inner.lock().await;
+        if inner.workers.contains_key(&worker_id) {
+            return Err(crate::error::RedFolderError::Service(format!(
+                "worker '{worker_id}' is already registered; use reregister_worker to update or unregister first"
+            )));
+        }
+
+        let (legacy_tx, legacy_rx) = mpsc::unbounded_channel();
         let is_active = inner.engine.is_blackout(&config);
         let active_window = if is_active {
             inner.engine.current_window(&config)
@@ -349,20 +364,31 @@ impl RedFolderService {
         self.notify.notify_waiters();
 
         debug!(worker=%worker_id, "registered worker in RedFolderService");
-        legacy_rx
+        Ok(legacy_rx)
     }
 
     /// Register a worker or trading strategy, returning an event-driven `RedFolderEvent` receiver.
     /// Immediately notifies if worker is currently in blackout.
+    ///
+    /// Validates `config` before registering. If a worker with `worker_id` is already registered,
+    /// returns an error to prevent silent disconnection of existing receivers.
+    /// To deliberately update or replace a worker, use [`reregister_worker_events`](Self::reregister_worker_events).
     pub async fn register_worker_events(
         &self,
         worker_id: impl Into<String>,
         config: RedFolderConfig,
-    ) -> mpsc::UnboundedReceiver<RedFolderEvent> {
+    ) -> Result<mpsc::UnboundedReceiver<RedFolderEvent>> {
+        config.validate()?;
         let worker_id = worker_id.into();
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         let mut inner = self.inner.lock().await;
+        if inner.workers.contains_key(&worker_id) {
+            return Err(crate::error::RedFolderError::Service(format!(
+                "worker '{worker_id}' is already registered; use reregister_worker_events to update or unregister first"
+            )));
+        }
+
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
         let is_active = inner.engine.is_blackout(&config);
         let active_window = if is_active {
             inner.engine.current_window(&config)
@@ -397,7 +423,111 @@ impl RedFolderService {
         self.notify.notify_waiters();
 
         debug!(worker=%worker_id, "registered event worker in RedFolderService");
-        event_rx
+        Ok(event_rx)
+    }
+
+    /// Re-registers an existing worker or registers a new worker, updating its configuration
+    /// and replacing its event channels. Emits a warning if an existing worker is overwritten.
+    pub async fn reregister_worker(
+        &self,
+        worker_id: impl Into<String>,
+        config: RedFolderConfig,
+    ) -> Result<mpsc::UnboundedReceiver<BlackoutNotification>> {
+        config.validate()?;
+        let worker_id = worker_id.into();
+
+        let mut inner = self.inner.lock().await;
+        if inner.workers.contains_key(&worker_id) {
+            warn!(worker=%worker_id, "re-registering worker: overwriting previous worker state and channels");
+        }
+
+        let (legacy_tx, legacy_rx) = mpsc::unbounded_channel();
+        let is_active = inner.engine.is_blackout(&config);
+        let active_window = if is_active {
+            inner.engine.current_window(&config)
+        } else {
+            None
+        };
+
+        if is_active {
+            legacy_tx
+                .send(BlackoutNotification {
+                    active: true,
+                    window: active_window.clone(),
+                })
+                .ok();
+        }
+
+        inner.workers.insert(
+            worker_id.clone(),
+            WorkerState {
+                config,
+                legacy_sender: Some(legacy_tx),
+                event_sender: None,
+                in_blackout: is_active,
+                active_window,
+                last_warned_window_start: None,
+            },
+        );
+
+        drop(inner);
+        self.notify.notify_waiters();
+
+        debug!(worker=%worker_id, "re-registered worker in RedFolderService");
+        Ok(legacy_rx)
+    }
+
+    /// Re-registers an existing event worker or registers a new worker, updating its configuration
+    /// and replacing its event channels. Emits a warning if an existing worker is overwritten.
+    pub async fn reregister_worker_events(
+        &self,
+        worker_id: impl Into<String>,
+        config: RedFolderConfig,
+    ) -> Result<mpsc::UnboundedReceiver<RedFolderEvent>> {
+        config.validate()?;
+        let worker_id = worker_id.into();
+
+        let mut inner = self.inner.lock().await;
+        if inner.workers.contains_key(&worker_id) {
+            warn!(worker=%worker_id, "re-registering worker: overwriting previous worker state and channels");
+        }
+
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let is_active = inner.engine.is_blackout(&config);
+        let active_window = if is_active {
+            inner.engine.current_window(&config)
+        } else {
+            None
+        };
+
+        if is_active {
+            if let Some(ref w) = active_window {
+                event_tx
+                    .send(RedFolderEvent::BlackoutStarted {
+                        window: w.clone(),
+                        worker_id: Some(worker_id.clone()),
+                    })
+                    .ok();
+            }
+        }
+
+        inner.workers.insert(
+            worker_id.clone(),
+            WorkerState {
+                config,
+                legacy_sender: None,
+                event_sender: Some(event_tx),
+                in_blackout: is_active,
+                active_window,
+                last_warned_window_start: None,
+            },
+        );
+
+        drop(inner);
+        self.notify.notify_waiters();
+
+        debug!(worker=%worker_id, "re-registered event worker in RedFolderService");
+        Ok(event_rx)
     }
 
     /// Unregister a worker by ID.
@@ -454,7 +584,7 @@ impl RedFolderService {
 
         let mut handles = Vec::new();
 
-        // 1. Daily midnight fetch loop
+        // 1. Daily midnight fetch loop (with short-interval retry on failure)
         {
             let inner_arc = self.inner.clone();
             let refresh_lock_arc = self.refresh_lock.clone();
@@ -471,10 +601,30 @@ impl RedFolderService {
 
                     tokio::select! {
                         _ = tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)) => {
-                            tokio::select! {
-                                _ = Self::fetch_and_compile(&inner_arc, &refresh_lock_arc, false, true) => {}
+                            let res = tokio::select! {
+                                res = Self::fetch_and_compile(&inner_arc, &refresh_lock_arc, false, true) => res,
                                 _ = token.cancelled() => {
                                     break;
+                                }
+                            };
+
+                            if let Err(ref e) = res {
+                                warn!(err = %e, "daily midnight calendar sync failed; will retry every 15 minutes");
+                                loop {
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(tokio::time::Duration::from_secs(900)) => {
+                                            let retry_res = Self::fetch_and_compile(&inner_arc, &refresh_lock_arc, false, true).await;
+                                            if retry_res.is_ok() {
+                                                info!("calendar sync successfully recovered after retry");
+                                                break;
+                                            } else if let Err(err) = retry_res {
+                                                warn!(err = %err, "calendar sync retry failed; will retry in 15 minutes");
+                                            }
+                                        }
+                                        _ = token.cancelled() => {
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -597,10 +747,21 @@ impl RedFolderService {
             let state = inner.lock().await;
             (state.client.clone(), state.client.calendar_timezone())
         };
-        let raw = if force_remote {
-            client.force_fetch().await?
+        let fetch_res = if force_remote {
+            client.force_fetch().await
         } else {
-            client.fetch_or_cached().await?
+            client.fetch_or_cached().await
+        };
+
+        let raw = match fetch_res {
+            Ok(raw) => raw,
+            Err(e) => {
+                let err_str = e.to_string();
+                let mut state = inner.lock().await;
+                state.last_sync_error = Some(err_str.clone());
+                state.dispatch_event(RedFolderEvent::CalendarSyncFailed { error: err_str });
+                return Err(e);
+            }
         };
 
         // 3. Re-acquire lock to compile windows into engine
@@ -615,6 +776,8 @@ impl RedFolderService {
 
         state.engine = BlackoutEngine::compile_with_tz(&raw, &config_refs, Utc::now(), client_tz);
         state.last_fetch_date = Some(today);
+        state.last_sync_time = Some(Utc::now());
+        state.last_sync_error = None;
 
         // Immediately reconcile worker states with newly compiled engine
         state.check_and_notify_workers();
@@ -630,6 +793,31 @@ impl RedFolderService {
         });
 
         Ok(())
+    }
+
+    /// Returns the timestamp of the last successful calendar synchronization, if any.
+    pub async fn last_sync_time(&self) -> Option<DateTime<Utc>> {
+        self.inner.lock().await.last_sync_time
+    }
+
+    /// Returns the error message from the most recent failed calendar synchronization, if any.
+    pub async fn last_sync_error(&self) -> Option<String> {
+        self.inner.lock().await.last_sync_error.clone()
+    }
+
+    /// Checks if calendar data is considered stale based on configured maximum stale age.
+    pub async fn is_calendar_stale(&self) -> bool {
+        let inner = self.inner.lock().await;
+        if let Some(last_sync) = inner.last_sync_time {
+            if let Some(max_age) = inner.client.max_stale_cache_age() {
+                if let Ok(chrono_dur) = Duration::from_std(max_age) {
+                    return Utc::now() - last_sync > chrono_dur;
+                }
+            }
+            false
+        } else {
+            inner.engine.is_empty()
+        }
     }
 
     /// Check if a specific worker is currently in blackout.
@@ -678,7 +866,10 @@ mod tests {
             .warning_minutes(10)
             .build();
 
-        let mut worker_events = service.register_worker_events("worker_usd", config).await;
+        let mut worker_events = service
+            .register_worker_events("worker_usd", config)
+            .await
+            .unwrap();
 
         let now = Utc::now();
         // Event starts in 5 minutes (triggering the 10-minute warning)
@@ -739,5 +930,80 @@ mod tests {
             .set_check_interval(std::time::Duration::from_secs(5))
             .await;
         assert!(res_valid.is_ok(), "valid interval must be accepted");
+    }
+
+    #[tokio::test]
+    async fn test_register_worker_rejects_unvalidated_config() {
+        let service = RedFolderService::new(None);
+
+        // Directly construct invalid config with negative buffers (bypassing builder)
+        let invalid_cfg = RedFolderConfig {
+            before_min: -10,
+            ..Default::default()
+        };
+
+        let res_legacy = service
+            .register_worker("bad_worker_legacy", invalid_cfg.clone())
+            .await;
+        assert!(
+            res_legacy.is_err(),
+            "register_worker must reject unvalidated config with negative buffer"
+        );
+
+        let res_events = service
+            .register_worker_events("bad_worker_events", invalid_cfg)
+            .await;
+        assert!(
+            res_events.is_err(),
+            "register_worker_events must reject unvalidated config with negative buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_worker_registration_rejected() {
+        let service = RedFolderService::new(None);
+        let cfg = RedFolderConfig::default();
+
+        let rx1 = service.register_worker("dup_worker", cfg.clone()).await;
+        assert!(rx1.is_ok());
+
+        // Duplicate registration must fail to protect existing channels
+        let rx2 = service.register_worker("dup_worker", cfg.clone()).await;
+        assert!(rx2.is_err());
+        assert!(rx2.unwrap_err().to_string().contains("already registered"));
+
+        // Explicit reregistration must succeed
+        let rereg_rx = service.reregister_worker("dup_worker", cfg).await;
+        assert!(rereg_rx.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_calendar_sync_failed_event_dispatch() {
+        // Construct client pointing to unreachable endpoint
+        let unreachable_client = CalendarClient::with_options(
+            reqwest::Client::new(),
+            "http://127.0.0.1:9/unreachable",
+            None,
+            std::time::Duration::from_millis(50),
+        );
+        let service = RedFolderService::with_client(unreachable_client);
+        let mut sub = service.subscribe();
+
+        let cfg = RedFolderConfig::default();
+        let _rx = service.register_worker("test_bot", cfg).await.unwrap();
+
+        // Refresh will fail due to unreachable host
+        let refresh_res = service.refresh().await;
+        assert!(refresh_res.is_err());
+
+        // Subscriber must receive CalendarSyncFailed event
+        let ev = sub
+            .try_recv()
+            .expect("must receive CalendarSyncFailed event");
+        assert!(ev.is_sync_failed());
+
+        // Service health check should report error
+        let err = service.last_sync_error().await;
+        assert!(err.is_some());
     }
 }

@@ -28,9 +28,8 @@ async fn main() -> Result<()> {
     // 3. Compile blackout engine
     let engine = BlackoutEngine::compile(&raw_events, &[&config], chrono::Utc::now());
 
-    // 4. Inspect current trading status
-    if engine.is_blackout(&config) {
-        let window = engine.current_window(&config).unwrap();
+    // 4. Inspect current trading status using the atomic status accessor
+    if let Some(window) = engine.status(&config) {
         println!("🔴 TRADING BLACKOUT ACTIVE!");
         println!("   Event: {}", window.summary_title());
         println!("   Remaining: {} minutes", window.remaining_minutes());

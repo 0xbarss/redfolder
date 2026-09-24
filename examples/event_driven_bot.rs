@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Register our worker bot and receive its typed event stream
     let mut event_rx = service
         .register_worker_events("eurusd_scalper", config)
-        .await;
+        .await?;
 
     // 4. Also demonstrate subscribing a global listener (e.g. for Telegram/Discord alerts or logging)
     let mut global_bus = service.subscribe();
@@ -49,6 +49,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "[Audit Log] Economic calendar refreshed: {} events, {} active windows.",
                         total_events, total_windows
                     );
+                }
+                RedFolderEvent::CalendarSyncFailed { error } => {
+                    println!("[Audit Log] Economic calendar sync failed: {error}");
                 }
                 RedFolderEvent::BlackoutWarning {
                     window,

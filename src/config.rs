@@ -1,6 +1,15 @@
 use serde::{Deserialize, Serialize};
 
 /// Configuration for economic news blackout filtering and weekend curfew windows.
+///
+/// # v2 Migration Note: Strong Typing & Invariants
+///
+/// In the current v0.1 / v1.x API, `currencies`, `impacts`, and `weekend_mode` are stored
+/// as string types to preserve backwards compatibility with configuration files (JSON/TOML)
+/// and legacy field aliases. For type-safe access, use the helper methods
+/// [`typed_currencies`](Self::typed_currencies), [`typed_impacts`](Self::typed_impacts),
+/// and [`typed_weekend_mode`](Self::typed_weekend_mode). In v2, these fields will transition
+/// to strongly-typed enum collections.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RedFolderConfig {
     /// Whether blackout checking is globally enabled for this worker/strategy.
@@ -28,6 +37,12 @@ pub struct RedFolderConfig {
     pub merge_threshold_min: i64,
 
     /// Whether weekend curfew / market close protection is enabled.
+    ///
+    /// **Important**: When enabled, the weekend curfew window applies globally to this worker
+    /// as a synthetic market-close blackout (`WindowEvent::is_custom == true`), intentionally
+    /// bypassing currency and impact filters. Even if a worker configures specific currency
+    /// or impact restrictions (e.g. only `"Medium"` impact), the weekend curfew will still
+    /// enforce a blackout during Friday close if `weekend_enabled` is `true`.
     #[serde(default = "default_true", alias = "friday_night_enabled")]
     pub weekend_enabled: bool,
 
@@ -265,6 +280,23 @@ impl RedFolderConfig {
 
         Ok(())
     }
+
+    /// Parse and return configured currencies as typed [`Currency`] variants.
+    #[must_use]
+    pub fn typed_currencies(&self) -> Vec<Currency> {
+        self.currencies.iter().map(|c| c.parse().unwrap()).collect()
+    }
+
+    /// Parse and return configured impacts as typed [`Impact`] variants.
+    #[must_use]
+    pub fn typed_impacts(&self) -> Vec<Impact> {
+        self.impacts.iter().map(|i| i.parse().unwrap()).collect()
+    }
+
+    /// Parse and return configured weekend mode as a typed [`crate::curfew::WeekendMode`].
+    pub fn typed_weekend_mode(&self) -> crate::error::Result<crate::curfew::WeekendMode> {
+        self.weekend_mode.parse()
+    }
 }
 
 /// Builder for `RedFolderConfig`.
@@ -349,6 +381,16 @@ impl RedFolderConfigBuilder {
         self.config.weekend_start = start_utc.into();
         self.config.weekend_end = end_utc.into();
         self.config.weekend_mode = mode.into();
+        self
+    }
+
+    /// Sets the weekend curfew mode using a typed [`crate::curfew::WeekendMode`].
+    #[must_use]
+    pub fn weekend_mode_typed(mut self, mode: crate::curfew::WeekendMode) -> Self {
+        self.config.weekend_mode = match mode {
+            crate::curfew::WeekendMode::Short => "short".to_string(),
+            crate::curfew::WeekendMode::Weekend => "weekend".to_string(),
+        };
         self
     }
 
@@ -516,5 +558,21 @@ mod tests {
             .impacts(vec!["High", "Medium"])
             .build();
         assert!(standard_cfg.validate_strict().is_ok());
+    }
+
+    #[test]
+    fn test_typed_helpers() {
+        let cfg = RedFolderConfig::builder()
+            .currencies(vec!["USD", "EUR"])
+            .impacts(vec!["High", "Medium"])
+            .weekend_mode_typed(crate::curfew::WeekendMode::Weekend)
+            .build();
+
+        assert_eq!(cfg.typed_currencies(), vec![Currency::USD, Currency::EUR]);
+        assert_eq!(cfg.typed_impacts(), vec![Impact::High, Impact::Medium]);
+        assert_eq!(
+            cfg.typed_weekend_mode().unwrap(),
+            crate::curfew::WeekendMode::Weekend
+        );
     }
 }

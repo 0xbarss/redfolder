@@ -11,6 +11,7 @@ struct MockAuditListener {
     starts: AtomicUsize,
     ends: AtomicUsize,
     calendars: AtomicUsize,
+    sync_failures: AtomicUsize,
     last_event: Mutex<Option<RedFolderEvent>>,
 }
 
@@ -21,6 +22,7 @@ impl MockAuditListener {
             starts: AtomicUsize::new(0),
             ends: AtomicUsize::new(0),
             calendars: AtomicUsize::new(0),
+            sync_failures: AtomicUsize::new(0),
             last_event: Mutex::new(None),
         }
     }
@@ -41,6 +43,9 @@ impl EventListener for MockAuditListener {
             }
             RedFolderEvent::CalendarUpdated { .. } => {
                 self.calendars.fetch_add(1, Ordering::SeqCst);
+            }
+            RedFolderEvent::CalendarSyncFailed { .. } => {
+                self.sync_failures.fetch_add(1, Ordering::SeqCst);
             }
         }
         *self.last_event.lock().await = Some(event.clone());
@@ -63,8 +68,14 @@ async fn test_multi_worker_isolation_and_filtering() {
         .buffer_minutes(10, 10)
         .build();
 
-    let _usd_rx = service.register_worker_events("usd_bot", usd_cfg).await;
-    let _eur_rx = service.register_worker_events("eur_bot", eur_cfg).await;
+    let _usd_rx = service
+        .register_worker_events("usd_bot", usd_cfg)
+        .await
+        .unwrap();
+    let _eur_rx = service
+        .register_worker_events("eur_bot", eur_cfg)
+        .await
+        .unwrap();
 
     let now = Utc::now();
     // Raw event strictly for USD
@@ -113,7 +124,10 @@ async fn test_custom_event_listener_callback() {
         .warning_minutes(15)
         .build();
 
-    let _rx = service.register_worker_events("test_worker", config).await;
+    let _rx = service
+        .register_worker_events("test_worker", config)
+        .await
+        .unwrap();
 
     let now = Utc::now();
     let raw = vec![redfolder::calendar::RawCalendarEvent {
@@ -166,7 +180,10 @@ async fn test_service_worker_unregistration() {
     let service = RedFolderService::new(None);
     let config = RedFolderConfig::default();
 
-    let _rx = service.register_worker("bot_to_remove", config).await;
+    let _rx = service
+        .register_worker("bot_to_remove", config)
+        .await
+        .unwrap();
     assert!(!service.is_blackout("bot_to_remove").await);
 
     service.unregister_worker("bot_to_remove").await;
@@ -199,8 +216,12 @@ async fn test_multi_worker_buffer_isolation_in_service() {
 
     let _scalper_rx = service
         .register_worker("scalper", scalper_cfg.clone())
-        .await;
-    let _swing_rx = service.register_worker("swing", swing_cfg.clone()).await;
+        .await
+        .unwrap();
+    let _swing_rx = service
+        .register_worker("swing", swing_cfg.clone())
+        .await
+        .unwrap();
 
     let now = Utc::now();
     // Event scheduled in 15 minutes from now
@@ -437,7 +458,10 @@ async fn test_service_lifecycle_guards_and_restart() {
         .buffer_minutes(5, 5)
         .build();
 
-    let _rx = service.register_worker("bot_lifecycle", config).await;
+    let _rx = service
+        .register_worker("bot_lifecycle", config)
+        .await
+        .unwrap();
 
     // Initially not running
     assert!(!service.is_running().await);
@@ -479,7 +503,10 @@ async fn test_blackout_ended_event_preserves_active_window() {
         .buffer_minutes(5, 5)
         .build();
 
-    let _worker_events = service.register_worker_events("w_ended", config).await;
+    let _worker_events = service
+        .register_worker_events("w_ended", config)
+        .await
+        .unwrap();
 
     let now = Utc::now();
     // Simulate event in progress (active right now)
@@ -598,7 +625,7 @@ async fn test_failed_startup_does_not_remain_running_and_can_retry() {
         .impacts(vec!["High"])
         .build();
 
-    let _rx = service.register_worker("bot_retry", config).await;
+    let _rx = service.register_worker("bot_retry", config).await.unwrap();
 
     // 1. Initial start fails due to network failure and missing cache
     let err = service.start().await;
@@ -654,7 +681,7 @@ async fn test_stop_waits_for_background_tasks_and_rapid_restart() {
 
     let service = RedFolderService::with_client(client);
     let config = RedFolderConfig::default();
-    let _rx = service.register_worker("w_rapid", config).await;
+    let _rx = service.register_worker("w_rapid", config).await.unwrap();
 
     // Start -> Stop -> Rapid Start -> Stop
     service.start().await.expect("start should succeed");
@@ -922,8 +949,14 @@ async fn test_immediate_notification_for_worker_registered_during_blackout() {
         .await;
 
     // Register worker while blackout is already in progress
-    let mut legacy_rx = service.register_worker("late_worker", cfg.clone()).await;
-    let mut event_rx = service.register_worker_events("late_worker_ev", cfg).await;
+    let mut legacy_rx = service
+        .register_worker("late_worker", cfg.clone())
+        .await
+        .unwrap();
+    let mut event_rx = service
+        .register_worker_events("late_worker_ev", cfg)
+        .await
+        .unwrap();
 
     // Both should receive immediate active notification without waiting for next evaluation tick!
     let legacy_notif = legacy_rx
@@ -967,8 +1000,12 @@ async fn test_windows_for_worker_isolation() {
 
     let _rx1 = service
         .register_worker("scalper", scalper_cfg.clone())
-        .await;
-    let _rx2 = service.register_worker("swing", swing_cfg.clone()).await;
+        .await
+        .unwrap();
+    let _rx2 = service
+        .register_worker("swing", swing_cfg.clone())
+        .await
+        .unwrap();
 
     service
         .set_engine(BlackoutEngine::compile(
@@ -1019,7 +1056,7 @@ async fn test_calendar_updated_reaches_both_broadcast_and_event_listener() {
     let mut broadcast_rx = service.subscribe();
 
     let config = RedFolderConfig::default();
-    let _rx = service.register_worker("w1", config).await;
+    let _rx = service.register_worker("w1", config).await.unwrap();
 
     // Trigger refresh
     service.refresh().await.expect("refresh should succeed");
@@ -1127,7 +1164,7 @@ async fn test_force_refresh_bypasses_cache_with_mock_server() {
     let cfg = RedFolderConfig::builder()
         .weekend_curfew(false, "20:00", "21:00", "short")
         .build();
-    let _rx = service.register_worker("w_force", cfg).await;
+    let _rx = service.register_worker("w_force", cfg).await.unwrap();
 
     // Problem 4 verification: force_refresh() must hit remote and return Event B, not cached Event A!
     service
@@ -1163,7 +1200,7 @@ async fn test_concurrent_refreshes_are_serialized() {
 
     let service = Arc::new(RedFolderService::with_client(client));
     let cfg = RedFolderConfig::default();
-    let _rx = service.register_worker("w_concurrent", cfg).await;
+    let _rx = service.register_worker("w_concurrent", cfg).await.unwrap();
 
     // Problem 5 verification: 5 concurrent refresh tasks run without racing or panic
     let mut handles = Vec::new();
@@ -1342,7 +1379,7 @@ async fn test_refresh_reconciles_worker_state_immediately() {
         .buffer_minutes(15, 15)
         .build();
 
-    let mut event_rx = service.register_worker_events("w_lag", cfg).await;
+    let mut event_rx = service.register_worker_events("w_lag", cfg).await.unwrap();
     assert!(!service.is_blackout("w_lag").await);
 
     // Save event that is happening right now into cache
@@ -1443,7 +1480,7 @@ async fn test_stop_during_delayed_http_request() {
 
     let service = Arc::new(RedFolderService::with_client(client));
     let cfg = RedFolderConfig::default();
-    let _rx = service.register_worker("w_slow", cfg).await;
+    let _rx = service.register_worker("w_slow", cfg).await.unwrap();
 
     // Spawn a long-running refresh task in background
     let s_clone = service.clone();
@@ -1571,4 +1608,176 @@ async fn test_http_retry_on_429_exhausted_falls_back_to_cache() {
         .expect("repeated 429 should fall back to disk cache");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].title, "Cached Reserve FOMC");
+}
+
+#[tokio::test]
+async fn test_register_worker_rejects_unvalidated_deserialized_config() {
+    let service = RedFolderService::new(None);
+
+    // Simulate deserializing an invalid config directly from JSON with negative buffers
+    let bad_json = r#"{
+        "enabled": true,
+        "currencies": ["USD"],
+        "impacts": ["High"],
+        "before_min": -15,
+        "after_min": 15
+    }"#;
+    let bad_cfg: RedFolderConfig = serde_json::from_str(bad_json).unwrap();
+
+    let legacy_res = service
+        .register_worker("bot_bad_legacy", bad_cfg.clone())
+        .await;
+    assert!(
+        legacy_res.is_err(),
+        "register_worker must reject unvalidated deserialized config with negative buffers"
+    );
+
+    let event_res = service
+        .register_worker_events("bot_bad_events", bad_cfg)
+        .await;
+    assert!(
+        event_res.is_err(),
+        "register_worker_events must reject unvalidated deserialized config with negative buffers"
+    );
+}
+
+#[tokio::test]
+async fn test_register_worker_duplicate_id_protection_and_reregister() {
+    let service = RedFolderService::new(None);
+    let cfg = RedFolderConfig::default();
+
+    // 1. Initial registration succeeds
+    let rx1 = service.register_worker("unique_bot", cfg.clone()).await;
+    assert!(rx1.is_ok(), "initial worker registration must succeed");
+
+    // 2. Duplicate registration without unregistering must return Err to protect channel
+    let rx_dup = service.register_worker("unique_bot", cfg.clone()).await;
+    assert!(
+        rx_dup.is_err(),
+        "duplicate worker registration must be rejected"
+    );
+
+    // 3. Explicit reregistration succeeds
+    let rx_rereg = service.reregister_worker("unique_bot", cfg).await;
+    assert!(
+        rx_rereg.is_ok(),
+        "explicit reregister_worker must succeed and overwrite state"
+    );
+}
+
+#[tokio::test]
+async fn test_concurrent_save_cache_atomic() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+
+    let client = Arc::new(redfolder::calendar::CalendarClient::new(Some(
+        cache_dir.clone(),
+    )));
+
+    let mut handles = Vec::new();
+    for i in 0..10 {
+        let client_clone = client.clone();
+        handles.push(tokio::spawn(async move {
+            let events = vec![redfolder::calendar::RawCalendarEvent {
+                title: format!("Concurrent Event {i}"),
+                country: "USD".into(),
+                date: "2026-06-15T12:00:00Z".into(),
+                time: "".into(),
+                impact: "High".into(),
+            }];
+            client_clone.save_cache(&events)
+        }));
+    }
+
+    for h in handles {
+        let res = h.await.unwrap();
+        assert!(
+            res.is_ok(),
+            "concurrent save_cache calls must succeed without race conditions"
+        );
+    }
+
+    // Verify cache file exists and is valid
+    let loaded = client.load_cache_data();
+    assert!(loaded.is_some());
+
+    // Verify zero leftover .tmp files
+    let mut tmp_count = 0;
+    for entry in std::fs::read_dir(&cache_dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.contains(".tmp") {
+            tmp_count += 1;
+        }
+    }
+    assert_eq!(
+        tmp_count, 0,
+        "concurrent atomic writes must leave zero leftover temp files"
+    );
+}
+
+#[tokio::test]
+async fn test_calendar_sync_failed_event_reaches_listeners() {
+    let unreachable_client = redfolder::calendar::CalendarClient::with_options(
+        reqwest::Client::new(),
+        "http://127.0.0.1:9/unreachable",
+        None,
+        std::time::Duration::from_millis(50),
+    );
+    let service = RedFolderService::with_client(unreachable_client);
+
+    let listener = Arc::new(MockAuditListener::new());
+    service.add_listener(listener.clone()).await;
+
+    let mut broadcast_rx = service.subscribe();
+
+    let cfg = RedFolderConfig::default();
+    let _rx = service.register_worker("w_sync_fail", cfg).await.unwrap();
+
+    // Trigger refresh which fails
+    let res = service.refresh().await;
+    assert!(res.is_err());
+
+    // Broadcast bus receives CalendarSyncFailed
+    let bus_ev = broadcast_rx
+        .recv()
+        .await
+        .expect("broadcast should receive event");
+    assert!(bus_ev.is_sync_failed());
+
+    // Allow background listener tasks to run
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        listener.sync_failures.load(Ordering::SeqCst) >= 1,
+        "EventListener must receive CalendarSyncFailed callback"
+    );
+}
+
+#[test]
+fn test_atomic_status_accessor_consistency() {
+    let now = Utc::now();
+    let raw = vec![redfolder::calendar::RawCalendarEvent {
+        title: "Atomic Accessor Check".into(),
+        country: "USD".into(),
+        date: now.to_rfc3339(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+
+    let config = RedFolderConfig::builder()
+        .currencies(vec!["USD"])
+        .impacts(vec!["High"])
+        .buffer_minutes(10, 10)
+        .build();
+
+    let engine = BlackoutEngine::compile(&raw, &[&config], now);
+
+    // status() returns Some(window) when active
+    let active = engine.status(&config);
+    assert!(active.is_some());
+    assert_eq!(active.unwrap().events[0].title, "Atomic Accessor Check");
+
+    // Non-matching currency returns None
+    let eur_config = RedFolderConfig::builder().currencies(vec!["EUR"]).build();
+    assert!(engine.status(&eur_config).is_none());
 }

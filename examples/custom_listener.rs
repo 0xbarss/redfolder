@@ -55,6 +55,9 @@ impl EventListener for RiskAuditor {
                     self.system_name, total_events, total_windows
                 );
             }
+            RedFolderEvent::CalendarSyncFailed { error } => {
+                println!("[{}] ❌ Calendar sync failed: {}", self.system_name, error);
+            }
         }
     }
 }
@@ -76,7 +79,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .warning_minutes(10)
         .build();
 
-    let _rx = service.register_worker_events("gbpusd_bot", config).await;
+    let _rx = service.register_worker_events("gbpusd_bot", config).await?;
 
     println!("Starting service with custom listener...");
     service.start().await?;

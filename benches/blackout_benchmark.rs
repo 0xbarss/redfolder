@@ -55,6 +55,11 @@ fn bench_blackout_engine(c: &mut Criterion) {
     c.bench_function("windows_for_config", |b| {
         b.iter(|| engine.windows_for_config(black_box(&config), black_box(now)))
     });
+
+    // 5. Benchmark atomic status accessor (status)
+    c.bench_function("status_query", |b| {
+        b.iter(|| engine.status(black_box(&config)))
+    });
 }
 
 criterion_group!(benches, bench_blackout_engine);
