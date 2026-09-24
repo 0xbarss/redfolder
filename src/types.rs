@@ -3,6 +3,120 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
+/// Currency code representation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Currency {
+    #[serde(alias = "usd")]
+    USD,
+    #[serde(alias = "eur")]
+    EUR,
+    #[serde(alias = "gbp")]
+    GBP,
+    #[serde(alias = "jpy")]
+    JPY,
+    #[serde(alias = "aud")]
+    AUD,
+    #[serde(alias = "cad")]
+    CAD,
+    #[serde(alias = "chf")]
+    CHF,
+    #[serde(alias = "nzd")]
+    NZD,
+    #[serde(alias = "cny")]
+    CNY,
+    #[serde(alias = "all", alias = "ALL", alias = "Global", alias = "global")]
+    All,
+    #[serde(untagged)]
+    Custom(String),
+}
+
+impl Currency {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Currency::USD => "USD",
+            Currency::EUR => "EUR",
+            Currency::GBP => "GBP",
+            Currency::JPY => "JPY",
+            Currency::AUD => "AUD",
+            Currency::CAD => "CAD",
+            Currency::CHF => "CHF",
+            Currency::NZD => "NZD",
+            Currency::CNY => "CNY",
+            Currency::All => "All",
+            Currency::Custom(s) => s.as_str(),
+        }
+    }
+
+    #[must_use]
+    pub fn matches_str(&self, text: &str) -> bool {
+        match self {
+            Currency::All => true,
+            Currency::Custom(s) => {
+                s.eq_ignore_ascii_case(text)
+                    || text.eq_ignore_ascii_case("all")
+                    || text.eq_ignore_ascii_case("global")
+            }
+            standard => {
+                standard.as_str().eq_ignore_ascii_case(text)
+                    || text.eq_ignore_ascii_case("all")
+                    || text.eq_ignore_ascii_case("global")
+            }
+        }
+    }
+}
+
+impl fmt::Display for Currency {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl FromStr for Currency {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let trimmed = s.trim();
+        Ok(match trimmed.to_uppercase().as_str() {
+            "USD" => Currency::USD,
+            "EUR" => Currency::EUR,
+            "GBP" => Currency::GBP,
+            "JPY" => Currency::JPY,
+            "AUD" => Currency::AUD,
+            "CAD" => Currency::CAD,
+            "CHF" => Currency::CHF,
+            "NZD" => Currency::NZD,
+            "CNY" => Currency::CNY,
+            "ALL" | "GLOBAL" => Currency::All,
+            _ => Currency::Custom(trimmed.to_string()),
+        })
+    }
+}
+
+impl From<&str> for Currency {
+    fn from(s: &str) -> Self {
+        s.parse().unwrap()
+    }
+}
+
+impl From<String> for Currency {
+    fn from(s: String) -> Self {
+        s.as_str().into()
+    }
+}
+
+impl From<Currency> for String {
+    fn from(c: Currency) -> Self {
+        c.to_string()
+    }
+}
+
+impl AsRef<str> for Currency {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
 /// Impact severity level of an economic event.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Impact {
@@ -19,14 +133,17 @@ pub enum Impact {
 }
 
 impl Impact {
+    #[must_use]
     pub fn is_high(&self) -> bool {
         matches!(self, Impact::High)
     }
 
+    #[must_use]
     pub fn is_red_folder(&self) -> bool {
         self.is_high()
     }
 
+    #[must_use]
     pub fn matches_str(&self, text: &str) -> bool {
         match self {
             Impact::High => text.eq_ignore_ascii_case("High") || text.eq_ignore_ascii_case("Red"),
@@ -41,6 +158,18 @@ impl Impact {
             }
             Impact::Custom(s) => s.eq_ignore_ascii_case(text),
         }
+    }
+}
+
+impl From<Impact> for String {
+    fn from(i: Impact) -> Self {
+        i.to_string()
+    }
+}
+
+impl From<&str> for Impact {
+    fn from(s: &str) -> Self {
+        s.parse().unwrap()
     }
 }
 
@@ -104,26 +233,31 @@ pub struct BlackoutWindow {
 impl BlackoutWindow {
     /// Returns the minutes remaining until this blackout window ends.
     /// If the window has already passed, returns 0.
+    #[must_use]
     pub fn remaining_minutes(&self) -> i64 {
         (self.end - Utc::now()).num_seconds().max(0) / 60
     }
 
     /// Total duration of the window in minutes.
+    #[must_use]
     pub fn duration_minutes(&self) -> i64 {
         (self.end - self.start).num_seconds() / 60
     }
 
     /// Whether this window is currently active at the specified timestamp.
+    #[must_use]
     pub fn is_active_at(&self, time: DateTime<Utc>) -> bool {
         self.start <= time && time <= self.end
     }
 
     /// Whether this window is currently active right now.
+    #[must_use]
     pub fn is_active(&self) -> bool {
         self.is_active_at(Utc::now())
     }
 
     /// Primary event title in this window (or summary if multiple).
+    #[must_use]
     pub fn summary_title(&self) -> String {
         if self.events.is_empty() {
             "Blackout Window".to_string()
@@ -184,5 +318,27 @@ mod tests {
         assert_eq!(window.duration_minutes(), 30);
         assert!(window.remaining_minutes() >= 19 && window.remaining_minutes() <= 20);
         assert_eq!(window.summary_title(), "US CPI Release");
+    }
+
+    #[test]
+    fn test_currency_parsing_and_matching() {
+        assert_eq!("USD".parse::<Currency>().unwrap(), Currency::USD);
+        assert_eq!("usd".parse::<Currency>().unwrap(), Currency::USD);
+        assert_eq!("eur".parse::<Currency>().unwrap(), Currency::EUR);
+        assert_eq!("ALL".parse::<Currency>().unwrap(), Currency::All);
+        assert_eq!("XAU".parse::<Currency>().unwrap(), Currency::Custom("XAU".into()));
+
+        let usd = Currency::USD;
+        assert!(usd.matches_str("USD"));
+        assert!(usd.matches_str("usd"));
+        assert!(usd.matches_str("all"));
+        assert!(!usd.matches_str("EUR"));
+
+        let all = Currency::All;
+        assert!(all.matches_str("USD"));
+        assert!(all.matches_str("JPY"));
+
+        assert_eq!(String::from(Currency::EUR), "EUR");
+        assert_eq!(Currency::from("GBP"), Currency::GBP);
     }
 }

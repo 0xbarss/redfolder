@@ -97,14 +97,18 @@ impl Default for RedFolderConfig {
     }
 }
 
+use crate::types::{Currency, Impact};
+
 impl RedFolderConfig {
     /// Create a new configuration builder.
+    #[must_use]
     pub fn builder() -> RedFolderConfigBuilder {
         RedFolderConfigBuilder::default()
     }
 
     /// Preset tailored for prop firm trading challenges (FTMO, FundedNext, MFF):
     /// Strict 5 minutes before and after high-impact news, plus full weekend curfew until Monday.
+    #[must_use]
     pub fn prop_firm_strict() -> Self {
         Self {
             enabled: true,
@@ -131,6 +135,7 @@ impl RedFolderConfig {
     }
 
     /// Preset with conservative 30-minute buffers for high and medium impact releases.
+    #[must_use]
     pub fn conservative() -> Self {
         Self {
             enabled: true,
@@ -152,43 +157,73 @@ impl RedFolderConfig {
 #[derive(Debug, Default)]
 pub struct RedFolderConfigBuilder {
     config: RedFolderConfig,
+    custom_currencies: bool,
+    custom_impacts: bool,
 }
 
 impl RedFolderConfigBuilder {
+    #[must_use]
     pub fn enabled(mut self, enabled: bool) -> Self {
         self.config.enabled = enabled;
         self
     }
 
+    #[must_use]
     pub fn currencies<I, S>(mut self, currencies: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
         self.config.currencies = currencies.into_iter().map(Into::into).collect();
+        self.custom_currencies = true;
         self
     }
 
+    #[must_use]
+    pub fn currency(mut self, currency: impl Into<Currency>) -> Self {
+        if !self.custom_currencies {
+            self.config.currencies.clear();
+            self.custom_currencies = true;
+        }
+        self.config.currencies.push(currency.into().to_string());
+        self
+    }
+
+    #[must_use]
     pub fn impacts<I, S>(mut self, impacts: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
         self.config.impacts = impacts.into_iter().map(Into::into).collect();
+        self.custom_impacts = true;
         self
     }
 
+    #[must_use]
+    pub fn impact(mut self, impact: impl Into<Impact>) -> Self {
+        if !self.custom_impacts {
+            self.config.impacts.clear();
+            self.custom_impacts = true;
+        }
+        self.config.impacts.push(impact.into().to_string());
+        self
+    }
+
+    #[must_use]
     pub fn buffer_minutes(mut self, before: i64, after: i64) -> Self {
         self.config.before_min = before;
         self.config.after_min = after;
         self
     }
 
+    #[must_use]
     pub fn merge_threshold(mut self, minutes: i64) -> Self {
         self.config.merge_threshold_min = minutes;
         self
     }
 
+    #[must_use]
     pub fn weekend_curfew(
         mut self,
         enabled: bool,
@@ -203,11 +238,13 @@ impl RedFolderConfigBuilder {
         self
     }
 
+    #[must_use]
     pub fn warning_minutes(mut self, minutes: i64) -> Self {
         self.config.warning_before_min = Some(minutes);
         self
     }
 
+    #[must_use]
     pub fn build(self) -> RedFolderConfig {
         self.config
     }
@@ -263,5 +300,21 @@ mod tests {
         assert_eq!(cfg.before_min, 10);
         assert_eq!(cfg.after_min, 10);
         assert_eq!(cfg.weekend_start, "19:00");
+    }
+
+    #[test]
+    fn test_typed_builder() {
+        use crate::curfew::WeekendMode;
+        let cfg = RedFolderConfig::builder()
+            .currency(Currency::USD)
+            .currency(Currency::EUR)
+            .impact(Impact::High)
+            .buffer_minutes(15, 15)
+            .weekend_curfew(true, "20:00", "21:00", WeekendMode::Weekend)
+            .build();
+
+        assert_eq!(cfg.currencies, vec!["USD", "EUR"]);
+        assert_eq!(cfg.impacts, vec!["High"]);
+        assert_eq!(cfg.weekend_mode, "weekend");
     }
 }

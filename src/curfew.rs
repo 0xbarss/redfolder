@@ -1,10 +1,12 @@
 use crate::error::{RedFolderError, Result};
 use chrono::{DateTime, Datelike, Duration, Utc};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
 /// Mode for weekend market close curfew windows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum WeekendMode {
     /// Window ends at the configured end time on Friday evening.
     Short,
@@ -30,6 +32,18 @@ impl FromStr for WeekendMode {
         } else {
             Ok(WeekendMode::Short)
         }
+    }
+}
+
+impl From<WeekendMode> for String {
+    fn from(m: WeekendMode) -> Self {
+        m.to_string()
+    }
+}
+
+impl From<&str> for WeekendMode {
+    fn from(s: &str) -> Self {
+        s.parse().unwrap()
     }
 }
 
@@ -116,6 +130,7 @@ pub fn next_weekend_window(
 }
 
 /// Helper that generates human-readable description for weekend curfew.
+#[must_use]
 pub fn weekend_window_title(start_str: &str, end_str: &str, mode: &str) -> String {
     if mode.eq_ignore_ascii_case("weekend") {
         "Weekend Blackout (Market Close)".to_string()

@@ -178,3 +178,79 @@ async fn test_service_worker_unregistration() {
         .await
         .is_empty());
 }
+
+#[tokio::test]
+async fn test_multi_worker_buffer_isolation_in_service() {
+    let service = RedFolderService::new(None);
+
+    let scalper_cfg = RedFolderConfig::builder()
+        .currency(Currency::USD)
+        .impact(Impact::High)
+        .buffer_minutes(5, 5)
+        .weekend_curfew(false, "20:00", "21:00", "short")
+        .build();
+
+    let swing_cfg = RedFolderConfig::builder()
+        .currency(Currency::USD)
+        .impact(Impact::High)
+        .buffer_minutes(30, 30)
+        .weekend_curfew(false, "20:00", "21:00", "short")
+        .build();
+
+    let _scalper_rx = service.register_worker("scalper", scalper_cfg.clone()).await;
+    let _swing_rx = service.register_worker("swing", swing_cfg.clone()).await;
+
+    let now = Utc::now();
+    // Event scheduled in 15 minutes from now
+    let raw = vec![redfolder::calendar::RawCalendarEvent {
+        title: "US CPI Release".into(),
+        country: "USD".into(),
+        date: (now + Duration::minutes(15)).to_rfc3339(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+
+    // Compile engine directly with both worker configs
+    let engine = BlackoutEngine::compile(&raw, &[&scalper_cfg, &swing_cfg], now);
+
+    // Verify Scalper (5m buffer) is NOT in blackout 15m before event
+    assert!(!engine.is_blackout(&scalper_cfg));
+    assert!(engine.current_window(&scalper_cfg).is_none());
+
+    // Verify Swing (30m buffer) IS in blackout 15m before event
+    assert!(engine.is_blackout(&swing_cfg));
+    let swing_window = engine.current_window(&swing_cfg).expect("swing window should exist");
+    assert_eq!(swing_window.events[0].title, "US CPI Release");
+}
+
+#[tokio::test]
+async fn test_offline_cache_fallback() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+
+    // 1. First client saves events to cache
+    let client = redfolder::calendar::CalendarClient::new(Some(cache_dir.clone()));
+    let events = vec![redfolder::calendar::RawCalendarEvent {
+        title: "ECB Rate Announcement".into(),
+        country: "EUR".into(),
+        date: "2026-06-15T12:45:00Z".into(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+    client.save_cache(&events).unwrap();
+
+    // 2. Second client with unreachable remote URL falls back to disk cache
+    let broken_client = redfolder::calendar::CalendarClient::with_options(
+        reqwest::Client::new(),
+        "http://127.0.0.1:9/unreachable",
+        Some(cache_dir),
+        std::time::Duration::from_millis(100),
+    );
+
+    let loaded = broken_client
+        .fetch_or_cached()
+        .await
+        .expect("should successfully fall back to cached events");
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].title, "ECB Rate Announcement");
+}

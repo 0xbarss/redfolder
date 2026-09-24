@@ -1,142 +1,191 @@
 use crate::calendar::{parse_event_datetime, RawCalendarEvent};
 use crate::config::RedFolderConfig;
 use crate::curfew::{next_weekend_window, weekend_window_title};
-use crate::types::{BlackoutWindow, WindowEvent};
+use crate::types::{BlackoutWindow, EconomicEvent, WindowEvent};
 use chrono::{DateTime, Duration, Utc};
-use std::collections::HashSet;
-use tracing::{debug, info};
+use tracing::info;
 
-/// In-memory engine that compiles raw calendar events and curfew rules into merged blackout windows.
+/// In-memory engine that manages calendar events and derives per-worker blackout windows.
 #[derive(Debug, Clone, Default)]
 pub struct BlackoutEngine {
+    /// Raw calendar events provided to the engine.
+    raw_events: Vec<RawCalendarEvent>,
+    /// Pre-parsed economic events.
+    parsed_events: Vec<EconomicEvent>,
+    /// Precompiled windows for backwards-compatible reference and single-worker setups.
     windows: Vec<BlackoutWindow>,
 }
 
 impl BlackoutEngine {
     /// Create an empty engine.
+    #[must_use]
     pub fn new() -> Self {
         Self {
+            raw_events: Vec::new(),
+            parsed_events: Vec::new(),
             windows: Vec::new(),
         }
     }
 
-    /// Compile raw calendar events and worker configurations into merged blackout windows.
+    /// Construct engine from raw calendar events.
+    #[must_use]
+    pub fn from_events(raw_events: &[RawCalendarEvent]) -> Self {
+        let parsed_events: Vec<EconomicEvent> = raw_events
+            .iter()
+            .filter_map(|raw| {
+                let dt = parse_event_datetime(raw)?;
+                Some(EconomicEvent {
+                    title: raw.title.clone(),
+                    country: raw.country.clone(),
+                    impact: raw.impact.clone(),
+                    datetime: dt,
+                })
+            })
+            .collect();
+
+        Self {
+            raw_events: raw_events.to_vec(),
+            parsed_events,
+            windows: Vec::new(),
+        }
+    }
+
+    /// Compile raw calendar events and worker configurations into blackout windows.
+    ///
+    /// Preserves worker isolation by deriving blackout windows per worker config
+    /// rather than widening all workers to the global maximum buffers.
+    #[must_use]
     pub fn compile(
         raw_events: &[RawCalendarEvent],
         configs: &[&RedFolderConfig],
         now: DateTime<Utc>,
     ) -> Self {
-        // Collect union of currencies and impacts, and maximum timing parameters across all enabled configs
-        let mut all_currencies: HashSet<String> = HashSet::new();
-        let mut all_impacts: HashSet<String> = HashSet::new();
-        let mut max_before: Option<i64> = None;
-        let mut max_after: Option<i64> = None;
-        let mut max_merge: Option<i64> = None;
+        let mut engine = Self::from_events(raw_events);
 
-        for cfg in configs {
-            if !cfg.enabled {
-                continue;
+        if !configs.is_empty() {
+            if configs.len() == 1 {
+                engine.windows = engine.windows_for_config(configs[0], now);
+            } else {
+                let mut all_windows = Vec::new();
+                for cfg in configs {
+                    if cfg.enabled {
+                        all_windows.extend(engine.windows_for_config(cfg, now));
+                    }
+                }
+                all_windows.sort_by_key(|w| w.start);
+                engine.windows = all_windows;
             }
-            all_currencies.extend(cfg.currencies.iter().cloned());
-            all_impacts.extend(cfg.impacts.iter().cloned());
-            max_before = Some(max_before.map_or(cfg.before_min, |m| m.max(cfg.before_min)));
-            max_after = Some(max_after.map_or(cfg.after_min, |m| m.max(cfg.after_min)));
-            max_merge =
-                Some(max_merge.map_or(cfg.merge_threshold_min, |m| m.max(cfg.merge_threshold_min)));
+        } else {
+            let default_cfg = RedFolderConfig::default();
+            engine.windows = engine.windows_for_config(&default_cfg, now);
         }
 
-        if all_currencies.is_empty() {
-            all_currencies.insert("USD".into());
-        }
-        if all_impacts.is_empty() {
-            all_impacts.insert("High".into());
+        info!(
+            windows = %engine.windows.len(),
+            events = %engine.parsed_events.len(),
+            "compiled blackout engine"
+        );
+        engine
+    }
+
+    /// Access raw calendar events stored in the engine.
+    #[must_use]
+    pub fn raw_events(&self) -> &[RawCalendarEvent] {
+        &self.raw_events
+    }
+
+    /// Access pre-parsed economic events stored in the engine.
+    #[must_use]
+    pub fn parsed_events(&self) -> &[EconomicEvent] {
+        &self.parsed_events
+    }
+
+    /// Access reference precompiled windows.
+    #[must_use]
+    pub fn windows(&self) -> &[BlackoutWindow] {
+        &self.windows
+    }
+
+    /// Whether the engine contains no events and no windows.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.raw_events.is_empty() && self.windows.is_empty()
+    }
+
+    /// Derives worker-specific blackout windows at runtime using the worker's own
+    /// timing buffers (`before_min`, `after_min`), merge threshold, currencies, impacts,
+    /// and weekend curfew configuration.
+    #[must_use]
+    pub fn windows_for_config(
+        &self,
+        config: &RedFolderConfig,
+        now: DateTime<Utc>,
+    ) -> Vec<BlackoutWindow> {
+        if !config.enabled {
+            return Vec::new();
         }
 
-        let before_min = max_before.unwrap_or(30);
-        let after_min = max_after.unwrap_or(30);
+        let before_min = config.before_min;
+        let after_min = config.after_min;
         let cutoff = now + Duration::hours(48);
+        let lower_cutoff = now - Duration::minutes(after_min);
 
         let mut individual: Vec<(DateTime<Utc>, DateTime<Utc>, WindowEvent)> = Vec::new();
 
-        let lower_cutoff = now - Duration::minutes(after_min);
-
-        // 1. Process external economic calendar releases
-        for raw in raw_events {
-            let Some(event_dt) = parse_event_datetime(raw) else {
-                continue;
-            };
-
-            // Only consider events whose blackout window is still active or starts within 48 hours
-            if event_dt < lower_cutoff || event_dt > cutoff {
+        // 1. Process parsed economic releases matching this worker config
+        for event in &self.parsed_events {
+            if event.datetime < lower_cutoff || event.datetime > cutoff {
                 continue;
             }
 
-            let matches_currency = raw.country.eq_ignore_ascii_case("All")
-                || raw.country.eq_ignore_ascii_case("Global")
-                || all_currencies
-                    .iter()
-                    .any(|c| c.eq_ignore_ascii_case(&raw.country) || c.eq_ignore_ascii_case("All"));
-            let matches_impact = all_impacts
-                .iter()
-                .any(|i| i.eq_ignore_ascii_case(&raw.impact));
-
-            if matches_currency && matches_impact {
-                let start = event_dt - Duration::minutes(before_min);
-                let end = event_dt + Duration::minutes(after_min);
+            if event_matches_economic_event(event, config) {
+                let start = event.datetime - Duration::minutes(before_min);
+                let end = event.datetime + Duration::minutes(after_min);
                 individual.push((
                     start,
                     end,
                     WindowEvent {
                         is_custom: false,
-                        event_time: event_dt,
-                        country: raw.country.clone(),
-                        impact: raw.impact.clone(),
-                        title: raw.title.clone(),
+                        event_time: event.datetime,
+                        country: event.country.clone(),
+                        impact: event.impact.clone(),
+                        title: event.title.clone(),
                     },
                 ));
             }
         }
 
-        // 2. Add weekend curfew windows for configs where weekend protection is enabled
-        let mut weekend_added = false;
-        for cfg in configs {
-            if cfg.enabled && cfg.weekend_enabled {
-                if let Ok((start, end)) =
-                    next_weekend_window(&cfg.weekend_start, &cfg.weekend_end, &cfg.weekend_mode)
-                {
-                    // Only add if within the cutoff or currently active
-                    if end >= now && start <= cutoff {
-                        let title = weekend_window_title(
-                            &cfg.weekend_start,
-                            &cfg.weekend_end,
-                            &cfg.weekend_mode,
-                        );
-                        individual.push((
-                            start,
-                            end,
-                            WindowEvent {
-                                is_custom: true,
-                                event_time: start,
-                                country: "Global".into(),
-                                impact: "High".into(),
-                                title,
-                            },
-                        ));
-                        weekend_added = true;
-                    }
+        // 2. Add weekend curfew if enabled for this worker
+        if config.weekend_enabled {
+            if let Ok((start, end)) =
+                next_weekend_window(&config.weekend_start, &config.weekend_end, &config.weekend_mode)
+            {
+                if end >= now && start <= cutoff {
+                    let title = weekend_window_title(
+                        &config.weekend_start,
+                        &config.weekend_end,
+                        &config.weekend_mode,
+                    );
+                    individual.push((
+                        start,
+                        end,
+                        WindowEvent {
+                            is_custom: true,
+                            event_time: start,
+                            country: "Global".into(),
+                            impact: "High".into(),
+                            title,
+                        },
+                    ));
                 }
             }
-        }
-
-        if weekend_added {
-            debug!("added weekend curfew blackout window");
         }
 
         // 3. Sort individual windows by start time
         individual.sort_by_key(|(start, _, _)| *start);
 
-        // 4. Merge overlapping or threshold-adjacent windows
-        let merge_gap = Duration::minutes(max_merge.unwrap_or(30));
+        // 4. Merge overlapping or threshold-adjacent windows using worker's merge threshold
+        let merge_gap = Duration::minutes(config.merge_threshold_min);
         let mut merged: Vec<BlackoutWindow> = Vec::new();
 
         for (start, end, event) in individual {
@@ -155,61 +204,61 @@ impl BlackoutEngine {
             }
         }
 
-        info!(count = %merged.len(), "compiled and merged blackout windows");
-        Self { windows: merged }
-    }
-
-    /// Access all compiled windows.
-    pub fn windows(&self) -> &[BlackoutWindow] {
-        &self.windows
+        merged
     }
 
     /// Checks if a blackout is currently active for the given configuration.
+    #[must_use]
     pub fn is_blackout(&self, config: &RedFolderConfig) -> bool {
-        is_blackout_for_config(config, &self.windows, Utc::now())
+        self.is_blackout_at(config, Utc::now())
     }
 
-    /// Checks if a blackout was active at a specific point in time.
+    /// Checks if a blackout was active at a specific point in time for the given configuration.
+    #[must_use]
     pub fn is_blackout_at(&self, config: &RedFolderConfig, time: DateTime<Utc>) -> bool {
-        is_blackout_for_config(config, &self.windows, time)
+        if !config.enabled {
+            return false;
+        }
+        let windows = self.windows_for_config(config, time);
+        windows.iter().any(|w| w.is_active_at(time))
     }
 
     /// Returns the active `BlackoutWindow` matching the configuration, if any.
+    #[must_use]
     pub fn current_window(&self, config: &RedFolderConfig) -> Option<BlackoutWindow> {
-        current_window_for_config(config, &self.windows, Utc::now())
+        self.current_window_at(config, Utc::now())
+    }
+
+    /// Returns the active `BlackoutWindow` matching the configuration at a specific timestamp, if any.
+    #[must_use]
+    pub fn current_window_at(
+        &self,
+        config: &RedFolderConfig,
+        time: DateTime<Utc>,
+    ) -> Option<BlackoutWindow> {
+        if !config.enabled {
+            return None;
+        }
+        let windows = self.windows_for_config(config, time);
+        windows.into_iter().find(|w| w.is_active_at(time))
     }
 
     /// Returns upcoming blackout windows within `hours` hours matching the configuration.
+    #[must_use]
     pub fn upcoming_blackouts(&self, config: &RedFolderConfig, hours: u32) -> Vec<BlackoutWindow> {
         let now = Utc::now();
         let cutoff = now + Duration::hours(hours as i64);
+        let windows = self.windows_for_config(config, now);
 
-        self.windows
-            .iter()
+        windows
+            .into_iter()
             .filter(|w| w.start >= now && w.start <= cutoff)
-            .filter_map(|w| {
-                let matching_events: Vec<WindowEvent> = w
-                    .events
-                    .iter()
-                    .filter(|e| event_matches_config(e, config))
-                    .cloned()
-                    .collect();
-
-                if matching_events.is_empty() {
-                    None
-                } else {
-                    Some(BlackoutWindow {
-                        start: w.start,
-                        end: w.end,
-                        events: matching_events,
-                    })
-                }
-            })
             .collect()
     }
 }
 
 /// Evaluates whether any window in `windows` is active for `config` at `at`.
+#[must_use]
 pub fn is_blackout_for_config(
     config: &RedFolderConfig,
     windows: &[BlackoutWindow],
@@ -232,6 +281,7 @@ pub fn is_blackout_for_config(
 }
 
 /// Returns the matching `BlackoutWindow` active at `at` for `config`, if any.
+#[must_use]
 pub fn current_window_for_config(
     config: &RedFolderConfig,
     windows: &[BlackoutWindow],
@@ -262,7 +312,25 @@ pub fn current_window_for_config(
     None
 }
 
+/// Checks if an `EconomicEvent` matches a given worker `RedFolderConfig`.
+#[must_use]
+pub fn event_matches_economic_event(event: &EconomicEvent, config: &RedFolderConfig) -> bool {
+    let currency_match = event.country.eq_ignore_ascii_case("All")
+        || event.country.eq_ignore_ascii_case("Global")
+        || config
+            .currencies
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&event.country) || c.eq_ignore_ascii_case("All"));
+    let impact_match = config
+        .impacts
+        .iter()
+        .any(|i| i.eq_ignore_ascii_case(&event.impact));
+
+    currency_match && impact_match
+}
+
 /// Checks if a single `WindowEvent` matches a given worker `RedFolderConfig`.
+#[must_use]
 pub fn event_matches_config(event: &WindowEvent, config: &RedFolderConfig) -> bool {
     if event.is_custom {
         config.weekend_enabled
@@ -348,5 +416,97 @@ mod tests {
             now
         ));
         assert!(!is_blackout_for_config(&eur_config, &[window], now));
+    }
+
+    #[test]
+    fn test_worker_specific_buffers_isolation() {
+        let now = Utc::now();
+        let event_time = now + Duration::minutes(15);
+        let raw = vec![RawCalendarEvent {
+            title: "US Non-Farm Payrolls".into(),
+            country: "USD".into(),
+            date: event_time.to_rfc3339(),
+            time: "".into(),
+            impact: "High".into(),
+        }];
+
+        // Scalper: 5 min before, 5 min after
+        let scalper = RedFolderConfig::builder()
+            .currencies(vec!["USD"])
+            .impacts(vec!["High"])
+            .buffer_minutes(5, 5)
+            .weekend_curfew(false, "20:00", "21:00", "short")
+            .build();
+
+        // Swing: 30 min before, 30 min after
+        let swing = RedFolderConfig::builder()
+            .currencies(vec!["USD"])
+            .impacts(vec!["High"])
+            .buffer_minutes(30, 30)
+            .weekend_curfew(false, "20:00", "21:00", "short")
+            .build();
+
+        let engine = BlackoutEngine::compile(&raw, &[&scalper, &swing], now);
+
+        // At T=now (15 mins before event):
+        // Scalper (5m buffer) must NOT be in blackout!
+        assert!(!engine.is_blackout_at(&scalper, now));
+        // Swing (30m buffer) MUST be in blackout!
+        assert!(engine.is_blackout_at(&swing, now));
+
+        // At T = event_time - 3 mins (3 mins before event):
+        // Both workers should now be in blackout!
+        let three_mins_before = event_time - Duration::minutes(3);
+        assert!(engine.is_blackout_at(&scalper, three_mins_before));
+        assert!(engine.is_blackout_at(&swing, three_mins_before));
+
+        // At T = event_time + 7 mins (7 mins after event):
+        // Scalper's 5 min buffer has expired -> FALSE
+        // Swing's 30 min buffer is still active -> TRUE
+        let seven_mins_after = event_time + Duration::minutes(7);
+        assert!(!engine.is_blackout_at(&scalper, seven_mins_after));
+        assert!(engine.is_blackout_at(&swing, seven_mins_after));
+
+        // At T = event_time + 35 mins:
+        // Neither is in blackout
+        let thirty_five_mins_after = event_time + Duration::minutes(35);
+        assert!(!engine.is_blackout_at(&scalper, thirty_five_mins_after));
+        assert!(!engine.is_blackout_at(&swing, thirty_five_mins_after));
+    }
+
+    #[test]
+    fn test_weekend_and_news_overlap() {
+        // Find upcoming Friday 20:15 UTC (15 mins before weekend curfew at 20:30 UTC)
+        let (curfew_start, _curfew_end) =
+            next_weekend_window("20:30", "21:00", "weekend").unwrap();
+        let news_time = curfew_start - Duration::minutes(15);
+
+        let raw = vec![RawCalendarEvent {
+            title: "Federal Budget Balance".into(),
+            country: "USD".into(),
+            date: news_time.to_rfc3339(),
+            time: "".into(),
+            impact: "High".into(),
+        }];
+
+        let config = RedFolderConfig::builder()
+            .currencies(vec!["USD"])
+            .impacts(vec!["High"])
+            .buffer_minutes(30, 30) // News blackout: curfew_start - 45m to curfew_start + 15m
+            .merge_threshold(30)
+            .weekend_curfew(true, "20:30", "21:00", "weekend")
+            .build();
+
+        let engine = BlackoutEngine::compile(&raw, &[&config], news_time - Duration::hours(1));
+        let windows = engine.windows_for_config(&config, news_time - Duration::hours(1));
+
+        // News window and curfew window overlap (curfew starts at 20:30, while news window ends at 20:45)
+        // They must merge cleanly into a single continuous window
+        assert_eq!(windows.len(), 1);
+        let merged = &windows[0];
+        // Start should be news start (news_time - 30m)
+        assert_eq!(merged.start, news_time - Duration::minutes(30));
+        // And window should contain both news and curfew events
+        assert!(merged.events.len() >= 2);
     }
 }

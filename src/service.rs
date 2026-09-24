@@ -51,7 +51,7 @@ impl ServiceInner {
     /// Evaluates blackout status and warnings for all registered workers,
     /// broadcasting domain events on transitions.
     fn check_and_notify_workers(&mut self) {
-        if self.engine.windows().is_empty() {
+        if self.engine.is_empty() {
             return;
         }
 
@@ -342,7 +342,7 @@ impl RedFolderService {
         // 1. Check if already fetched today under lock
         {
             let state = inner.lock().await;
-            if state.last_fetch_date == Some(today) && !state.engine.windows().is_empty() {
+            if state.last_fetch_date == Some(today) && !state.engine.is_empty() {
                 debug!("calendar already fetched and compiled for today");
                 return Ok(());
             }

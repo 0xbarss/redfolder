@@ -42,21 +42,25 @@ pub enum RedFolderEvent {
 
 impl RedFolderEvent {
     /// Whether this event signals entering a blackout window.
+    #[must_use]
     pub fn is_blackout_started(&self) -> bool {
         matches!(self, RedFolderEvent::BlackoutStarted { .. })
     }
 
     /// Whether this event signals the clearance of a blackout window.
+    #[must_use]
     pub fn is_blackout_ended(&self) -> bool {
         matches!(self, RedFolderEvent::BlackoutEnded { .. })
     }
 
     /// Whether this event is a pre-blackout heads-up warning.
+    #[must_use]
     pub fn is_warning(&self) -> bool {
         matches!(self, RedFolderEvent::BlackoutWarning { .. })
     }
 
     /// Returns the associated `BlackoutWindow` if applicable.
+    #[must_use]
     pub fn window(&self) -> Option<&BlackoutWindow> {
         match self {
             RedFolderEvent::BlackoutWarning { window, .. } => Some(window),
@@ -67,6 +71,7 @@ impl RedFolderEvent {
     }
 
     /// Target worker ID if event is scoped to a specific worker.
+    #[must_use]
     pub fn worker_id(&self) -> Option<&str> {
         match self {
             RedFolderEvent::BlackoutWarning { worker_id, .. } => worker_id.as_deref(),
