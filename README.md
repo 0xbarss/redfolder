@@ -40,7 +40,7 @@ flowchart TD
     end
 
     Bus -->|RedFolderEvent| Bot["Algorithmic Trading Bot"]
-    Bus -->|RedFolderEvent| Bridge["mt5-bridge / Broker Connector"]
+    Bus -->|RedFolderEvent| Bridge["Broker / Exchange Connector"]
     Bus -->|RedFolderEvent| Alert["Webhook / Telegram Risk Alerts"]
 ```
 
@@ -196,15 +196,15 @@ redfolder sync
 
 ---
 
-## 🤝 Synergy with `mt5-bridge`
+## 🤖 Trading Loop Integration
 
-`redfolder` pairs naturally with [`mt5-bridge`](https://github.com/0xbarss/mt5-bridge) to build institutional-grade automated trading systems:
+`redfolder` integrates cleanly into any async trading loop or execution broker:
 
 ```rust
-// In your trading loop:
+// In your strategy or execution loop:
 tokio::select! {
-    // 1. Process broker tick feed from mt5-bridge
-    Some(tick) = mt5_client.next_tick() => {
+    // 1. Ingest market tick data
+    Some(tick) = market_feed.next_tick() => {
         if !redfolder_service.is_blackout("scalper").await {
             strategy.on_tick(tick);
         }
@@ -213,10 +213,10 @@ tokio::select! {
     Some(event) = redfolder_events.recv() => {
         match event {
             RedFolderEvent::BlackoutWarning { .. } => {
-                mt5_client.cancel_all_orders().await?;
+                broker.cancel_all_orders().await?;
             }
             RedFolderEvent::BlackoutStarted { .. } => {
-                mt5_client.close_all_positions().await?;
+                broker.close_all_positions().await?;
             }
             RedFolderEvent::BlackoutEnded { .. } => {
                 strategy.reset();
