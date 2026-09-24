@@ -44,6 +44,11 @@ pub struct RedFolderConfig {
     /// - `"weekend"`: curfew window extends throughout the weekend until Monday 00:00 UTC.
     #[serde(default = "default_weekend_mode", alias = "friday_night_mode")]
     pub weekend_mode: String,
+
+    /// Optional advance warning in minutes before a blackout window starts.
+    /// If configured, `RedFolderEvent::BlackoutWarning` will be emitted in advance.
+    #[serde(default)]
+    pub warning_before_min: Option<i64>,
 }
 
 fn default_true() -> bool {
@@ -87,6 +92,7 @@ impl Default for RedFolderConfig {
             weekend_start: default_weekend_start(),
             weekend_end: default_weekend_end(),
             weekend_mode: default_weekend_mode(),
+            warning_before_min: None,
         }
     }
 }
@@ -120,6 +126,7 @@ impl RedFolderConfig {
             weekend_start: "20:00".into(),
             weekend_end: "21:00".into(),
             weekend_mode: "weekend".into(),
+            warning_before_min: Some(15),
         }
     }
 
@@ -136,6 +143,7 @@ impl RedFolderConfig {
             weekend_start: "20:30".into(),
             weekend_end: "21:00".into(),
             weekend_mode: "weekend".into(),
+            warning_before_min: Some(30),
         }
     }
 }
@@ -192,6 +200,11 @@ impl RedFolderConfigBuilder {
         self.config.weekend_start = start_utc.into();
         self.config.weekend_end = end_utc.into();
         self.config.weekend_mode = mode.into();
+        self
+    }
+
+    pub fn warning_minutes(mut self, minutes: i64) -> Self {
+        self.config.warning_before_min = Some(minutes);
         self
     }
 

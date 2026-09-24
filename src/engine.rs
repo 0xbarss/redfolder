@@ -29,9 +29,9 @@ impl BlackoutEngine {
         // Collect union of currencies and impacts, and maximum timing parameters across all enabled configs
         let mut all_currencies: HashSet<String> = HashSet::new();
         let mut all_impacts: HashSet<String> = HashSet::new();
-        let mut max_before = 0i64;
-        let mut max_after = 0i64;
-        let mut max_merge = 0i64;
+        let mut max_before: Option<i64> = None;
+        let mut max_after: Option<i64> = None;
+        let mut max_merge: Option<i64> = None;
 
         for cfg in configs {
             if !cfg.enabled {
@@ -39,9 +39,9 @@ impl BlackoutEngine {
             }
             all_currencies.extend(cfg.currencies.iter().cloned());
             all_impacts.extend(cfg.impacts.iter().cloned());
-            max_before = max_before.max(cfg.before_min);
-            max_after = max_after.max(cfg.after_min);
-            max_merge = max_merge.max(cfg.merge_threshold_min);
+            max_before = Some(max_before.map_or(cfg.before_min, |m| m.max(cfg.before_min)));
+            max_after = Some(max_after.map_or(cfg.after_min, |m| m.max(cfg.after_min)));
+            max_merge = Some(max_merge.map_or(cfg.merge_threshold_min, |m| m.max(cfg.merge_threshold_min)));
         }
 
         if all_currencies.is_empty() {
@@ -51,8 +51,8 @@ impl BlackoutEngine {
             all_impacts.insert("High".into());
         }
 
-        let before_min = if max_before > 0 { max_before } else { 30 };
-        let after_min = if max_after > 0 { max_after } else { 30 };
+        let before_min = max_before.unwrap_or(30);
+        let after_min = max_after.unwrap_or(30);
         let cutoff = now + Duration::hours(48);
 
         let mut individual: Vec<(DateTime<Utc>, DateTime<Utc>, WindowEvent)> = Vec::new();
@@ -131,7 +131,7 @@ impl BlackoutEngine {
         individual.sort_by_key(|(start, _, _)| *start);
 
         // 4. Merge overlapping or threshold-adjacent windows
-        let merge_gap = Duration::minutes(if max_merge > 0 { max_merge } else { 30 });
+        let merge_gap = Duration::minutes(max_merge.unwrap_or(30));
         let mut merged: Vec<BlackoutWindow> = Vec::new();
 
         for (start, end, event) in individual {

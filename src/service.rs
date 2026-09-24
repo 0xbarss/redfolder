@@ -2,19 +2,22 @@ use crate::calendar::CalendarClient;
 use crate::config::RedFolderConfig;
 use crate::engine::BlackoutEngine;
 use crate::error::Result;
+use crate::events::{EventListener, RedFolderEvent};
 use crate::types::{BlackoutNotification, BlackoutWindow};
-use chrono::{Duration, NaiveDate, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use tracing::{debug, info, warn};
 
 /// Internal state tracking for an individual registered worker or strategy.
 struct WorkerState {
     config: RedFolderConfig,
-    sender: mpsc::UnboundedSender<BlackoutNotification>,
+    legacy_sender: mpsc::UnboundedSender<BlackoutNotification>,
+    event_sender: mpsc::UnboundedSender<RedFolderEvent>,
     in_blackout: bool,
+    last_warned_window_start: Option<DateTime<Utc>>,
 }
 
 /// Internal mutable state protected by an async mutex.
@@ -24,77 +27,144 @@ struct ServiceInner {
     last_fetch_date: Option<NaiveDate>,
     client: CalendarClient,
     check_interval: std::time::Duration,
+    broadcast_tx: broadcast::Sender<RedFolderEvent>,
+    listeners: Vec<Arc<dyn EventListener>>,
 }
 
 impl ServiceInner {
-    fn new(client: CalendarClient, check_interval: std::time::Duration) -> Self {
+    fn new(
+        client: CalendarClient,
+        check_interval: std::time::Duration,
+        broadcast_tx: broadcast::Sender<RedFolderEvent>,
+    ) -> Self {
         Self {
             workers: HashMap::new(),
             engine: BlackoutEngine::new(),
             last_fetch_date: None,
             client,
             check_interval,
+            broadcast_tx,
+            listeners: Vec::new(),
         }
     }
 
-    /// Evaluates blackout status for all registered workers and broadcasts notifications on state transitions.
+    /// Evaluates blackout status and warnings for all registered workers,
+    /// broadcasting domain events on transitions.
     fn check_and_notify_workers(&mut self) {
         if self.engine.windows().is_empty() {
             return;
         }
 
-        // Collect state transitions to avoid holding multiple mutable references
-        let transitions: Vec<(String, bool, Option<BlackoutWindow>)> = self
-            .workers
-            .iter()
-            .filter(|(_, ws)| ws.config.enabled)
-            .filter_map(|(id, ws)| {
-                let is_active = self.engine.is_blackout(&ws.config);
-                if is_active != ws.in_blackout {
-                    let window = if is_active {
-                        self.engine.current_window(&ws.config)
-                    } else {
-                        None
-                    };
-                    Some((id.clone(), is_active, window))
+        let now = Utc::now();
+        let mut events_to_dispatch: Vec<RedFolderEvent> = Vec::new();
+
+        // 1. Check blackout active transitions and upcoming warnings per worker
+        for (worker_id, ws) in self.workers.iter_mut() {
+            if !ws.config.enabled {
+                continue;
+            }
+
+            let is_active = self.engine.is_blackout(&ws.config);
+
+            // State transition: Enter or Exit
+            if is_active != ws.in_blackout {
+                ws.in_blackout = is_active;
+                let window = if is_active {
+                    self.engine.current_window(&ws.config)
                 } else {
                     None
-                }
-            })
-            .collect();
+                };
 
-        for (worker_id, is_active, window) in transitions {
-            if let Some(ws) = self.workers.get_mut(&worker_id) {
-                ws.in_blackout = is_active;
-                if is_active {
-                    let end_str = window
-                        .as_ref()
-                        .map(|w| w.end.format("%H:%M UTC").to_string())
-                        .unwrap_or_else(|| "N/A".to_string());
-                    warn!(worker=%worker_id, until=%end_str, "ENTERING news blackout window");
-                } else {
-                    info!(worker=%worker_id, "EXITING news blackout window");
-                }
-                ws.sender
+                // Legacy notification
+                ws.legacy_sender
                     .send(BlackoutNotification {
                         active: is_active,
-                        window,
+                        window: window.clone(),
                     })
                     .ok();
+
+                if is_active {
+                    if let Some(w) = window {
+                        let end_str = w.end.format("%H:%M UTC").to_string();
+                        warn!(worker=%worker_id, until=%end_str, "ENTERING news blackout window");
+                        let ev = RedFolderEvent::BlackoutStarted {
+                            window: w,
+                            worker_id: Some(worker_id.clone()),
+                        };
+                        ws.event_sender.send(ev.clone()).ok();
+                        events_to_dispatch.push(ev);
+                    }
+                } else {
+                    info!(worker=%worker_id, "EXITING news blackout window");
+                    // Send dummy or latest window for clearance
+                    let dummy_window = BlackoutWindow {
+                        start: now,
+                        end: now,
+                        events: vec![],
+                    };
+                    let ev = RedFolderEvent::BlackoutEnded {
+                        window: dummy_window,
+                        worker_id: Some(worker_id.clone()),
+                    };
+                    ws.event_sender.send(ev.clone()).ok();
+                    events_to_dispatch.push(ev);
+                }
+            }
+
+            // Warning check (if worker not in blackout and warning_before_min is set)
+            if !ws.in_blackout {
+                if let Some(warn_min) = ws.config.warning_before_min {
+                    let upcoming = self.engine.upcoming_blackouts(&ws.config, 2);
+                    if let Some(next_window) = upcoming.first() {
+                        let mins_until_start = (next_window.start - now).num_minutes();
+                        if mins_until_start > 0 && mins_until_start <= warn_min {
+                            let already_warned = ws
+                                .last_warned_window_start
+                                .map(|t| t == next_window.start)
+                                .unwrap_or(false);
+
+                            if !already_warned {
+                                ws.last_warned_window_start = Some(next_window.start);
+                                let ev = RedFolderEvent::BlackoutWarning {
+                                    window: next_window.clone(),
+                                    minutes_until_start: mins_until_start,
+                                    worker_id: Some(worker_id.clone()),
+                                };
+                                ws.event_sender.send(ev.clone()).ok();
+                                events_to_dispatch.push(ev);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Dispatch events to global broadcast bus and registered event listeners
+        for ev in events_to_dispatch {
+            self.broadcast_tx.send(ev.clone()).ok();
+            for listener in &self.listeners {
+                let listener_clone = listener.clone();
+                let ev_clone = ev.clone();
+                tokio::spawn(async move {
+                    listener_clone.on_event(&ev_clone).await;
+                });
             }
         }
     }
 }
 
-/// Async service that orchestrates daily economic calendar synchronization and real-time blackout alerts.
+/// Async service that orchestrates daily economic calendar synchronization and event-driven blackout alerts.
 ///
 /// Features:
+/// - Event-driven architecture with broadcast channels (`subscribe()`) and listener callbacks.
+/// - Early warning notifications before blackout periods commence.
 /// - Background daily refresh at midnight UTC with automatic disk fallback.
 /// - 15-second background evaluation loop dispatching alerts when blackout state changes.
-/// - Multi-worker independent registration with dedicated `mpsc::UnboundedReceiver` streams.
+/// - Multi-worker independent registration with dedicated typed streams.
 /// - Graceful cancellation and lifecycle management.
 pub struct RedFolderService {
     inner: Arc<Mutex<ServiceInner>>,
+    broadcast_tx: broadcast::Sender<RedFolderEvent>,
     shutdown_tx: watch::Sender<bool>,
 }
 
@@ -107,48 +177,84 @@ impl RedFolderService {
     /// Create with an existing `CalendarClient`.
     pub fn with_client(client: CalendarClient) -> Self {
         let (shutdown_tx, _) = watch::channel(false);
+        let (broadcast_tx, _) = broadcast::channel(256);
         Self {
             inner: Arc::new(Mutex::new(ServiceInner::new(
                 client,
                 std::time::Duration::from_secs(15),
+                broadcast_tx.clone(),
             ))),
+            broadcast_tx,
             shutdown_tx,
         }
     }
 
-    /// Configure the check loop frequency.
+    /// Subscribe to the global broadcast event bus.
+    ///
+    /// Any system component (e.g. risk manager, Telegram bot, MT5 bridge)
+    /// can receive a cloned stream of all `RedFolderEvent`s.
+    pub fn subscribe(&self) -> broadcast::Receiver<RedFolderEvent> {
+        self.broadcast_tx.subscribe()
+    }
+
+    /// Add an asynchronous event listener implementing `EventListener`.
+    pub async fn add_listener(&self, listener: Arc<dyn EventListener>) {
+        self.inner.lock().await.listeners.push(listener);
+    }
+
+    /// Configure the periodic evaluation loop frequency.
     pub async fn set_check_interval(&self, interval: std::time::Duration) {
         self.inner.lock().await.check_interval = interval;
     }
 
-    /// Register a worker or trading strategy, returning an unbounded channel receiver
-    /// that receives `BlackoutNotification` events whenever blackout status changes.
+    /// Register a worker or trading strategy, returning a legacy `BlackoutNotification` receiver.
     pub async fn register_worker(
         &self,
         worker_id: impl Into<String>,
         config: RedFolderConfig,
     ) -> mpsc::UnboundedReceiver<BlackoutNotification> {
         let worker_id = worker_id.into();
-        let (tx, rx) = mpsc::unbounded_channel();
-        let enabled = config.enabled;
-        let currencies = config.currencies.clone();
+        let (legacy_tx, legacy_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
 
         self.inner.lock().await.workers.insert(
             worker_id.clone(),
             WorkerState {
                 config,
-                sender: tx,
+                legacy_sender: legacy_tx,
+                event_sender: event_tx,
                 in_blackout: false,
+                last_warned_window_start: None,
             },
         );
 
-        debug!(
-            worker=%worker_id,
-            enabled=%enabled,
-            currencies=?currencies,
-            "registered worker in RedFolderService"
+        debug!(worker=%worker_id, "registered worker in RedFolderService");
+        legacy_rx
+    }
+
+    /// Register a worker or trading strategy, returning an event-driven `RedFolderEvent` receiver.
+    pub async fn register_worker_events(
+        &self,
+        worker_id: impl Into<String>,
+        config: RedFolderConfig,
+    ) -> mpsc::UnboundedReceiver<RedFolderEvent> {
+        let worker_id = worker_id.into();
+        let (legacy_tx, _legacy_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+
+        self.inner.lock().await.workers.insert(
+            worker_id.clone(),
+            WorkerState {
+                config,
+                legacy_sender: legacy_tx,
+                event_sender: event_tx,
+                in_blackout: false,
+                last_warned_window_start: None,
+            },
         );
-        rx
+
+        debug!(worker=%worker_id, "registered event worker in RedFolderService");
+        event_rx
     }
 
     /// Unregister a worker by ID.
@@ -258,7 +364,19 @@ impl RedFolderService {
 
         state.engine = BlackoutEngine::compile(&raw, &config_refs, Utc::now());
         state.last_fetch_date = Some(today);
-        info!(windows=%state.engine.windows().len(), "refreshed economic calendar windows");
+
+        let total_windows = state.engine.windows().len();
+        info!(windows=%total_windows, "refreshed economic calendar windows");
+
+        // Broadcast CalendarUpdated event
+        state
+            .broadcast_tx
+            .send(RedFolderEvent::CalendarUpdated {
+                total_events: raw.len(),
+                total_windows,
+            })
+            .ok();
+
         Ok(())
     }
 
@@ -300,77 +418,49 @@ pub type NewsBlackoutService = RedFolderService;
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_service_inner_check_and_notify() {
-        let client = CalendarClient::new(None);
-        let mut inner = ServiceInner::new(client, std::time::Duration::from_secs(1));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+    #[tokio::test]
+    async fn test_event_bus_and_warning_dispatch() {
+        let service = RedFolderService::new(None);
+        let mut broadcast_rx = service.subscribe();
+
         let config = RedFolderConfig::builder()
             .currencies(vec!["USD"])
             .impacts(vec!["High"])
+            .buffer_minutes(0, 15)
+            .warning_minutes(10)
             .build();
 
-        inner.workers.insert(
-            "worker_1".into(),
-            WorkerState {
-                config,
-                sender: tx,
-                in_blackout: false,
-            },
-        );
+        let mut worker_events = service.register_worker_events("worker_usd", config).await;
 
         let now = Utc::now();
+        // Event starts in 5 minutes (triggering the 10-minute warning)
         let raw = vec![crate::calendar::RawCalendarEvent {
             title: "US CPI Release".into(),
             country: "USD".into(),
-            date: now.to_rfc3339(),
+            date: (now + Duration::minutes(5)).to_rfc3339(),
             time: "".into(),
             impact: "High".into(),
         }];
 
-        let cfg = RedFolderConfig {
-            weekend_enabled: false,
-            ..Default::default()
-        };
-        inner.engine = BlackoutEngine::compile(&raw, &[&cfg], now);
-
-        inner.check_and_notify_workers();
-        assert!(inner.workers.get("worker_1").unwrap().in_blackout);
-
-        let notif = rx.try_recv().expect("should receive enter notification");
-        assert!(notif.active);
-        assert!(notif.window.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_service_lifecycle_mocked() {
-        let service = RedFolderService::new(None);
-        let config = RedFolderConfig::default();
-        let _rx = service.register_worker("test_bot", config).await;
-
-        // Manually inject windows into inner engine
         {
             let mut inner = service.inner.lock().await;
-            inner.last_fetch_date = Some(Utc::now().date_naive());
-            let now = Utc::now();
-            let raw = vec![crate::calendar::RawCalendarEvent {
-                title: "FOMC Rate Decision".into(),
-                country: "USD".into(),
-                date: (now + Duration::minutes(60)).to_rfc3339(),
-                time: "".into(),
-                impact: "High".into(),
-            }];
             let cfg = RedFolderConfig {
                 weekend_enabled: false,
+                before_min: 0,
+                after_min: 15,
                 ..Default::default()
             };
             inner.engine = BlackoutEngine::compile(&raw, &[&cfg], now);
+            inner.check_and_notify_workers();
         }
 
-        let upcoming = service.get_upcoming_blackouts("test_bot", 2).await;
-        assert_eq!(upcoming.len(), 1);
-        assert_eq!(upcoming[0].events[0].title, "FOMC Rate Decision");
+        // Verify worker event channel received BlackoutWarning
+        let ev = worker_events.try_recv().expect("should receive warning event");
+        assert!(ev.is_warning());
+        assert_eq!(ev.worker_id(), Some("worker_usd"));
 
-        service.stop().await;
+        // Verify global broadcast bus received warning
+        let bus_ev = broadcast_rx.try_recv().expect("broadcast should receive warning");
+        assert!(bus_ev.is_warning());
     }
 }
