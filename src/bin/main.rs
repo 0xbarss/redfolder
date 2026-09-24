@@ -44,7 +44,7 @@ enum Commands {
     /// List upcoming economic blackout windows within a given time horizon
     Upcoming {
         /// Hours to look ahead
-        #[arg(short, long, default_value_t = 24)]
+        #[arg(short = 'H', long, default_value_t = 24)]
         hours: u32,
 
         /// Filter by currency (e.g. USD, EUR, GBP, or All)
