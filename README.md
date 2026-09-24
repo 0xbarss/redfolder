@@ -502,7 +502,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 Created and maintained by [**0xbarss**](https://github.com/0xbarss).
 
-Contributions, bug reports, and suggestions are welcome. Please ensure that all pull requests pass `cargo test`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo fmt --all -- --check`. Feel free to open an issue or pull request at [**github.com/0xbarss/redfolder**](https://github.com/0xbarss/redfolder).
+Contributions, bug reports, and suggestions are welcome! Please check out [**CONTRIBUTING.md**](CONTRIBUTING.md) for architecture guidelines, code standards, and local testing instructions before opening a pull request at [**github.com/0xbarss/redfolder**](https://github.com/0xbarss/redfolder).
 
 ---
 
