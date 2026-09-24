@@ -2,7 +2,7 @@
 name = "redfolder"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.88"
 authors = ["0xbarss"]
 description = "Async economic calendar client and automated trading blackout engine for algorithmic traders and prop firms"
 license = "MIT"
