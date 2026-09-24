@@ -411,7 +411,20 @@ fn test_config_validation_negative_buffers_and_bad_formats() {
 
 #[tokio::test]
 async fn test_service_lifecycle_guards_and_restart() {
-    let service = RedFolderService::new(None);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+
+    let good_events = vec![redfolder::calendar::RawCalendarEvent {
+        title: "US Core CPI".into(),
+        country: "USD".into(),
+        date: "2026-06-15T12:30:00Z".into(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+    let client = redfolder::calendar::CalendarClient::new(Some(cache_dir));
+    client.save_cache(&good_events).unwrap();
+
+    let service = RedFolderService::with_client(client);
 
     let config = RedFolderConfig::builder()
         .currencies(vec!["USD"])
