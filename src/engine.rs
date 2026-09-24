@@ -58,20 +58,24 @@ impl BlackoutEngine {
 
         let mut individual: Vec<(DateTime<Utc>, DateTime<Utc>, WindowEvent)> = Vec::new();
 
+        let lower_cutoff = now - Duration::minutes(after_min);
+
         // 1. Process external economic calendar releases
         for raw in raw_events {
             let Some(event_dt) = parse_event_datetime(raw) else {
                 continue;
             };
 
-            // Only consider events from now up to 48 hours into the future
-            if event_dt < now || event_dt > cutoff {
+            // Only consider events whose blackout window is still active or starts within 48 hours
+            if event_dt < lower_cutoff || event_dt > cutoff {
                 continue;
             }
 
-            let matches_currency = all_currencies
-                .iter()
-                .any(|c| c.eq_ignore_ascii_case(&raw.country) || c.eq_ignore_ascii_case("All"));
+            let matches_currency = raw.country.eq_ignore_ascii_case("All")
+                || raw.country.eq_ignore_ascii_case("Global")
+                || all_currencies
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(&raw.country) || c.eq_ignore_ascii_case("All"));
             let matches_impact = all_impacts
                 .iter()
                 .any(|i| i.eq_ignore_ascii_case(&raw.impact));
@@ -263,10 +267,12 @@ pub fn event_matches_config(event: &WindowEvent, config: &RedFolderConfig) -> bo
     if event.is_custom {
         config.weekend_enabled
     } else {
-        let currency_match = config
-            .currencies
-            .iter()
-            .any(|c| c.eq_ignore_ascii_case(&event.country) || c.eq_ignore_ascii_case("All"));
+        let currency_match = event.country.eq_ignore_ascii_case("All")
+            || event.country.eq_ignore_ascii_case("Global")
+            || config
+                .currencies
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(&event.country) || c.eq_ignore_ascii_case("All"));
         let impact_match = config
             .impacts
             .iter()
