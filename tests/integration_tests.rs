@@ -421,7 +421,12 @@ async fn test_service_lifecycle_guards_and_restart() {
         time: "".into(),
         impact: "High".into(),
     }];
-    let client = redfolder::calendar::CalendarClient::new(Some(cache_dir));
+    let client = redfolder::calendar::CalendarClient::with_options(
+        reqwest::Client::new(),
+        "http://127.0.0.1:9/unreachable",
+        Some(cache_dir),
+        std::time::Duration::from_millis(50),
+    );
     client.save_cache(&good_events).unwrap();
 
     let service = RedFolderService::with_client(client);
@@ -639,7 +644,12 @@ async fn test_stop_waits_for_background_tasks_and_rapid_restart() {
         time: "".into(),
         impact: "High".into(),
     }];
-    let client = redfolder::calendar::CalendarClient::new(Some(cache_dir));
+    let client = redfolder::calendar::CalendarClient::with_options(
+        reqwest::Client::new(),
+        "http://127.0.0.1:9/unreachable",
+        Some(cache_dir),
+        std::time::Duration::from_millis(50),
+    );
     client.save_cache(&good_events).unwrap();
 
     let service = RedFolderService::with_client(client);
@@ -993,7 +1003,12 @@ async fn test_calendar_updated_reaches_both_broadcast_and_event_listener() {
         time: "".into(),
         impact: "High".into(),
     }];
-    let client = redfolder::calendar::CalendarClient::new(Some(cache_dir));
+    let client = redfolder::calendar::CalendarClient::with_options(
+        reqwest::Client::new(),
+        "http://127.0.0.1:9/unreachable",
+        Some(cache_dir),
+        std::time::Duration::from_millis(50),
+    );
     client.save_cache(&good_events).unwrap();
 
     let service = RedFolderService::with_client(client);
@@ -1138,7 +1153,12 @@ async fn test_concurrent_refreshes_are_serialized() {
         time: "".into(),
         impact: "High".into(),
     }];
-    let client = redfolder::calendar::CalendarClient::new(Some(cache_dir));
+    let client = redfolder::calendar::CalendarClient::with_options(
+        reqwest::Client::new(),
+        "http://127.0.0.1:9/unreachable",
+        Some(cache_dir),
+        std::time::Duration::from_millis(50),
+    );
     client.save_cache(&good_events).unwrap();
 
     let service = Arc::new(RedFolderService::with_client(client));
@@ -1308,7 +1328,12 @@ async fn test_refresh_reconciles_worker_state_immediately() {
     let temp_dir = tempfile::tempdir().unwrap();
     let cache_dir = temp_dir.path().to_path_buf();
 
-    let client = redfolder::calendar::CalendarClient::new(Some(cache_dir.clone()));
+    let client = redfolder::calendar::CalendarClient::with_options(
+        reqwest::Client::new(),
+        "http://127.0.0.1:9/unreachable",
+        Some(cache_dir.clone()),
+        std::time::Duration::from_millis(100),
+    );
     let service = RedFolderService::with_client(client);
 
     let cfg = RedFolderConfig::builder()
@@ -1436,4 +1461,114 @@ async fn test_stop_during_delayed_http_request() {
     assert_eq!(service.state().await, ServiceState::Stopped);
 
     let _ = refresh_task.await;
+}
+
+#[tokio::test]
+async fn test_http_retry_on_429_with_recovery() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock_url = format!("http://{}", addr);
+
+    let attempt_counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = attempt_counter.clone();
+
+    let _server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let counter = counter_clone.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let current_attempt = counter.fetch_add(1, Ordering::SeqCst);
+
+                if current_attempt == 0 {
+                    // Attempt 0: return 429 Too Many Requests with Retry-After: 0
+                    let resp = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                } else {
+                    // Attempt 1: return 200 OK with valid events
+                    let body = r#"[{"title":"Recovered CPI","country":"USD","date":"2026-06-15T12:30:00Z","time":"","impact":"High"}]"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                }
+            });
+        }
+    });
+
+    let client = redfolder::calendar::CalendarClient::with_options(
+        reqwest::Client::new(),
+        mock_url,
+        None,
+        std::time::Duration::from_secs(3),
+    );
+
+    let events = client
+        .fetch_remote()
+        .await
+        .expect("429 should retry and recover");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].title, "Recovered CPI");
+    assert_eq!(
+        attempt_counter.load(Ordering::SeqCst),
+        2,
+        "must have retried after initial 429"
+    );
+}
+
+#[tokio::test]
+async fn test_http_retry_on_429_exhausted_falls_back_to_cache() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+
+    // Seed cache with known good event
+    let good_events = vec![redfolder::calendar::RawCalendarEvent {
+        title: "Cached Reserve FOMC".into(),
+        country: "USD".into(),
+        date: "2026-06-15T14:00:00Z".into(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+    let client_setup = redfolder::calendar::CalendarClient::new(Some(cache_dir.clone()));
+    client_setup.save_cache(&good_events).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock_url = format!("http://{}", addr);
+
+    // Mock server always returns 429 Too Many Requests
+    let _server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let resp = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = socket.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let client = redfolder::calendar::CalendarClient::with_options(
+        reqwest::Client::new(),
+        mock_url,
+        Some(cache_dir),
+        std::time::Duration::from_secs(2),
+    );
+
+    // After repeated 429, fetch_or_cached must fall back to disk cache
+    let events = client
+        .fetch_or_cached()
+        .await
+        .expect("repeated 429 should fall back to disk cache");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].title, "Cached Reserve FOMC");
 }

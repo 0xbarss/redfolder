@@ -233,6 +233,9 @@ pub struct RedFolderService {
     notify: Arc<Notify>,
 }
 
+/// Minimum allowable check interval for periodic evaluation to prevent CPU busy loops.
+pub const MIN_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 impl RedFolderService {
     /// Create a new `RedFolderService` with an optional cache directory.
     pub fn new(cache_dir: Option<PathBuf>) -> Self {
@@ -277,9 +280,19 @@ impl RedFolderService {
     }
 
     /// Configure the periodic evaluation loop frequency or watchdog interval.
-    pub async fn set_check_interval(&self, interval: std::time::Duration) {
+    ///
+    /// Returns an error if the requested interval is zero or less than [`MIN_CHECK_INTERVAL`] (100ms)
+    /// to prevent busy evaluation loops and excessive CPU consumption.
+    pub async fn set_check_interval(&self, interval: std::time::Duration) -> Result<()> {
+        if interval < MIN_CHECK_INTERVAL {
+            return Err(crate::error::RedFolderError::Config(format!(
+                "check interval must be at least {:?} (got {:?})",
+                MIN_CHECK_INTERVAL, interval
+            )));
+        }
         self.inner.lock().await.check_interval = interval;
         self.notify.notify_waiters();
+        Ok(())
     }
 
     /// Manually trigger blackout evaluation and worker notifications immediately.
@@ -701,5 +714,30 @@ mod tests {
             .try_recv()
             .expect("broadcast should receive warning");
         assert!(bus_ev.is_warning());
+    }
+
+    #[tokio::test]
+    async fn test_set_check_interval_validation() {
+        let service = RedFolderService::new(None);
+
+        // Zero duration must be rejected
+        let res_zero = service.set_check_interval(std::time::Duration::ZERO).await;
+        assert!(res_zero.is_err(), "zero interval must be rejected");
+        assert!(res_zero
+            .unwrap_err()
+            .to_string()
+            .contains("must be at least"));
+
+        // Sub-100ms interval must be rejected
+        let res_small = service
+            .set_check_interval(std::time::Duration::from_millis(50))
+            .await;
+        assert!(res_small.is_err(), "sub-100ms interval must be rejected");
+
+        // Sensible duration must be accepted
+        let res_valid = service
+            .set_check_interval(std::time::Duration::from_secs(5))
+            .await;
+        assert!(res_valid.is_ok(), "valid interval must be accepted");
     }
 }

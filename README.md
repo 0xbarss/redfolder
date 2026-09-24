@@ -434,6 +434,7 @@ redfolder sync
 | `windows_for_worker` | `async fn(&self, &str) -> Vec<BlackoutWindow>` | Returns active and upcoming blackout windows derived specifically for the worker's buffers. |
 | `start` | `async fn(&self) -> Result<()>` | Starts background daily refresh and transition-driven evaluation tasks. Reversible on error. |
 | `stop` | `async fn(&self)` | Gracefully terminates all background tasks and awaits their exit. |
+| `set_check_interval` | `async fn(&self, Duration) -> Result<()>` | Configures evaluation frequency; validates interval is at least 100ms to prevent busy loops. |
 | `refresh` | `async fn(&self) -> Result<()>` | Synchronizes calendar and recompiles blackout windows (allowing cached fallback). |
 | `force_refresh` | `async fn(&self) -> Result<()>` | Forces immediate network download from remote API and window recompilation, bypassing cache. |
 | `is_blackout` | `async fn(&self, &str) -> bool` | Checks if a specific registered worker is currently in blackout. |
@@ -462,7 +463,7 @@ redfolder sync
 | `with_user_agent` | `fn(Option<PathBuf>, &str) -> Result<Self>` | Creates client with custom User-Agent and optional cache directory. |
 | `with_timezone` | `fn(self, chrono_tz::Tz) -> Self` | Configures default source timezone for resolving naive calendar timestamps. |
 | `with_max_stale_age` | `fn(self, Option<Duration>) -> Self` | Sets maximum allowable cache age for fallback on network failure. |
-| `fetch_remote` | `async fn(&self) -> Result<Vec<RawCalendarEvent>>` | Performs HTTP GET against FairEconomy weekly feed with retry backoff. |
+| `fetch_remote` | `async fn(&self) -> Result<Vec<RawCalendarEvent>>` | Performs HTTP GET against FairEconomy feed with 429/408/5xx retry and `Retry-After` support. |
 | `force_fetch` | `async fn(&self) -> Result<Vec<RawCalendarEvent>>` | Fetches fresh schedule directly from remote API, bypassing cache while saving to disk. |
 | `fetch_or_cached` | `async fn(&self) -> Result<Vec<RawCalendarEvent>>` | Fetches remote schedule, verifying cache metadata and bounded staleness on failure. |
 | `save_cache` | `fn(&self, &[RawCalendarEvent]) -> Result<()>` | Atomically writes JSON-serialized events with schema metadata (`version`, `event_count`). |
@@ -481,7 +482,7 @@ redfolder sync
 
 ## Testing & Quality Assurance
 
-`redfolder` includes an automated test battery with **60 unit and integration tests** covering interval calculations, state machines, and resilience guarantees.
+`redfolder` includes an automated test battery with **69 unit and integration tests** covering interval calculations, state machines, and resilience guarantees.
 
 Run the test suite:
 
@@ -500,11 +501,12 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 | Scenario / Injected Condition | Expected Invariant / System Behavior | Status |
 | :--- | :--- | :---: |
-| **HTTP 429 Rate Limit from API** | Intercepts error; falls back to local disk cache without throwing an error. | Verified |
+| **HTTP 429 Rate Limit from API** | Retries transient 429 honoring `Retry-After`; falls back to local cache if exhausted. | Verified |
 | **Network Partition / Host Offline** | Transparently serves existing cached calendar until network recovers. | Verified |
 | **Startup Failure (Network & Cache Fail)** | `start()` errors cleanly and resets state to `Stopped`; retries succeed without lockout. | Verified |
 | **Rapid Restart / Task Overlap** | `stop()` cleanly joins previous tasks; restarting creates zero duplicate loops. | Verified |
 | **Transition-Driven Timing** | Emits alerts at exact scheduled second rather than waiting for 15s polling cycle. | Verified |
+| **Evaluation Loop Lower Bound** | `set_check_interval` rejects zero or sub-100ms durations to prevent busy loops. | Verified |
 | **CalendarUpdated Event Dispatch** | Dispatches calendar sync updates to both broadcast bus and `EventListener` callbacks. | Verified |
 | **Atomic Cache Write Resilience** | Writes via temp file and atomic rename; crashes leave no truncated cache or `.tmp` files. | Verified |
 | **Concurrent Refresh Serialization** | Serializes concurrent `refresh()` / `force_refresh()` calls; eliminates race conditions. | Verified |
@@ -512,10 +514,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 | **Bounded Stale Cache Fallback** | Rejects cache older than `max_stale_cache_age` on network failure; accepts within limit. | Verified |
 | **Legacy Cache Staleness Protection** | Rejects unversioned/unknown-age legacy cache files during stale fallback. | Verified |
 | **Impact & Currency Alias Normalization** | Matches `"Red"` vs `"High"`, `"med"` vs `"Medium"`, and currencies case-insensitively. | Verified |
-| **Empty Currency / Impact Filter** | Builder rejects empty filters (`currencies: []`, `impacts: []`) with descriptive errors. | Verified |
+| **Semantic Config & Blank Item Checks** | Rejects blank or empty strings in currency/impact lists; offers `validate_strict()`. | Verified |
 | **All-Day & Tentative Events** | Default config ignores all-day/tentative events to avoid fake midnight spikes; 24h opt-in. | Verified |
+| **Missing Release Times** | Date-only events without time parsed as `TentativeDate`, preventing fake midnight spikes. | Verified |
 | **Timezone-Aware All-Day Boundaries** | Interprets all-day events in configured calendar timezone (e.g. `America/New_York`). | Verified |
-| **Naive Timestamps & DST Transition** | Converts naive times via configured timezone (`America/New_York`) with EDT/EST DST accuracy. | Verified |
+| **Naive Timestamps & DST Transition** | Converts naive times with EDT/EST DST accuracy; gaps advance 1h to valid daylight instant. | Verified |
 | **Half-Open Interval Semantics** | Window is active at exact start and inactive at exact end `[start, end)`. | Verified |
 | **Worker Registered in Active Blackout** | Newly registered worker immediately receives active blackout notification. | Verified |
 | **Overlapping Events within Threshold** | Merges closely spaced releases into single uninterrupted `BlackoutWindow`. | Verified |

@@ -97,12 +97,21 @@ impl Default for CalendarClient {
 }
 
 /// Builds a fallback `reqwest::Client` ensuring the configured User-Agent is preserved.
+///
+/// In the unlikely event that the builder fails (e.g. system TLS subsystem initialization failure),
+/// logs a warning and falls back to `Client::default()`.
 fn fallback_client() -> Client {
     Client::builder()
         .user_agent(DEFAULT_USER_AGENT)
         .timeout(Duration::from_secs(30))
         .build()
-        .unwrap_or_default()
+        .unwrap_or_else(|err| {
+            warn!(
+                err = %err,
+                "failed to build reqwest::Client with custom User-Agent; falling back to Client::default()"
+            );
+            Client::default()
+        })
 }
 
 impl CalendarClient {
@@ -271,12 +280,6 @@ impl CalendarClient {
         let mut last_error = None;
 
         for attempt in 0..=max_retries {
-            if attempt > 0 {
-                let delay = Duration::from_millis(500 * (1 << (attempt - 1)));
-                tokio::time::sleep(delay).await;
-                debug!(attempt, "retrying calendar fetch");
-            }
-
             match self
                 .client
                 .get(&self.calendar_url)
@@ -284,64 +287,110 @@ impl CalendarClient {
                 .send()
                 .await
             {
-                Ok(resp) => match resp.error_for_status() {
-                    Ok(resp) => match resp.json::<Vec<serde_json::Value>>().await {
-                        Ok(raw_items) => {
-                            let total_count = raw_items.len();
-                            let mut events = Vec::with_capacity(total_count);
-                            let mut malformed_count = 0;
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        match resp.json::<Vec<serde_json::Value>>().await {
+                            Ok(raw_items) => {
+                                let total_count = raw_items.len();
+                                let mut events = Vec::with_capacity(total_count);
+                                let mut malformed_count = 0;
 
-                            for item in raw_items {
-                                match serde_json::from_value::<RawCalendarEvent>(item) {
-                                    Ok(ev) => {
-                                        if ev.date.trim().is_empty() {
+                                for item in raw_items {
+                                    match serde_json::from_value::<RawCalendarEvent>(item) {
+                                        Ok(ev) => {
+                                            if ev.date.trim().is_empty() {
+                                                malformed_count += 1;
+                                            } else {
+                                                events.push(ev);
+                                            }
+                                        }
+                                        Err(_) => {
                                             malformed_count += 1;
-                                        } else {
-                                            events.push(ev);
                                         }
                                     }
-                                    Err(_) => {
-                                        malformed_count += 1;
+                                }
+
+                                if total_count > 0 && malformed_count == total_count {
+                                    return Err(crate::error::RedFolderError::Calendar(
+                                        "all upstream calendar events were malformed".to_string(),
+                                    ));
+                                }
+
+                                if malformed_count > 0 {
+                                    warn!(
+                                        malformed = %malformed_count,
+                                        total = %total_count,
+                                        "some upstream events failed validation"
+                                    );
+                                    if malformed_count * 5 > total_count {
+                                        return Err(crate::error::RedFolderError::Calendar(format!(
+                                            "upstream response corrupted: {malformed_count}/{total_count} events malformed"
+                                        )));
                                     }
                                 }
-                            }
 
-                            if total_count > 0 && malformed_count == total_count {
-                                return Err(crate::error::RedFolderError::Calendar(
-                                    "all upstream calendar events were malformed".to_string(),
-                                ));
+                                info!(count = %events.len(), "downloaded calendar events successfully");
+                                return Ok(events);
                             }
-
-                            if malformed_count > 0 {
-                                warn!(
-                                    malformed = %malformed_count,
-                                    total = %total_count,
-                                    "some upstream events failed validation"
-                                );
-                                if malformed_count * 5 > total_count {
-                                    return Err(crate::error::RedFolderError::Calendar(format!(
-                                        "upstream response corrupted: {malformed_count}/{total_count} events malformed"
-                                    )));
+                            Err(e) => {
+                                warn!(err = %e, attempt, "failed to parse calendar response JSON");
+                                last_error = Some(crate::error::RedFolderError::Http(e));
+                                if attempt < max_retries {
+                                    let delay = Duration::from_millis(500 * (1 << attempt));
+                                    tokio::time::sleep(delay).await;
+                                    continue;
                                 }
                             }
-
-                            info!(count = %events.len(), "downloaded calendar events successfully");
-                            return Ok(events);
                         }
-                        Err(e) => {
+                    } else {
+                        // Rate limit (429), timeout (408), or server errors (5xx) are retryable
+                        let is_rate_limited = status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+                        let is_timeout = status == reqwest::StatusCode::REQUEST_TIMEOUT;
+                        let is_server_err = status.is_server_error();
+                        let is_retryable = is_rate_limited || is_timeout || is_server_err;
+
+                        let retry_after_duration = if is_rate_limited {
+                            resp.headers()
+                                .get(reqwest::header::RETRY_AFTER)
+                                .and_then(|val| val.to_str().ok())
+                                .and_then(|s| s.trim().parse::<u64>().ok())
+                                .map(|secs| Duration::from_secs(secs.min(10)))
+                        } else {
+                            None
+                        };
+
+                        warn!(
+                            status = %status,
+                            retryable = is_retryable,
+                            retry_after = ?retry_after_duration,
+                            attempt,
+                            "calendar HTTP fetch returned non-success status"
+                        );
+
+                        if let Err(e) = resp.error_for_status() {
                             last_error = Some(crate::error::RedFolderError::Http(e));
                         }
-                    },
-                    Err(e) => {
-                        let is_server_err = e.status().is_some_and(|s| s.is_server_error());
-                        last_error = Some(crate::error::RedFolderError::Http(e));
-                        if !is_server_err {
+
+                        if !is_retryable || attempt == max_retries {
                             break;
                         }
+
+                        let delay = retry_after_duration
+                            .unwrap_or_else(|| Duration::from_millis(500 * (1 << attempt)));
+                        debug!(delay = ?delay, "sleeping before retrying rate-limited or transient failure");
+                        tokio::time::sleep(delay).await;
+                        continue;
                     }
-                },
+                }
                 Err(e) => {
+                    warn!(err = %e, attempt, "calendar HTTP transport request failed");
                     last_error = Some(crate::error::RedFolderError::Http(e));
+                    if attempt < max_retries {
+                        let delay = Duration::from_millis(500 * (1 << attempt));
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
                 }
             }
         }
@@ -624,13 +673,30 @@ pub fn parse_event_timing(
         return Some(EventTiming::Exact(dt.with_timezone(&Utc)));
     }
 
-    // 5. Combine naive date + time (e.g. "06-10-2026 8:30am" or "2026-06-10 14:30")
-    let time_str = if raw.time.trim().is_empty() {
-        "12:00am"
+    // 5. If time string is empty:
+    // Check if the event is a date-only entry. If date_trimmed matches a date format and has no time,
+    // classify it as a tentative date-only event to prevent fabricating a false midnight exact blackout.
+    if raw.time.trim().is_empty() {
+        let date_formats = ["%Y-%m-%d", "%m-%d-%Y", "%m/%d/%Y", "%Y/%m/%d"];
+        for fmt in date_formats {
+            if let Ok(naive_date) = chrono::NaiveDate::parse_from_str(date_trimmed, fmt) {
+                warn!(
+                    title = %raw.title,
+                    country = %raw.country,
+                    date = %date_trimmed,
+                    "event has date but missing release time; classifying as tentative date-only event"
+                );
+                return Some(EventTiming::TentativeDate(naive_date));
+            }
+        }
+    }
+
+    // 6. Combine naive date + time (or parse naive datetime if time was embedded in date string)
+    let dt_str = if raw.time.trim().is_empty() {
+        date_trimmed.to_string()
     } else {
-        raw.time.trim()
+        format!("{date_trimmed} {}", raw.time.trim())
     };
-    let dt_str = format!("{date_trimmed} {time_str}");
 
     let formats = [
         "%m-%d-%Y %I:%M%p",
@@ -650,7 +716,29 @@ pub fn parse_event_timing(
                     chrono::LocalResult::Single(dt) => dt.with_timezone(&Utc),
                     chrono::LocalResult::Ambiguous(earliest, _) => earliest.with_timezone(&Utc),
                     chrono::LocalResult::None => {
-                        DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc)
+                        // Nonexistent local time due to DST spring-forward gap.
+                        // Shift forward by 1 hour to advance past the gap into the first valid daylight instant.
+                        let shifted = naive + chrono::Duration::hours(1);
+                        match tz.from_local_datetime(&shifted) {
+                            chrono::LocalResult::Single(dt)
+                            | chrono::LocalResult::Ambiguous(dt, _) => {
+                                warn!(
+                                    local_time = %naive,
+                                    timezone = %tz.name(),
+                                    shifted_time = %shifted,
+                                    "local time falls in DST spring-forward gap; shifted forward 1h to valid instant"
+                                );
+                                dt.with_timezone(&Utc)
+                            }
+                            chrono::LocalResult::None => {
+                                warn!(
+                                    local_time = %naive,
+                                    timezone = %tz.name(),
+                                    "local time in DST gap could not be resolved; rejecting invalid timestamp"
+                                );
+                                return None;
+                            }
+                        }
                     }
                 }
             } else {
@@ -676,14 +764,25 @@ pub fn date_to_utc_start(
             chrono::LocalResult::Ambiguous(earliest, _) => Some(earliest.with_timezone(&Utc)),
             chrono::LocalResult::None => {
                 // If 00:00 does not exist due to DST spring-forward transition, advance to 01:00:00
-                date.and_hms_opt(1, 0, 0)
-                    .and_then(|alt| match tz.from_local_datetime(&alt) {
-                        chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => {
-                            Some(dt.with_timezone(&Utc))
-                        }
-                        chrono::LocalResult::None => None,
-                    })
-                    .or_else(|| Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc)))
+                let shifted = naive + chrono::Duration::hours(1);
+                match tz.from_local_datetime(&shifted) {
+                    chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => {
+                        warn!(
+                            local_date = %date,
+                            timezone = %tz.name(),
+                            "midnight falls in DST spring-forward gap; using 01:00:00 local time"
+                        );
+                        Some(dt.with_timezone(&Utc))
+                    }
+                    chrono::LocalResult::None => {
+                        warn!(
+                            local_date = %date,
+                            timezone = %tz.name(),
+                            "midnight in DST gap could not be resolved; rejecting invalid date"
+                        );
+                        None
+                    }
+                }
             }
         }
     } else {
@@ -866,5 +965,98 @@ mod tests {
     fn test_calendar_client_custom_user_agent() {
         let client = CalendarClient::with_user_agent(None, "custom-agent/1.0.0");
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_dst_spring_forward_gap_shift() {
+        // America/New_York on 2026-03-08 jumps from 02:00:00 EST to 03:00:00 EDT.
+        // 02:30:00 local time does not exist.
+        let tz = chrono_tz::America::New_York;
+        let event = RawCalendarEvent {
+            title: "Sunday Special Announcement".into(),
+            country: "USD".into(),
+            date: "03-08-2026".into(),
+            time: "2:30am".into(),
+            impact: "High".into(),
+        };
+
+        let timing =
+            parse_event_timing(&event, Some(tz)).expect("should resolve DST gap by shifting");
+        let dt = timing.exact_time().expect("should be exact time");
+        // Shifted +1h to 03:30 EDT (-04:00) => 07:30 UTC.
+        // Silently falling back to UTC would have produced 02:30 UTC!
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M UTC").to_string(),
+            "2026-03-08 07:30 UTC"
+        );
+    }
+
+    #[test]
+    fn test_dst_fall_back_ambiguous() {
+        // America/New_York on 2026-11-01 falls back from 02:00:00 EDT to 01:00:00 EST.
+        // 01:30:00 local time occurs twice: first at 05:30 UTC (EDT), then at 06:30 UTC (EST).
+        let tz = chrono_tz::America::New_York;
+        let event = RawCalendarEvent {
+            title: "Fall-Back Release".into(),
+            country: "USD".into(),
+            date: "11-01-2026".into(),
+            time: "1:30am".into(),
+            impact: "High".into(),
+        };
+
+        let timing = parse_event_timing(&event, Some(tz)).expect("should resolve ambiguous time");
+        let dt = timing.exact_time().expect("should be exact time");
+        // Safe conservative policy chooses earliest instant: 05:30 UTC
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M UTC").to_string(),
+            "2026-11-01 05:30 UTC"
+        );
+    }
+
+    #[test]
+    fn test_date_only_event_without_time_is_tentative() {
+        let event = RawCalendarEvent {
+            title: "G7 Summit".into(),
+            country: "ALL".into(),
+            date: "2026-08-15".into(),
+            time: "".into(),
+            impact: "High".into(),
+        };
+
+        let timing = parse_event_timing(&event, None).expect("should parse date-only event");
+        assert!(
+            timing.is_tentative(),
+            "date-only event without time must be tentative, not exact midnight"
+        );
+        assert!(
+            !timing.is_exact(),
+            "date-only event must not fabricate an exact midnight timestamp"
+        );
+        assert_eq!(
+            timing,
+            EventTiming::TentativeDate(chrono::NaiveDate::from_ymd_opt(2026, 8, 15).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_date_with_embedded_time_and_empty_time_field() {
+        let event = RawCalendarEvent {
+            title: "Embedded Datetime".into(),
+            country: "USD".into(),
+            date: "2026-08-15 14:30".into(),
+            time: "".into(),
+            impact: "High".into(),
+        };
+
+        let timing = parse_event_timing(&event, None).expect("should parse embedded datetime");
+        assert!(
+            timing.is_exact(),
+            "date containing explicit time must be parsed as exact"
+        );
+        let dt = timing.exact_time().unwrap();
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M UTC").to_string(),
+            "2026-08-15 14:30 UTC"
+        );
     }
 }

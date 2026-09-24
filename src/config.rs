@@ -168,7 +168,12 @@ impl RedFolderConfig {
         }
     }
 
-    /// Validates the configuration parameters, ensuring non-negative buffers and valid curfew formats.
+    /// Validates the configuration parameters, ensuring non-negative buffers, non-empty filters,
+    /// non-blank currency/impact entries, and valid curfew formats.
+    ///
+    /// Custom non-standard currency symbols (e.g. `"XAU"`, `"BTC"`, `"TRY"`) and custom impact
+    /// levels are supported by default via [`Currency::Custom`] and [`Impact::Custom`].
+    /// To enforce strict standard-only currencies and impacts, use [`Self::validate_strict`].
     pub fn validate(&self) -> crate::error::Result<()> {
         if self.currencies.is_empty() {
             return Err(crate::error::RedFolderError::Config(
@@ -176,11 +181,25 @@ impl RedFolderConfig {
                     .to_string(),
             ));
         }
+        for c in &self.currencies {
+            if c.trim().is_empty() {
+                return Err(crate::error::RedFolderError::Config(
+                    "currency filter cannot contain empty or blank strings".to_string(),
+                ));
+            }
+        }
         if self.impacts.is_empty() {
             return Err(crate::error::RedFolderError::Config(
                 "impacts filter cannot be empty; specify at least one impact level (e.g. 'High')"
                     .to_string(),
             ));
+        }
+        for i in &self.impacts {
+            if i.trim().is_empty() {
+                return Err(crate::error::RedFolderError::Config(
+                    "impact filter cannot contain empty or blank strings".to_string(),
+                ));
+            }
         }
         if self.before_min < 0 {
             return Err(crate::error::RedFolderError::Config(format!(
@@ -215,6 +234,35 @@ impl RedFolderConfig {
                 crate::curfew::parse_time(&self.weekend_end)?;
             }
         }
+        Ok(())
+    }
+
+    /// Performs strict validation, verifying all standard configuration rules and ensuring
+    /// that only standard known currency codes (USD, EUR, GBP, JPY, AUD, CAD, CHF, NZD, CNY, ALL)
+    /// and standard impact levels (High, Medium, Low, Non-Economic) are accepted.
+    pub fn validate_strict(&self) -> crate::error::Result<()> {
+        self.validate()?;
+
+        for c in &self.currencies {
+            let parsed: Currency = c.parse().unwrap();
+            if let Currency::Custom(ref s) = parsed {
+                return Err(crate::error::RedFolderError::Config(format!(
+                    "unknown non-standard currency '{}' rejected in strict mode",
+                    s
+                )));
+            }
+        }
+
+        for i in &self.impacts {
+            let parsed: Impact = i.parse().unwrap();
+            if let Impact::Custom(ref s) = parsed {
+                return Err(crate::error::RedFolderError::Config(format!(
+                    "unknown non-standard impact '{}' rejected in strict mode",
+                    s
+                )));
+            }
+        }
+
         Ok(())
     }
 }
@@ -414,5 +462,59 @@ mod tests {
         assert_eq!(cfg.currencies, vec!["USD", "EUR"]);
         assert_eq!(cfg.impacts, vec!["High"]);
         assert_eq!(cfg.weekend_mode, "weekend");
+    }
+
+    #[test]
+    fn test_semantic_validation_rejects_blank_items() {
+        // Blank currency string in list must be rejected
+        let bad_cur = RedFolderConfig::builder()
+            .currencies(vec!["USD", "   "])
+            .try_build();
+        assert!(bad_cur.is_err());
+        assert!(bad_cur
+            .unwrap_err()
+            .to_string()
+            .contains("currency filter cannot contain empty or blank strings"));
+
+        // Blank impact string in list must be rejected
+        let bad_imp = RedFolderConfig::builder()
+            .impacts(vec!["High", ""])
+            .try_build();
+        assert!(bad_imp.is_err());
+        assert!(bad_imp
+            .unwrap_err()
+            .to_string()
+            .contains("impact filter cannot contain empty or blank strings"));
+    }
+
+    #[test]
+    fn test_validate_strict() {
+        // Custom currency is valid in standard mode
+        let custom_cfg = RedFolderConfig::builder()
+            .currencies(vec!["USD", "XAU"])
+            .impacts(vec!["High"])
+            .build();
+        assert!(
+            custom_cfg.validate().is_ok(),
+            "custom currency should be allowed in default mode"
+        );
+
+        // Custom currency is rejected in strict mode
+        let strict_err = custom_cfg.validate_strict();
+        assert!(
+            strict_err.is_err(),
+            "custom currency should be rejected in strict mode"
+        );
+        assert!(strict_err
+            .unwrap_err()
+            .to_string()
+            .contains("rejected in strict mode"));
+
+        // Standard-only config passes strict validation
+        let standard_cfg = RedFolderConfig::builder()
+            .currencies(vec!["USD", "EUR"])
+            .impacts(vec!["High", "Medium"])
+            .build();
+        assert!(standard_cfg.validate_strict().is_ok());
     }
 }
