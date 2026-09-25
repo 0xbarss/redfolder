@@ -44,8 +44,8 @@ async-trait = "0.1"
 # CLI dependencies (optional)
 clap = { version = "4.5", features = ["derive"], optional = true }
 colored = { version = "2.1", optional = true }
-tokio-util = "0.7.19"
-chrono-tz = { version = "0.10.4", features = ["serde"] }
+tokio-util = "0.7"
+chrono-tz = { version = "0.10", features = ["serde"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

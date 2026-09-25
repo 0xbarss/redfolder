@@ -200,9 +200,12 @@ impl RedFolderConfig {
     /// Validates the configuration parameters, ensuring non-negative buffers, non-empty filters,
     /// non-blank currency/impact entries, and valid curfew formats.
     ///
+    /// # Permissive vs. Strict Validation
     /// Custom non-standard currency symbols (e.g. `"XAU"`, `"BTC"`, `"TRY"`) and custom impact
-    /// levels are supported by default via [`Currency::Custom`] and [`Impact::Custom`].
-    /// To enforce strict standard-only currencies and impacts, use [`Self::validate_strict`].
+    /// levels are supported by default via [`Currency::Custom`] and [`Impact::Custom`]. Because of this,
+    /// standard `validate()` will **not** reject typos such as `"USDD"` (which evaluates to `Custom("USDD")`).
+    /// If loading configuration from external files (YAML, TOML, JSON, or ENV), prefer [`Self::validate_strict`]
+    /// or [`RedFolderConfigBuilder::try_build_strict`] to catch typos early rather than silently monitoring nothing.
     pub fn validate(&self) -> crate::error::Result<()> {
         if self.currencies.is_empty() {
             return Err(crate::error::RedFolderError::Config(
@@ -458,6 +461,24 @@ impl RedFolderConfigBuilder {
         self.config.validate()?;
         Ok(self.config)
     }
+
+    /// Validates strictly and builds the configuration safely without panicking.
+    ///
+    /// Ensures that only standard known currency codes (USD, EUR, GBP, JPY, AUD, CAD, CHF, NZD, CNY, ALL)
+    /// and standard impact levels (High, Medium, Low, Non-Economic) are accepted.
+    /// Rejects non-standard currencies or typos (e.g. `"USDD"`).
+    pub fn try_build_strict(self) -> crate::error::Result<RedFolderConfig> {
+        self.config.validate_strict()?;
+        Ok(self.config)
+    }
+
+    /// Validates strictly and builds the configuration, panicking if strict validation fails.
+    #[must_use]
+    pub fn build_strict(self) -> RedFolderConfig {
+        self.try_build_strict().expect(
+            "invalid RedFolderConfig parameters in strict mode: use try_build_strict() for fallible initialization",
+        )
+    }
 }
 
 /// Backwards compatibility alias for `RedFolderConfig`.
@@ -580,6 +601,31 @@ mod tests {
             .impacts(vec!["High", "Medium"])
             .build();
         assert!(standard_cfg.validate_strict().is_ok());
+    }
+
+    #[test]
+    fn test_builder_strict_methods() {
+        let ok_cfg = RedFolderConfig::builder()
+            .currencies(vec!["USD", "EUR"])
+            .impacts(vec!["High"])
+            .try_build_strict();
+        assert!(ok_cfg.is_ok());
+
+        let err_cfg = RedFolderConfig::builder()
+            .currencies(vec!["USDD"])
+            .impacts(vec!["High"])
+            .try_build_strict();
+        assert!(err_cfg.is_err());
+        assert!(err_cfg
+            .unwrap_err()
+            .to_string()
+            .contains("unknown non-standard currency 'USDD'"));
+
+        let built = RedFolderConfig::builder()
+            .currencies(vec!["GBP"])
+            .impacts(vec!["High"])
+            .build_strict();
+        assert_eq!(built.currencies, vec!["GBP"]);
     }
 
     #[test]

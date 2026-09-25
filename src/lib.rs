@@ -31,8 +31,8 @@ pub use error::{RedFolderError, Result};
 pub use events::{EventListener, RedFolderEvent};
 pub use service::{NewsBlackoutService, RedFolderService};
 pub use types::{
-    BlackoutNotification, BlackoutWindow, Currency, EconomicEvent, EventTiming, FailSafeMode,
-    Impact, NewsEvent, WindowEvent,
+    BlackoutNotification, BlackoutWindow, Currency, CustomEventKind, EconomicEvent, EventTiming,
+    FailSafeMode, Impact, NewsEvent, WindowEvent,
 };
 
 /// Common prelude items for quick import.
@@ -44,7 +44,7 @@ pub mod prelude {
     pub use crate::events::{EventListener, RedFolderEvent};
     pub use crate::service::{RedFolderService, ServiceState};
     pub use crate::types::{
-        BlackoutNotification, BlackoutWindow, Currency, EventTiming, FailSafeMode, Impact,
-        WindowEvent,
+        BlackoutNotification, BlackoutWindow, Currency, CustomEventKind, EventTiming, FailSafeMode,
+        Impact, WindowEvent,
     };
 }

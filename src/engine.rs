@@ -1,7 +1,9 @@
 use crate::calendar::{parse_event_timing, RawCalendarEvent};
 use crate::config::RedFolderConfig;
 use crate::curfew::{weekend_window_at, weekend_window_title};
-use crate::types::{BlackoutWindow, Currency, EconomicEvent, EventTiming, Impact, WindowEvent};
+use crate::types::{
+    BlackoutWindow, Currency, CustomEventKind, EconomicEvent, EventTiming, Impact, WindowEvent,
+};
 use chrono::{DateTime, Duration, Utc};
 use tracing::{error, info};
 
@@ -226,6 +228,7 @@ impl BlackoutEngine {
                         end,
                         WindowEvent {
                             is_custom: false,
+                            custom_kind: None,
                             event_time: *dt,
                             country: event.country.clone(),
                             impact: event.impact.clone(),
@@ -249,6 +252,7 @@ impl BlackoutEngine {
                                     end,
                                     WindowEvent {
                                         is_custom: false,
+                                        custom_kind: None,
                                         event_time: start,
                                         country: event.country.clone(),
                                         impact: event.impact.clone(),
@@ -275,6 +279,7 @@ impl BlackoutEngine {
                                     end,
                                     WindowEvent {
                                         is_custom: false,
+                                        custom_kind: None,
                                         event_time: start,
                                         country: event.country.clone(),
                                         impact: event.impact.clone(),
@@ -308,6 +313,7 @@ impl BlackoutEngine {
                             end,
                             WindowEvent {
                                 is_custom: true,
+                                custom_kind: Some(CustomEventKind::WeekendCurfew),
                                 event_time: start,
                                 country: "Global".into(),
                                 impact: "High".into(),
@@ -340,6 +346,7 @@ impl BlackoutEngine {
                 now + Duration::hours(24),
                 WindowEvent {
                     is_custom: true,
+                    custom_kind: Some(CustomEventKind::FailClosedSafety),
                     event_time: now,
                     country: "Global".into(),
                     impact: "High".into(),
@@ -528,7 +535,7 @@ pub fn event_matches_economic_event(event: &EconomicEvent, config: &RedFolderCon
 #[must_use]
 pub fn event_matches_config(event: &WindowEvent, config: &RedFolderConfig) -> bool {
     if event.is_custom {
-        if event.title.contains("Fail-Closed") {
+        if event.is_fail_closed_safety() {
             config.enabled && config.fail_safe_mode.is_fail_closed()
         } else {
             config.weekend_enabled
@@ -595,6 +602,7 @@ mod tests {
             end: now + Duration::minutes(10),
             events: vec![WindowEvent {
                 is_custom: false,
+                custom_kind: None,
                 event_time: now,
                 country: "USD".into(),
                 impact: "High".into(),
@@ -796,10 +804,12 @@ mod tests {
 
         let status = empty_engine.status(&fail_closed_cfg);
         assert!(status.is_some());
-        assert!(status
-            .unwrap()
+        let safety_win = status.unwrap();
+        assert!(safety_win
             .summary_title()
             .contains("Fail-Closed Safety Blackout"));
+        assert!(safety_win.events.iter().all(|e| e.is_fail_closed_safety()
+            && e.custom_kind == Some(CustomEventKind::FailClosedSafety)));
 
         // 2. On stale data, fail-closed returns true even if past events exist
         let past_raw = vec![RawCalendarEvent {

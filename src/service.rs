@@ -330,6 +330,50 @@ impl RedFolderService {
         self.notify.notify_waiters();
     }
 
+    /// Internal unified worker registration routine to ensure atomic registration and channel initialization.
+    async fn register_worker_internal<R>(
+        &self,
+        worker_id: impl Into<String>,
+        config: RedFolderConfig,
+        allow_overwrite: bool,
+        reregister_method_hint: &str,
+        setup: impl FnOnce(&str, &RedFolderConfig, bool, Option<BlackoutWindow>) -> (WorkerState, R),
+    ) -> Result<R> {
+        config.validate()?;
+        let worker_id = worker_id.into();
+
+        let mut inner = self.inner.lock().await;
+        if inner.workers.contains_key(&worker_id) {
+            if allow_overwrite {
+                warn!(worker=%worker_id, "re-registering worker: overwriting previous worker state and channels");
+            } else {
+                return Err(crate::error::RedFolderError::Service(format!(
+                    "worker '{worker_id}' is already registered; use {reregister_method_hint} to update or unregister first"
+                )));
+            }
+        }
+
+        let is_active = inner.engine.is_blackout(&config);
+        let active_window = if is_active {
+            inner.engine.current_window(&config)
+        } else {
+            None
+        };
+
+        let (state, rx) = setup(&worker_id, &config, is_active, active_window);
+        inner.workers.insert(worker_id.clone(), state);
+
+        drop(inner);
+        self.notify.notify_waiters();
+
+        if allow_overwrite {
+            debug!(worker=%worker_id, "re-registered worker in RedFolderService");
+        } else {
+            debug!(worker=%worker_id, "registered worker in RedFolderService");
+        }
+        Ok(rx)
+    }
+
     /// Register a worker or trading strategy, returning a legacy `BlackoutNotification` receiver.
     /// Immediately notifies if worker is currently in blackout.
     ///
@@ -341,50 +385,32 @@ impl RedFolderService {
         worker_id: impl Into<String>,
         config: RedFolderConfig,
     ) -> Result<mpsc::UnboundedReceiver<BlackoutNotification>> {
-        config.validate()?;
-        let worker_id = worker_id.into();
-
-        let mut inner = self.inner.lock().await;
-        if inner.workers.contains_key(&worker_id) {
-            return Err(crate::error::RedFolderError::Service(format!(
-                "worker '{worker_id}' is already registered; use reregister_worker to update or unregister first"
-            )));
-        }
-
-        let (legacy_tx, legacy_rx) = mpsc::unbounded_channel();
-        let is_active = inner.engine.is_blackout(&config);
-        let active_window = if is_active {
-            inner.engine.current_window(&config)
-        } else {
-            None
-        };
-
-        if is_active {
-            legacy_tx
-                .send(BlackoutNotification {
-                    active: true,
-                    window: active_window.clone(),
-                })
-                .ok();
-        }
-
-        inner.workers.insert(
-            worker_id.clone(),
-            WorkerState {
-                config,
-                legacy_sender: Some(legacy_tx),
-                event_sender: None,
-                in_blackout: is_active,
-                active_window,
-                last_warned_window_start: None,
+        self.register_worker_internal(
+            worker_id,
+            config,
+            false,
+            "reregister_worker",
+            |_, cfg, is_active, active_window| {
+                let (tx, rx) = mpsc::unbounded_channel();
+                if is_active {
+                    tx.send(BlackoutNotification {
+                        active: true,
+                        window: active_window.clone(),
+                    })
+                    .ok();
+                }
+                let state = WorkerState {
+                    config: cfg.clone(),
+                    legacy_sender: Some(tx),
+                    event_sender: None,
+                    in_blackout: is_active,
+                    active_window,
+                    last_warned_window_start: None,
+                };
+                (state, rx)
             },
-        );
-
-        drop(inner);
-        self.notify.notify_waiters();
-
-        debug!(worker=%worker_id, "registered worker in RedFolderService");
-        Ok(legacy_rx)
+        )
+        .await
     }
 
     /// Register a worker or trading strategy, returning an event-driven `RedFolderEvent` receiver.
@@ -398,52 +424,34 @@ impl RedFolderService {
         worker_id: impl Into<String>,
         config: RedFolderConfig,
     ) -> Result<mpsc::UnboundedReceiver<RedFolderEvent>> {
-        config.validate()?;
-        let worker_id = worker_id.into();
-
-        let mut inner = self.inner.lock().await;
-        if inner.workers.contains_key(&worker_id) {
-            return Err(crate::error::RedFolderError::Service(format!(
-                "worker '{worker_id}' is already registered; use reregister_worker_events to update or unregister first"
-            )));
-        }
-
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let is_active = inner.engine.is_blackout(&config);
-        let active_window = if is_active {
-            inner.engine.current_window(&config)
-        } else {
-            None
-        };
-
-        if is_active {
-            if let Some(ref w) = active_window {
-                event_tx
-                    .send(RedFolderEvent::BlackoutStarted {
-                        window: w.clone(),
-                        worker_id: Some(worker_id.clone()),
-                    })
-                    .ok();
-            }
-        }
-
-        inner.workers.insert(
-            worker_id.clone(),
-            WorkerState {
-                config,
-                legacy_sender: None,
-                event_sender: Some(event_tx),
-                in_blackout: is_active,
-                active_window,
-                last_warned_window_start: None,
+        self.register_worker_internal(
+            worker_id,
+            config,
+            false,
+            "reregister_worker_events",
+            |wid, cfg, is_active, active_window| {
+                let (tx, rx) = mpsc::unbounded_channel();
+                if is_active {
+                    if let Some(ref w) = active_window {
+                        tx.send(RedFolderEvent::BlackoutStarted {
+                            window: w.clone(),
+                            worker_id: Some(wid.to_string()),
+                        })
+                        .ok();
+                    }
+                }
+                let state = WorkerState {
+                    config: cfg.clone(),
+                    legacy_sender: None,
+                    event_sender: Some(tx),
+                    in_blackout: is_active,
+                    active_window,
+                    last_warned_window_start: None,
+                };
+                (state, rx)
             },
-        );
-
-        drop(inner);
-        self.notify.notify_waiters();
-
-        debug!(worker=%worker_id, "registered event worker in RedFolderService");
-        Ok(event_rx)
+        )
+        .await
     }
 
     /// Re-registers an existing worker or registers a new worker, updating its configuration
@@ -453,48 +461,32 @@ impl RedFolderService {
         worker_id: impl Into<String>,
         config: RedFolderConfig,
     ) -> Result<mpsc::UnboundedReceiver<BlackoutNotification>> {
-        config.validate()?;
-        let worker_id = worker_id.into();
-
-        let mut inner = self.inner.lock().await;
-        if inner.workers.contains_key(&worker_id) {
-            warn!(worker=%worker_id, "re-registering worker: overwriting previous worker state and channels");
-        }
-
-        let (legacy_tx, legacy_rx) = mpsc::unbounded_channel();
-        let is_active = inner.engine.is_blackout(&config);
-        let active_window = if is_active {
-            inner.engine.current_window(&config)
-        } else {
-            None
-        };
-
-        if is_active {
-            legacy_tx
-                .send(BlackoutNotification {
-                    active: true,
-                    window: active_window.clone(),
-                })
-                .ok();
-        }
-
-        inner.workers.insert(
-            worker_id.clone(),
-            WorkerState {
-                config,
-                legacy_sender: Some(legacy_tx),
-                event_sender: None,
-                in_blackout: is_active,
-                active_window,
-                last_warned_window_start: None,
+        self.register_worker_internal(
+            worker_id,
+            config,
+            true,
+            "reregister_worker",
+            |_, cfg, is_active, active_window| {
+                let (tx, rx) = mpsc::unbounded_channel();
+                if is_active {
+                    tx.send(BlackoutNotification {
+                        active: true,
+                        window: active_window.clone(),
+                    })
+                    .ok();
+                }
+                let state = WorkerState {
+                    config: cfg.clone(),
+                    legacy_sender: Some(tx),
+                    event_sender: None,
+                    in_blackout: is_active,
+                    active_window,
+                    last_warned_window_start: None,
+                };
+                (state, rx)
             },
-        );
-
-        drop(inner);
-        self.notify.notify_waiters();
-
-        debug!(worker=%worker_id, "re-registered worker in RedFolderService");
-        Ok(legacy_rx)
+        )
+        .await
     }
 
     /// Re-registers an existing event worker or registers a new worker, updating its configuration
@@ -504,50 +496,34 @@ impl RedFolderService {
         worker_id: impl Into<String>,
         config: RedFolderConfig,
     ) -> Result<mpsc::UnboundedReceiver<RedFolderEvent>> {
-        config.validate()?;
-        let worker_id = worker_id.into();
-
-        let mut inner = self.inner.lock().await;
-        if inner.workers.contains_key(&worker_id) {
-            warn!(worker=%worker_id, "re-registering worker: overwriting previous worker state and channels");
-        }
-
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let is_active = inner.engine.is_blackout(&config);
-        let active_window = if is_active {
-            inner.engine.current_window(&config)
-        } else {
-            None
-        };
-
-        if is_active {
-            if let Some(ref w) = active_window {
-                event_tx
-                    .send(RedFolderEvent::BlackoutStarted {
-                        window: w.clone(),
-                        worker_id: Some(worker_id.clone()),
-                    })
-                    .ok();
-            }
-        }
-
-        inner.workers.insert(
-            worker_id.clone(),
-            WorkerState {
-                config,
-                legacy_sender: None,
-                event_sender: Some(event_tx),
-                in_blackout: is_active,
-                active_window,
-                last_warned_window_start: None,
+        self.register_worker_internal(
+            worker_id,
+            config,
+            true,
+            "reregister_worker_events",
+            |wid, cfg, is_active, active_window| {
+                let (tx, rx) = mpsc::unbounded_channel();
+                if is_active {
+                    if let Some(ref w) = active_window {
+                        tx.send(RedFolderEvent::BlackoutStarted {
+                            window: w.clone(),
+                            worker_id: Some(wid.to_string()),
+                        })
+                        .ok();
+                    }
+                }
+                let state = WorkerState {
+                    config: cfg.clone(),
+                    legacy_sender: None,
+                    event_sender: Some(tx),
+                    in_blackout: is_active,
+                    active_window,
+                    last_warned_window_start: None,
+                };
+                (state, rx)
             },
-        );
-
-        drop(inner);
-        self.notify.notify_waiters();
-
-        debug!(worker=%worker_id, "re-registered event worker in RedFolderService");
-        Ok(event_rx)
+        )
+        .await
     }
 
     /// Unregister a worker by ID.
@@ -572,6 +548,13 @@ impl RedFolderService {
     }
 
     /// Start the background synchronization and evaluation loops.
+    ///
+    /// # Worker Requirement
+    /// At least one worker must be registered with `config.enabled == true` before calling `start()`.
+    /// If no workers are registered or all registered workers have `config.enabled == false`,
+    /// `start()` logs a warning/info message and returns `Ok(())` without spawning background tasks
+    /// or changing state away from `ServiceState::Stopped`. Callers can verify active running state via
+    /// [`is_running`](Self::is_running) or [`state`](Self::state).
     pub async fn start(&self) -> Result<()> {
         {
             let mut inner = self.inner.lock().await;

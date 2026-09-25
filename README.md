@@ -342,6 +342,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+> [!TIP]
+> Always register workers before invoking `service.start().await?`. If no enabled workers are registered, `start()` logs an informational warning and safely remains in `ServiceState::Stopped` without spawning unnecessary background loops.
+
 ---
 
 ### 3. Pre-Blackout Advance Warnings (Order Cancellation Guard)
@@ -556,11 +559,17 @@ redfolder sync
 | `fail_safe_mode` | `fn(self, FailSafeMode) -> Self` | Sets safety policy (`FailOpen` or `FailClosed`) for handling stale or failed feeds. |
 | `build` | `fn(self) -> RedFolderConfig` | Validates parameters and constructs config; panics if invalid. |
 | `try_build` | `fn(self) -> Result<RedFolderConfig>` | Validates parameters and returns typed `Result<RedFolderConfig, RedFolderError>`. |
+| `try_build_strict` | `fn(self) -> Result<RedFolderConfig>` | Strict validation rejecting non-standard currency/impact typos; returns typed `Result`. |
+| `build_strict` | `fn(self) -> RedFolderConfig` | Validates strictly; panics if non-standard or invalid parameters are provided. |
+
+> [!NOTE]
+> **Permissive Defaults vs. Strict Validation**: By default, `validate()` and `try_build()` allow custom non-standard currency codes (e.g. `"XAU"`, `"BTC"`, `"TRY"`) via `Currency::Custom` and `Impact::Custom`. When loading configuration from external files (YAML, JSON, TOML) or untrusted user input, prefer `validate_strict()` or `try_build_strict()` to reject typos like `"USDD"` at startup instead of silently matching zero events.
 
 ### Types & Domain Models
 
 - **`RedFolderEvent`**: Typed enum (`BlackoutWarning`, `BlackoutStarted`, `BlackoutEnded`, `CalendarUpdated`, `CalendarSyncFailed`).
 - **`FailSafeMode`**: Policy enum (`FailOpen`, `FailClosed`). In `FailClosed` mode, missing or stale calendar feeds trigger an immediate safety blackout to protect prop firm accounts from unexpected macroeconomic volatility.
+- **`CustomEventKind`**: Typed classification enum (`WeekendCurfew`, `FailClosedSafety`) identifying synthetic blackout windows. `WindowEvent` provides helper accessors `is_weekend_curfew()` and `is_fail_closed_safety()`.
 - **`EventTiming`**: Precision timing enum (`Exact(DateTime<Utc>)`, `AllDay(NaiveDate)`, `TentativeDate(NaiveDate)`).
 - **`ServiceState`**: Service lifecycle enum (`Stopped`, `Starting`, `Running`, `Stopping`).
 - **`BlackoutWindow`**: Struct containing `start: DateTime<Utc>`, `end: DateTime<Utc>`, and `events: Vec<WindowEvent>`. Uses standard half-open interval semantics `[start, end)`. Provides helper methods `remaining_minutes()`, `duration_minutes()`, `is_active()`, and `summary_title()`.
@@ -571,7 +580,7 @@ redfolder sync
 
 ## Testing & Quality Assurance
 
-`redfolder` includes an automated test battery with **93 unit and integration tests** (49 unit + 44 integration) covering interval calculations, state machines, and resilience guarantees.
+`redfolder` includes an automated test battery with **95 unit and integration tests** (51 unit + 44 integration) covering interval calculations, state machines, and resilience guarantees.
 
 Run the test suite:
 
@@ -646,11 +655,11 @@ The following representative measurements illustrate sub-microsecond to low-micr
 
 | Operation | Benchmark Name | Latency (Mean) | 95% Confidence Interval | Description |
 | :--- | :--- | :---: | :---: | :--- |
-| **Engine Compilation** | `engine_compile_50_events` | **17.31 µs** | [17.21 µs – 17.42 µs] | Parses, sorts, filters, and merges 50 raw events into UTC intervals |
-| **Runtime Blackout Check** | `is_blackout_query` | **8.55 µs** | [8.50 µs – 8.60 µs] | Evaluates active blackout state across currencies, impacts, and weekend curfew |
-| **Deterministic Timestamp Query** | `is_blackout_at_query` | **6.57 µs** | [6.54 µs – 6.60 µs] | Historical or future evaluation point query for tick-level backtesting |
-| **Worker Window Derivation** | `windows_for_config` | **8.74 µs** | [8.69 µs – 8.80 µs] | Derives isolated worker-specific blackout intervals from parsed events |
-| **Atomic Status Accessor** | `status_query` | **8.60 µs** | [8.55 µs – 8.65 µs] | Atomically evaluates status and extracts active window in a single pass |
+| **Engine Compilation** | `engine_compile_50_events` | **24.02 µs** | [23.57 µs – 24.52 µs] | Parses, sorts, filters, and merges 50 raw events into UTC intervals |
+| **Runtime Blackout Check** | `is_blackout_query` | **12.26 µs** | [12.17 µs – 12.37 µs] | Evaluates active blackout state across currencies, impacts, and weekend curfew |
+| **Deterministic Timestamp Query** | `is_blackout_at_query` | **10.76 µs** | [10.60 µs – 10.96 µs] | Historical or future evaluation point query for tick-level backtesting |
+| **Worker Window Derivation** | `windows_for_config` | **13.10 µs** | [12.92 µs – 13.36 µs] | Derives isolated worker-specific blackout intervals from parsed events |
+| **Atomic Status Accessor** | `status_query` | **13.09 µs** | [13.01 µs – 13.17 µs] | Atomically evaluates status and extracts active window in a single pass |
 
 To reproduce these benchmarks:
 ```bash
