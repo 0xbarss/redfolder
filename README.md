@@ -87,10 +87,13 @@ Building economic news protection from scratch usually results in brittle HTTP p
 │        - Overlapping Window Merge (Gap Threshold)         │
 │        - Half-Open Interval Semantics: [start, end)       │
 │        - Weekend Curfew Injection (Short / Weekend)       │
+│        - O(log n) Binary Search Window Evaluation         │
 └─────────────────────────────┬─────────────────────────────┘
                               │ Compiled BlackoutWindows
 ┌─────────────────────────────▼─────────────────────────────┐
 │                     RedFolderService                      │
+│        - Fine-Grained RwLock Concurrency Architecture     │
+│        - Concurrent EventListener Dispatch (tokio::spawn) │
 │        - Daily Midnight UTC Sync Loop                     │
 │        - Transition-Driven Evaluation Loop (Exact Timing) │
 │        - CancellationToken & Tracked JoinHandles Lifecycle│
@@ -198,7 +201,10 @@ When upstream network feeds, fallback mirrors, and local disk caches fail concur
 ## Key Features
 
 - **Zero Unsound Dependencies**: Pure Rust implementation with strict compile-time invariants.
-- **Fast In-Memory Matching**: Compiles events into pre-sorted UTC intervals for single-digit microsecond query latency (~6–8 µs) during order placement, verified with Criterion benchmarks.
+- **Fast In-Memory Matching**: Compiles events into pre-sorted UTC intervals for $O(\log n)$ binary search lookup and single-digit microsecond query latency (~6–8 µs) during order placement, verified with Criterion benchmarks.
+- **High-Concurrency Service Architecture**: Granular `RwLock` synchronization separates engine intervals, registered worker states, and sync metadata, enabling hundreds of trading bots to query blackout statuses concurrently without serialization bottlenecks.
+- **Concurrent Event Listeners**: Trait-based event listeners are dispatched concurrently across Tokio tasks, preventing slow logging or webhook sinks from delaying order cancellation warnings.
+- **Strong Domain Typing**: Strongly typed `Currency`, `Impact`, and `WeekendMode` enums with flexible builder ergonomics accepting both typed variants and string literals.
 - **Multi-Worker Granularity**: Assign separate configurations to different strategies or symbols (e.g. `EURUSD` bot monitors USD + EUR; `GBPJPY` bot monitors GBP + JPY).
 - **Multiple Integration Channels**: Consume events via `tokio::sync::broadcast`, per-worker `tokio::sync::mpsc`, or asynchronous `EventListener` traits.
 - **Prop Firm Preset Out of the Box**: Configurable presets approximating FTMO, FundedNext, and The5ers rules.
@@ -246,7 +252,7 @@ Add `redfolder` to your project's `Cargo.toml`:
 
 ```toml
 [dependencies]
-redfolder = "0.1"
+redfolder = "1.0"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -548,12 +554,12 @@ redfolder sync
 
 | Method | Signature | Description |
 | :--- | :--- | :--- |
-| `currencies` | `fn(self, impl IntoIterator<Item = S>) -> Self` | Sets target currency symbols (e.g. `["USD", "EUR"]`). |
-| `impacts` | `fn(self, impl IntoIterator<Item = S>) -> Self` | Sets impact tiers to filter (e.g. `["High"]`, `"Red"`). |
+| `currencies` | `fn(self, impl IntoIterator<Item = impl IntoCurrency>) -> Self` | Sets target currencies (accepts `Currency` variants like `Currency::USD` or string slices `["USD", "EUR"]`). |
+| `impacts` | `fn(self, impl IntoIterator<Item = impl IntoImpact>) -> Self` | Sets impact tiers to filter (accepts `Impact` variants like `Impact::High` or string slices `["High", "Red"]`). |
 | `buffer_minutes` | `fn(self, u32, u32) -> Self` | Sets pre-event and post-event blackout safety buffers in minutes. |
 | `warning_minutes` | `fn(self, u32) -> Self` | Configures advance warning alert threshold prior to blackout onset. |
 | `merge_threshold_minutes` | `fn(self, u32) -> Self` | Maximum gap between successive events to merge into a single window. |
-| `weekend_curfew` | `fn(self, bool, &str, &str, WeekendMode) -> Self` | Enables and configures weekend market-close curfew start, end, and mode. |
+| `weekend_curfew` | `fn(self, bool, &str, &str, impl IntoWeekendMode) -> Self` | Enables and configures weekend curfew start, end, and mode (accepts `WeekendMode`, `&str`, or `String`). |
 | `include_all_day` | `fn(self, bool) -> Self` | Controls whether all-day events (e.g. bank holidays) trigger 24h blackouts. |
 | `include_tentative` | `fn(self, bool) -> Self` | Controls whether unscheduled tentative releases trigger blackouts. |
 | `fail_safe_mode` | `fn(self, FailSafeMode) -> Self` | Sets safety policy (`FailOpen` or `FailClosed`) for handling stale or failed feeds. |
@@ -573,14 +579,15 @@ redfolder sync
 - **`EventTiming`**: Precision timing enum (`Exact(DateTime<Utc>)`, `AllDay(NaiveDate)`, `TentativeDate(NaiveDate)`).
 - **`ServiceState`**: Service lifecycle enum (`Stopped`, `Starting`, `Running`, `Stopping`).
 - **`BlackoutWindow`**: Struct containing `start: DateTime<Utc>`, `end: DateTime<Utc>`, and `events: Vec<WindowEvent>`. Uses standard half-open interval semantics `[start, end)`. Provides helper methods `remaining_minutes()`, `duration_minutes()`, `is_active()`, and `summary_title()`.
+- **`Currency`**: Strongly-typed enum with variants `USD`, `EUR`, `GBP`, `JPY`, `CAD`, `AUD`, `NZD`, `CHF`, and `Custom(String)`. Supports case-insensitive string parsing, matching, and deserialization.
 - **`Impact`**: Enum with variants `High`, `Medium`, `Low`, `NonEconomic`, `Custom(String)`. Supports case-insensitive string matching (`"red"`, `"high"`).
-- **`WeekendMode`**: Enum with variants `Short` (Friday evening window) and `Weekend` (Friday evening through Monday 00:00 UTC). Validated strictly on parse (rejecting typos or unknown strings with a descriptive error).
+- **`WeekendMode`**: Enum with variants `Short` (Friday evening window) and `Weekend` (Friday evening through Monday 00:00 UTC). Supports case-insensitive deserialization and default derivation.
 
 ---
 
 ## Testing & Quality Assurance
 
-`redfolder` includes an automated test battery with **95 unit and integration tests** (51 unit + 44 integration) covering interval calculations, state machines, and resilience guarantees.
+`redfolder` includes an automated test battery with **101 unit and integration tests** (51 unit + 50 integration) covering interval calculations, state machines, and resilience guarantees.
 
 Run the test suite:
 
@@ -637,6 +644,12 @@ cargo clippy --all-targets --all-features -- -D warnings
 | **Sync Failure under Fail-Closed Policy** | Automatically injects a synthetic `Fail-Closed Safety Blackout` window for `FailClosed` workers, halting trading during feed outages. | Verified |
 | **Retry Latency Ceiling Exceeded** | Aborts retry loop once cumulative duration exceeds `overall_timeout` (default 30s), avoiding stalled caller tasks. | Verified |
 | **Disabled Weekend Config Validation** | `validate()` unconditionally checks weekend curfew parameters even when `weekend_enabled` is false, preventing latent runtime bugs. | Verified |
+| **Back-to-Back News Interval Merging** | Merges overlapping releases into unified intervals verified via $O(\log n)$ binary search lookup. | Verified |
+| **Weekend & Economic Overlap** | Seamlessly connects late Friday economic releases with weekend market curfews without coverage gap. | Verified |
+| **Stale Calendar Policy: Fail-Open** | Maintains normal trading execution when calendar synchronization fails under `FailOpen` mode. | Verified |
+| **Stale Calendar Policy: Fail-Closed** | Defensively triggers continuous safety blackout during feed outages under `FailClosed` prop firm mode. | Verified |
+| **Daylight Saving Time (DST) Transitions** | Resolves spring-forward gaps and fall-back ambiguities in US Eastern / configured timezones deterministically. | Verified |
+| **CLI Binary Subcommands & JSON Output** | Verifies `status`, `upcoming`, and flag parsing across isolated environments via command execution. | Verified |
 
 ---
 

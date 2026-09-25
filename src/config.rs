@@ -1,28 +1,24 @@
+use crate::curfew::WeekendMode;
+use crate::types::{Currency, FailSafeMode, Impact};
 use serde::{Deserialize, Serialize};
 
 /// Configuration for economic news blackout filtering and weekend curfew windows.
 ///
-/// # v2 Migration Note: Strong Typing & Invariants
-///
-/// In the current v0.1 / v1.x API, `currencies`, `impacts`, and `weekend_mode` are stored
-/// as string types to preserve backwards compatibility with configuration files (JSON/TOML)
-/// and legacy field aliases. For type-safe access, use the helper methods
-/// [`typed_currencies`](Self::typed_currencies), [`typed_impacts`](Self::typed_impacts),
-/// and [`typed_weekend_mode`](Self::typed_weekend_mode). In v2, these fields will transition
-/// to strongly-typed enum collections.
+/// Fields are strongly typed with [`Currency`], [`Impact`], and [`WeekendMode`],
+/// while supporting transparent Serde deserialization from JSON/TOML strings and legacy aliases.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RedFolderConfig {
     /// Whether blackout checking is globally enabled for this worker/strategy.
     #[serde(default = "default_true")]
     pub enabled: bool,
 
-    /// Currencies to monitor (e.g. `["USD", "EUR", "GBP"]` or `["All"]`).
+    /// Currencies to monitor (e.g. `[Currency::USD, Currency::EUR]` or `[Currency::All]`).
     #[serde(default = "default_currencies")]
-    pub currencies: Vec<String>,
+    pub currencies: Vec<Currency>,
 
-    /// Impact levels to filter on (e.g. `["High"]` or `["High", "Medium"]`).
+    /// Impact levels to filter on (e.g. `[Impact::High]` or `[Impact::High, Impact::Medium]`).
     #[serde(default = "default_impacts")]
-    pub impacts: Vec<String>,
+    pub impacts: Vec<Impact>,
 
     /// Minutes before the scheduled event time to initiate the blackout window.
     #[serde(default = "default_30")]
@@ -55,10 +51,10 @@ pub struct RedFolderConfig {
     pub weekend_end: String,
 
     /// Curfew mode:
-    /// - `"short"` (default): curfew window ends at `weekend_end` on Friday.
-    /// - `"weekend"`: curfew window extends throughout the weekend until Monday 00:00 UTC.
+    /// - [`WeekendMode::Short`]: curfew window ends at `weekend_end` on Friday.
+    /// - [`WeekendMode::Weekend`]: curfew window extends throughout the weekend until Monday 00:00 UTC.
     #[serde(default = "default_weekend_mode", alias = "friday_night_mode")]
-    pub weekend_mode: String,
+    pub weekend_mode: WeekendMode,
 
     /// Optional advance warning in minutes before a blackout window starts.
     /// If configured, `RedFolderEvent::BlackoutWarning` will be emitted in advance.
@@ -82,7 +78,7 @@ pub struct RedFolderConfig {
     ///
     /// Defaults to [`FailSafeMode::FailOpen`] for standard setups; prop firm presets default to `FailClosed`.
     #[serde(default)]
-    pub fail_safe_mode: crate::types::FailSafeMode,
+    pub fail_safe_mode: FailSafeMode,
 }
 
 fn default_true() -> bool {
@@ -93,12 +89,12 @@ fn default_30() -> i64 {
     30
 }
 
-fn default_currencies() -> Vec<String> {
-    vec!["USD".into()]
+fn default_currencies() -> Vec<Currency> {
+    vec![Currency::USD]
 }
 
-fn default_impacts() -> Vec<String> {
-    vec!["High".into()]
+fn default_impacts() -> Vec<Impact> {
+    vec![Impact::High]
 }
 
 fn default_weekend_start() -> String {
@@ -109,8 +105,8 @@ fn default_weekend_end() -> String {
     "21:00".to_string()
 }
 
-fn default_weekend_mode() -> String {
-    "short".to_string()
+fn default_weekend_mode() -> WeekendMode {
+    WeekendMode::Short
 }
 
 impl Default for RedFolderConfig {
@@ -129,12 +125,10 @@ impl Default for RedFolderConfig {
             warning_before_min: None,
             include_all_day: false,
             include_tentative: false,
-            fail_safe_mode: crate::types::FailSafeMode::FailOpen,
+            fail_safe_mode: FailSafeMode::FailOpen,
         }
     }
 }
-
-use crate::types::{Currency, Impact};
 
 impl RedFolderConfig {
     /// Create a new configuration builder.
@@ -151,27 +145,27 @@ impl RedFolderConfig {
         Self {
             enabled: true,
             currencies: vec![
-                "USD".into(),
-                "EUR".into(),
-                "GBP".into(),
-                "JPY".into(),
-                "CAD".into(),
-                "AUD".into(),
-                "NZD".into(),
-                "CHF".into(),
+                Currency::USD,
+                Currency::EUR,
+                Currency::GBP,
+                Currency::JPY,
+                Currency::CAD,
+                Currency::AUD,
+                Currency::NZD,
+                Currency::CHF,
             ],
-            impacts: vec!["High".into()],
+            impacts: vec![Impact::High],
             before_min: 5,
             after_min: 5,
             merge_threshold_min: 15,
             weekend_enabled: true,
             weekend_start: "20:00".into(),
             weekend_end: "21:00".into(),
-            weekend_mode: "weekend".into(),
+            weekend_mode: WeekendMode::Weekend,
             warning_before_min: Some(15),
             include_all_day: false,
             include_tentative: false,
-            fail_safe_mode: crate::types::FailSafeMode::FailClosed,
+            fail_safe_mode: FailSafeMode::FailClosed,
         }
     }
 
@@ -181,31 +175,24 @@ impl RedFolderConfig {
     pub fn conservative() -> Self {
         Self {
             enabled: true,
-            currencies: vec!["USD".into(), "EUR".into(), "GBP".into()],
-            impacts: vec!["High".into(), "Medium".into()],
+            currencies: vec![Currency::USD, Currency::EUR, Currency::GBP],
+            impacts: vec![Impact::High, Impact::Medium],
             before_min: 30,
             after_min: 30,
             merge_threshold_min: 30,
             weekend_enabled: true,
             weekend_start: "20:30".into(),
             weekend_end: "21:00".into(),
-            weekend_mode: "weekend".into(),
+            weekend_mode: WeekendMode::Weekend,
             warning_before_min: Some(30),
             include_all_day: false,
             include_tentative: false,
-            fail_safe_mode: crate::types::FailSafeMode::FailClosed,
+            fail_safe_mode: FailSafeMode::FailClosed,
         }
     }
 
     /// Validates the configuration parameters, ensuring non-negative buffers, non-empty filters,
     /// non-blank currency/impact entries, and valid curfew formats.
-    ///
-    /// # Permissive vs. Strict Validation
-    /// Custom non-standard currency symbols (e.g. `"XAU"`, `"BTC"`, `"TRY"`) and custom impact
-    /// levels are supported by default via [`Currency::Custom`] and [`Impact::Custom`]. Because of this,
-    /// standard `validate()` will **not** reject typos such as `"USDD"` (which evaluates to `Custom("USDD")`).
-    /// If loading configuration from external files (YAML, TOML, JSON, or ENV), prefer [`Self::validate_strict`]
-    /// or [`RedFolderConfigBuilder::try_build_strict`] to catch typos early rather than silently monitoring nothing.
     pub fn validate(&self) -> crate::error::Result<()> {
         if self.currencies.is_empty() {
             return Err(crate::error::RedFolderError::Config(
@@ -214,7 +201,7 @@ impl RedFolderConfig {
             ));
         }
         for c in &self.currencies {
-            if c.trim().is_empty() {
+            if c.as_str().trim().is_empty() {
                 return Err(crate::error::RedFolderError::Config(
                     "currency filter cannot contain empty or blank strings".to_string(),
                 ));
@@ -227,7 +214,7 @@ impl RedFolderConfig {
             ));
         }
         for i in &self.impacts {
-            if i.trim().is_empty() {
+            if i.to_string().trim().is_empty() {
                 return Err(crate::error::RedFolderError::Config(
                     "impact filter cannot contain empty or blank strings".to_string(),
                 ));
@@ -260,11 +247,9 @@ impl RedFolderConfig {
             }
         }
 
-        // Unconditionally validate weekend curfew time formats and mode even if weekend_enabled is false,
-        // ensuring the config is sound if weekend_enabled is toggled on later or curfew math is queried.
+        // Unconditionally validate weekend curfew time formats even if weekend_enabled is false
         crate::curfew::parse_time(&self.weekend_start)?;
-        let mode: crate::curfew::WeekendMode = self.weekend_mode.parse()?;
-        if mode == crate::curfew::WeekendMode::Short || !self.weekend_end.is_empty() {
+        if self.weekend_mode == WeekendMode::Short || !self.weekend_end.is_empty() {
             crate::curfew::parse_time(&self.weekend_end)?;
         }
         Ok(())
@@ -277,8 +262,7 @@ impl RedFolderConfig {
         self.validate()?;
 
         for c in &self.currencies {
-            let parsed: Currency = c.parse().unwrap();
-            if let Currency::Custom(ref s) = parsed {
+            if let Currency::Custom(ref s) = c {
                 return Err(crate::error::RedFolderError::Config(format!(
                     "unknown non-standard currency '{}' rejected in strict mode",
                     s
@@ -287,8 +271,7 @@ impl RedFolderConfig {
         }
 
         for i in &self.impacts {
-            let parsed: Impact = i.parse().unwrap();
-            if let Impact::Custom(ref s) = parsed {
+            if let Impact::Custom(ref s) = i {
                 return Err(crate::error::RedFolderError::Config(format!(
                     "unknown non-standard impact '{}' rejected in strict mode",
                     s
@@ -299,21 +282,62 @@ impl RedFolderConfig {
         Ok(())
     }
 
-    /// Parse and return configured currencies as typed [`Currency`] variants.
+    /// Return configured currencies as a slice of typed [`Currency`] variants.
     #[must_use]
-    pub fn typed_currencies(&self) -> Vec<Currency> {
-        self.currencies.iter().map(|c| c.parse().unwrap()).collect()
+    pub fn typed_currencies(&self) -> &[Currency] {
+        &self.currencies
     }
 
-    /// Parse and return configured impacts as typed [`Impact`] variants.
+    /// Return configured impacts as a slice of typed [`Impact`] variants.
     #[must_use]
-    pub fn typed_impacts(&self) -> Vec<Impact> {
-        self.impacts.iter().map(|i| i.parse().unwrap()).collect()
+    pub fn typed_impacts(&self) -> &[Impact] {
+        &self.impacts
     }
 
-    /// Parse and return configured weekend mode as a typed [`crate::curfew::WeekendMode`].
-    pub fn typed_weekend_mode(&self) -> crate::error::Result<crate::curfew::WeekendMode> {
-        self.weekend_mode.parse()
+    /// Return configured weekend mode as a typed [`WeekendMode`].
+    pub fn typed_weekend_mode(&self) -> crate::error::Result<WeekendMode> {
+        Ok(self.weekend_mode)
+    }
+
+    /// Helper returning currencies as a list of strings.
+    #[must_use]
+    pub fn currencies_as_strings(&self) -> Vec<String> {
+        self.currencies.iter().map(|c| c.to_string()).collect()
+    }
+
+    /// Helper returning impacts as a list of strings.
+    #[must_use]
+    pub fn impacts_as_strings(&self) -> Vec<String> {
+        self.impacts.iter().map(|i| i.to_string()).collect()
+    }
+}
+
+/// Helper trait to accept either `WeekendMode`, `&str`, or `String` in configuration builders.
+pub trait IntoWeekendMode {
+    fn into_weekend_mode(self) -> crate::error::Result<WeekendMode>;
+}
+
+impl IntoWeekendMode for WeekendMode {
+    fn into_weekend_mode(self) -> crate::error::Result<WeekendMode> {
+        Ok(self)
+    }
+}
+
+impl IntoWeekendMode for &str {
+    fn into_weekend_mode(self) -> crate::error::Result<WeekendMode> {
+        self.parse()
+    }
+}
+
+impl IntoWeekendMode for &String {
+    fn into_weekend_mode(self) -> crate::error::Result<WeekendMode> {
+        self.as_str().parse()
+    }
+}
+
+impl IntoWeekendMode for String {
+    fn into_weekend_mode(self) -> crate::error::Result<WeekendMode> {
+        self.parse()
     }
 }
 
@@ -323,6 +347,7 @@ pub struct RedFolderConfigBuilder {
     config: RedFolderConfig,
     custom_currencies: bool,
     custom_impacts: bool,
+    mode_err: Option<String>,
 }
 
 impl RedFolderConfigBuilder {
@@ -336,7 +361,7 @@ impl RedFolderConfigBuilder {
     pub fn currencies<I, S>(mut self, currencies: I) -> Self
     where
         I: IntoIterator<Item = S>,
-        S: Into<String>,
+        S: Into<Currency>,
     {
         self.config.currencies = currencies.into_iter().map(Into::into).collect();
         self.custom_currencies = true;
@@ -349,7 +374,7 @@ impl RedFolderConfigBuilder {
             self.config.currencies.clear();
             self.custom_currencies = true;
         }
-        self.config.currencies.push(currency.into().to_string());
+        self.config.currencies.push(currency.into());
         self
     }
 
@@ -357,7 +382,7 @@ impl RedFolderConfigBuilder {
     pub fn impacts<I, S>(mut self, impacts: I) -> Self
     where
         I: IntoIterator<Item = S>,
-        S: Into<String>,
+        S: Into<Impact>,
     {
         self.config.impacts = impacts.into_iter().map(Into::into).collect();
         self.custom_impacts = true;
@@ -370,7 +395,7 @@ impl RedFolderConfigBuilder {
             self.config.impacts.clear();
             self.custom_impacts = true;
         }
-        self.config.impacts.push(impact.into().to_string());
+        self.config.impacts.push(impact.into());
         self
     }
 
@@ -393,22 +418,28 @@ impl RedFolderConfigBuilder {
         enabled: bool,
         start_utc: impl Into<String>,
         end_utc: impl Into<String>,
-        mode: impl Into<String>,
+        mode: impl IntoWeekendMode,
     ) -> Self {
         self.config.weekend_enabled = enabled;
         self.config.weekend_start = start_utc.into();
         self.config.weekend_end = end_utc.into();
-        self.config.weekend_mode = mode.into();
+        match mode.into_weekend_mode() {
+            Ok(m) => {
+                self.config.weekend_mode = m;
+                self.mode_err = None;
+            }
+            Err(e) => {
+                self.mode_err = Some(e.to_string());
+            }
+        }
         self
     }
 
-    /// Sets the weekend curfew mode using a typed [`crate::curfew::WeekendMode`].
+    /// Sets the weekend curfew mode using a typed [`WeekendMode`].
     #[must_use]
-    pub fn weekend_mode_typed(mut self, mode: crate::curfew::WeekendMode) -> Self {
-        self.config.weekend_mode = match mode {
-            crate::curfew::WeekendMode::Short => "short".to_string(),
-            crate::curfew::WeekendMode::Weekend => "weekend".to_string(),
-        };
+    pub fn weekend_mode_typed(mut self, mode: WeekendMode) -> Self {
+        self.config.weekend_mode = mode;
+        self.mode_err = None;
         self
     }
 
@@ -430,23 +461,14 @@ impl RedFolderConfigBuilder {
         self
     }
 
-    /// Sets the policy for data loss or stale calendar handling ([`crate::types::FailSafeMode`]).
+    /// Sets the policy for data loss or stale calendar handling ([`FailSafeMode`]).
     #[must_use]
-    pub fn fail_safe_mode(mut self, mode: crate::types::FailSafeMode) -> Self {
+    pub fn fail_safe_mode(mut self, mode: FailSafeMode) -> Self {
         self.config.fail_safe_mode = mode;
         self
     }
 
     /// Builds the configuration, panicking if parameters fail validation.
-    ///
-    /// # Panics
-    ///
-    /// Panics if configuration validation fails (e.g., empty currencies/impacts,
-    /// negative durations, or malformed curfew timestamps).
-    ///
-    /// For production use cases where configuration is loaded from untrusted external sources
-    /// (environment variables, TOML/JSON files, user input), prefer [`try_build`](Self::try_build)
-    /// to handle validation errors gracefully without panicking.
     #[must_use]
     pub fn build(self) -> RedFolderConfig {
         self.try_build().expect(
@@ -455,19 +477,19 @@ impl RedFolderConfigBuilder {
     }
 
     /// Validates and builds the configuration safely without panicking.
-    ///
-    /// Recommended for production applications to handle runtime configuration errors gracefully.
     pub fn try_build(self) -> crate::error::Result<RedFolderConfig> {
+        if let Some(err) = self.mode_err {
+            return Err(crate::error::RedFolderError::Curfew(err));
+        }
         self.config.validate()?;
         Ok(self.config)
     }
 
     /// Validates strictly and builds the configuration safely without panicking.
-    ///
-    /// Ensures that only standard known currency codes (USD, EUR, GBP, JPY, AUD, CAD, CHF, NZD, CNY, ALL)
-    /// and standard impact levels (High, Medium, Low, Non-Economic) are accepted.
-    /// Rejects non-standard currencies or typos (e.g. `"USDD"`).
     pub fn try_build_strict(self) -> crate::error::Result<RedFolderConfig> {
+        if let Some(err) = self.mode_err {
+            return Err(crate::error::RedFolderError::Curfew(err));
+        }
         self.config.validate_strict()?;
         Ok(self.config)
     }
@@ -480,9 +502,6 @@ impl RedFolderConfigBuilder {
         )
     }
 }
-
-/// Backwards compatibility alias for `RedFolderConfig`.
-pub type NewsConfig = RedFolderConfig;
 
 #[cfg(test)]
 mod tests {

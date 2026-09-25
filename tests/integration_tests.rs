@@ -1999,3 +1999,339 @@ async fn test_prop_firm_strict_defaults_to_fail_closed() {
     let notif = rx.try_recv().expect("must receive notification");
     assert!(notif.active);
 }
+
+#[test]
+fn test_back_to_back_news_merge() {
+    let now = Utc::now();
+    // Two high-impact releases: CPI at T+60m, FOMC at T+100m (40 minutes apart)
+    let raw = vec![
+        redfolder::RawCalendarEvent {
+            title: "US CPI Release".into(),
+            country: "USD".into(),
+            date: (now + Duration::minutes(60)).to_rfc3339(),
+            time: "".into(),
+            impact: "High".into(),
+        },
+        redfolder::RawCalendarEvent {
+            title: "FOMC Rate Decision".into(),
+            country: "USD".into(),
+            date: (now + Duration::minutes(100)).to_rfc3339(),
+            time: "".into(),
+            impact: "High".into(),
+        },
+    ];
+
+    let config = RedFolderConfig::builder()
+        .currencies(vec![Currency::USD])
+        .impacts(vec![Impact::High])
+        .buffer_minutes(30, 30) // CPI: [T+30, T+90], FOMC: [T+70, T+130]
+        .merge_threshold(15) // Overlap from T+70 to T+90 -> single continuous window
+        .weekend_curfew(false, "20:00", "21:00", "short")
+        .build();
+
+    let engine = BlackoutEngine::compile(&raw, &[&config], now);
+    let windows = engine.windows_for_config(&config, now);
+
+    assert_eq!(
+        windows.len(),
+        1,
+        "overlapping back-to-back releases must merge into a single window"
+    );
+    let merged = &windows[0];
+    assert_eq!(merged.events.len(), 2);
+    assert_eq!(merged.start, now + Duration::minutes(30));
+    assert_eq!(merged.end, now + Duration::minutes(130));
+    assert_eq!(merged.duration_minutes(), 100);
+
+    // Verify binary search status accessor at the midpoint (T+80m, between the two release times)
+    let mid_point = now + Duration::minutes(80);
+    assert!(engine.is_blackout_at(&config, mid_point));
+    let active_win = engine
+        .status_at(&config, mid_point)
+        .expect("must be in blackout");
+    assert_eq!(active_win.events.len(), 2);
+}
+
+#[test]
+fn test_weekend_and_economic_overlap() {
+    // Friday night economic event right before curfew
+    let (curfew_start, curfew_end) =
+        redfolder::curfew::next_weekend_window("20:30", "21:00", "weekend").unwrap();
+    let news_time = curfew_start - Duration::minutes(10); // 20:20 UTC
+
+    let raw = vec![redfolder::RawCalendarEvent {
+        title: "Federal Reserve Emergency Briefing".into(),
+        country: "USD".into(),
+        date: news_time.to_rfc3339(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+
+    let config = RedFolderConfig::builder()
+        .currencies(vec![Currency::USD])
+        .impacts(vec![Impact::High])
+        .buffer_minutes(20, 20) // News window: 20:00 UTC to 20:40 UTC
+        .merge_threshold(15) // Curfew starts at 20:30 UTC -> overlaps news window by 10 minutes
+        .weekend_curfew(true, "20:30", "21:00", "weekend")
+        .build();
+
+    let engine = BlackoutEngine::compile(&raw, &[&config], news_time - Duration::hours(1));
+    let windows = engine.windows_for_config(&config, news_time - Duration::hours(1));
+
+    assert_eq!(
+        windows.len(),
+        1,
+        "news and weekend curfew must merge seamlessly"
+    );
+    let window = &windows[0];
+    // Must begin at news window start (20:00) and extend until Monday close (curfew_end)
+    assert_eq!(window.start, news_time - Duration::minutes(20));
+    assert_eq!(window.end, curfew_end);
+    assert!(window
+        .events
+        .iter()
+        .any(|e| e.title.contains("Federal Reserve Emergency Briefing")));
+    assert!(window.events.iter().any(|e| e.is_weekend_curfew()));
+
+    // Verify continuous blackout at the transition boundary (20:35 UTC)
+    let transition_point = curfew_start + Duration::minutes(5);
+    assert!(engine.is_blackout_at(&config, transition_point));
+}
+
+#[tokio::test]
+async fn test_stale_calendar_fail_open() {
+    // Stale calendar data with FailOpen policy: trades must NOT be blocked
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+
+    // Create an expired cache file (2 hours old, max allowed is 30 mins)
+    let client = redfolder::CalendarClient::new(Some(cache_dir.clone()))
+        .with_max_stale_age(Some(std::time::Duration::from_secs(1800)));
+
+    let past_events = vec![redfolder::RawCalendarEvent {
+        title: "Historical Past Event".into(),
+        country: "USD".into(),
+        date: (Utc::now() - Duration::hours(5)).to_rfc3339(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+    client.save_cache(&past_events).unwrap();
+
+    // Manually set cache metadata to 2 hours ago
+    let metadata_path = cache_dir.join("economic_calendar_metadata.json");
+    let stale_meta = serde_json::json!({
+        "fetched_at": (Utc::now() - Duration::hours(2)).to_rfc3339(),
+        "total_events": 1,
+        "source_url": "http://127.0.0.1/test",
+        "sha256": "dummy"
+    });
+    std::fs::write(&metadata_path, stale_meta.to_string()).unwrap();
+
+    let service = RedFolderService::with_client(client);
+    let fail_open_cfg = RedFolderConfig::builder()
+        .currencies(vec![Currency::USD])
+        .impacts(vec![Impact::High])
+        .fail_safe_mode(FailSafeMode::FailOpen)
+        .weekend_curfew(false, "20:00", "21:00", "short")
+        .build();
+
+    service
+        .register_worker("fail_open_trader", fail_open_cfg)
+        .await
+        .expect("registered");
+
+    // Staleness is detected, but FailOpen keeps trading active (NOT in blackout)
+    assert!(service.is_calendar_stale().await);
+    assert!(!service.is_blackout("fail_open_trader").await);
+    assert!(service.current_window("fail_open_trader").await.is_none());
+}
+
+#[tokio::test]
+async fn test_stale_calendar_fail_closed() {
+    // Stale calendar data with FailClosed policy (Prop firm mode): trading must be defensively halted
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+
+    let client = redfolder::CalendarClient::new(Some(cache_dir.clone()))
+        .with_max_stale_age(Some(std::time::Duration::from_secs(1800)));
+
+    let past_events = vec![redfolder::RawCalendarEvent {
+        title: "Past Release".into(),
+        country: "USD".into(),
+        date: (Utc::now() - Duration::hours(5)).to_rfc3339(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+    client.save_cache(&past_events).unwrap();
+
+    let metadata_path = cache_dir.join("economic_calendar_metadata.json");
+    let stale_meta = serde_json::json!({
+        "fetched_at": (Utc::now() - Duration::hours(2)).to_rfc3339(),
+        "total_events": 1,
+        "source_url": "http://127.0.0.1/test",
+        "sha256": "dummy"
+    });
+    std::fs::write(&metadata_path, stale_meta.to_string()).unwrap();
+
+    let service = RedFolderService::with_client(client);
+    let prop_cfg = RedFolderConfig::prop_firm_strict(); // Defaults to FailClosed
+
+    let mut rx = service
+        .register_worker("prop_firm_trader", prop_cfg)
+        .await
+        .expect("registered");
+
+    assert!(service.is_calendar_stale().await);
+    // Under FailClosed, worker MUST enter emergency blackout
+    assert!(service.is_blackout("prop_firm_trader").await);
+    let win = service
+        .current_window("prop_firm_trader")
+        .await
+        .expect("must have active blackout");
+    assert!(win.summary_title().contains("Fail-Closed Safety Blackout"));
+
+    let notif = rx.try_recv().expect("must receive notification");
+    assert!(notif.active);
+}
+
+#[test]
+fn test_dst_transition() {
+    // Daylight Saving Time test for America/New_York (US Eastern Time)
+    let ny_tz: chrono_tz::Tz = "America/New_York".parse().unwrap();
+
+    // 1. Spring-Forward Gap: 2026-03-08 02:30:00 does not exist in local time (clocks jump 02:00 -> 03:00)
+    // The calendar parser shifts forward to 03:30 EDT (07:30 UTC)
+    let spring_raw = redfolder::RawCalendarEvent {
+        title: "Spring Forward Event".into(),
+        country: "USD".into(),
+        date: "2026-03-08".into(),
+        time: "2:30am".into(),
+        impact: "High".into(),
+    };
+    let spring_timing = redfolder::calendar::parse_event_timing(&spring_raw, Some(ny_tz))
+        .expect("spring-forward gap must resolve to valid UTC instant");
+    let spring_utc = spring_timing.exact_time().unwrap();
+    // 03:30 EDT is UTC-4 -> 07:30 UTC
+    assert_eq!(
+        spring_utc.format("%Y-%m-%d %H:%M UTC").to_string(),
+        "2026-03-08 07:30 UTC"
+    );
+
+    // 2. Fall-Back Ambiguity: 2026-11-01 01:30:00 occurs twice (clocks fall back from 02:00 -> 01:00)
+    // Must resolve deterministically to the earliest valid daylight instant (05:30 UTC)
+    let fall_raw = redfolder::RawCalendarEvent {
+        title: "Fall Back Release".into(),
+        country: "USD".into(),
+        date: "2026-11-01".into(),
+        time: "1:30am".into(),
+        impact: "High".into(),
+    };
+    let fall_timing = redfolder::calendar::parse_event_timing(&fall_raw, Some(ny_tz))
+        .expect("ambiguous fall-back time must resolve deterministically");
+    let fall_utc = fall_timing.exact_time().unwrap();
+    // Earliest 01:30 is EDT (UTC-4) -> 05:30 UTC
+    assert_eq!(
+        fall_utc.format("%Y-%m-%d %H:%M UTC").to_string(),
+        "2026-11-01 05:30 UTC"
+    );
+
+    // 3. Compile blackout window around DST transition
+    let cfg = RedFolderConfig::builder()
+        .currencies(vec![Currency::USD])
+        .impacts(vec![Impact::High])
+        .buffer_minutes(15, 15)
+        .weekend_curfew(false, "20:00", "21:00", "short")
+        .build();
+
+    let engine = BlackoutEngine::compile_with_tz(
+        &[spring_raw, fall_raw],
+        &[&cfg],
+        spring_utc - Duration::hours(1),
+        Some(ny_tz),
+    );
+
+    // Active exactly during the spring buffer [07:15, 07:45 UTC]
+    assert!(engine.is_blackout_at(&cfg, spring_utc));
+    assert!(engine.is_blackout_at(&cfg, spring_utc - Duration::minutes(10)));
+    assert!(!engine.is_blackout_at(&cfg, spring_utc - Duration::minutes(20)));
+}
+
+#[cfg(feature = "cli")]
+#[tokio::test]
+async fn test_cli_binary_execution() {
+    let bin_path = env!("CARGO_BIN_EXE_redfolder");
+
+    // 1. --help check
+    let output = std::process::Command::new(bin_path)
+        .arg("--help")
+        .output()
+        .expect("failed to execute redfolder binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("[OPTIONS] <COMMAND>"));
+    assert!(stdout.contains("status"));
+    assert!(stdout.contains("upcoming"));
+    assert!(stdout.contains("sync"));
+    assert!(stdout.contains("watch"));
+
+    // 2. --version check
+    let output = std::process::Command::new(bin_path)
+        .arg("--version")
+        .output()
+        .expect("failed to execute redfolder binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("1.0.0"));
+
+    // 3. status --json with isolated cache dir
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+    let client = redfolder::CalendarClient::new(Some(cache_dir.clone()));
+    let future_event = redfolder::RawCalendarEvent {
+        title: "Federal Funds Rate".into(),
+        country: "USD".into(),
+        date: (Utc::now() + Duration::hours(1)).to_rfc3339(),
+        time: "".into(),
+        impact: "High".into(),
+    };
+    client.save_cache(&[future_event]).unwrap();
+
+    let output = std::process::Command::new(bin_path)
+        .args([
+            "--cache-dir",
+            cache_dir.to_str().unwrap(),
+            "status",
+            "--currency",
+            "USD",
+            "--json",
+        ])
+        .output()
+        .expect("failed to execute status subcommand");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json_val: serde_json::Value = serde_json::from_str(&stdout).expect("valid json output");
+    assert_eq!(json_val["currency"], "USD");
+    assert_eq!(json_val["in_blackout"], false);
+
+    // 4. upcoming --json with isolated cache dir
+    let output = std::process::Command::new(bin_path)
+        .args([
+            "--cache-dir",
+            cache_dir.to_str().unwrap(),
+            "upcoming",
+            "--hours",
+            "24",
+            "--currency",
+            "USD",
+            "--json",
+        ])
+        .output()
+        .expect("failed to execute upcoming subcommand");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json_arr: Vec<serde_json::Value> = serde_json::from_str(&stdout).expect("valid json array");
+    assert!(
+        !json_arr.is_empty(),
+        "upcoming should return compiled blackout window"
+    );
+}

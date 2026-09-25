@@ -1,8 +1,7 @@
 use crate::calendar::{parse_event_timing, RawCalendarEvent};
 use crate::config::RedFolderConfig;
-use crate::curfew::{weekend_window_at, weekend_window_title};
 use crate::types::{
-    BlackoutWindow, Currency, CustomEventKind, EconomicEvent, EventTiming, Impact, WindowEvent,
+    BlackoutWindow, CustomEventKind, EconomicEvent, EventTiming, Impact, WindowEvent,
 };
 use chrono::{DateTime, Duration, Utc};
 use tracing::{error, info};
@@ -295,18 +294,18 @@ impl BlackoutEngine {
 
         // 2. Add weekend curfew if enabled for this worker
         if config.weekend_enabled {
-            match weekend_window_at(
+            match crate::curfew::weekend_window_for_mode(
                 now,
                 &config.weekend_start,
                 &config.weekend_end,
-                &config.weekend_mode,
+                config.weekend_mode,
             ) {
                 Ok((start, end)) => {
                     if end >= now {
-                        let title = weekend_window_title(
+                        let title = crate::curfew::weekend_window_title_for_mode(
                             &config.weekend_start,
                             &config.weekend_end,
-                            &config.weekend_mode,
+                            config.weekend_mode,
                         );
                         individual.push((
                             start,
@@ -327,7 +326,7 @@ impl BlackoutEngine {
                         err = %err,
                         start = %config.weekend_start,
                         end = %config.weekend_end,
-                        mode = %config.weekend_mode,
+                        mode = ?config.weekend_mode,
                         "failed to calculate weekend curfew window; check configuration"
                     );
                 }
@@ -394,7 +393,7 @@ impl BlackoutEngine {
             return false;
         }
         let windows = self.windows_for_config(config, time);
-        windows.iter().any(|w| w.is_active_at(time))
+        find_window_binary_search(&windows, time).is_some()
     }
 
     /// Returns the active `BlackoutWindow` matching the configuration, if any.
@@ -414,7 +413,7 @@ impl BlackoutEngine {
             return None;
         }
         let windows = self.windows_for_config(config, time);
-        windows.into_iter().find(|w| w.is_active_at(time))
+        find_window_binary_search(&windows, time).cloned()
     }
 
     /// Returns the active `BlackoutWindow` matching the configuration, if any.
@@ -453,6 +452,32 @@ impl BlackoutEngine {
     }
 }
 
+/// Binary search for an active blackout window covering `time` in a sorted, non-overlapping slice of windows.
+///
+/// Returns `Some(&window)` if `time` falls between `window.start` and `window.end` (inclusive), or `None` otherwise.
+/// Runs in $O(\log n)$ time.
+#[must_use]
+pub fn find_window_binary_search(
+    windows: &[BlackoutWindow],
+    time: DateTime<Utc>,
+) -> Option<&BlackoutWindow> {
+    if windows.is_empty() {
+        return None;
+    }
+    match windows.binary_search_by(|w| {
+        if time < w.start {
+            std::cmp::Ordering::Greater
+        } else if time > w.end {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    }) {
+        Ok(idx) => Some(&windows[idx]),
+        Err(_) => None,
+    }
+}
+
 /// Evaluates whether any window in `windows` is active for `config` at `at`.
 #[must_use]
 pub fn is_blackout_for_config(
@@ -464,6 +489,14 @@ pub fn is_blackout_for_config(
         return false;
     }
 
+    if let Some(window) = find_window_binary_search(windows, at) {
+        return window
+            .events
+            .iter()
+            .any(|e| event_matches_config(e, config));
+    }
+
+    // Fallback linear scan if windows slice was unsorted
     for window in windows {
         if window.is_active_at(at) {
             for event in &window.events {
@@ -487,6 +520,24 @@ pub fn current_window_for_config(
         return None;
     }
 
+    if let Some(window) = find_window_binary_search(windows, at) {
+        let matching: Vec<WindowEvent> = window
+            .events
+            .iter()
+            .filter(|e| event_matches_config(e, config))
+            .cloned()
+            .collect();
+
+        if !matching.is_empty() {
+            return Some(BlackoutWindow {
+                start: window.start,
+                end: window.end,
+                events: matching,
+            });
+        }
+    }
+
+    // Fallback linear scan if windows slice was unsorted
     for window in windows {
         if window.is_active_at(at) {
             let matching: Vec<WindowEvent> = window
@@ -513,15 +564,15 @@ pub fn current_window_for_config(
 pub fn event_matches_economic_event(event: &EconomicEvent, config: &RedFolderConfig) -> bool {
     let currency_match = event.country.eq_ignore_ascii_case("All")
         || event.country.eq_ignore_ascii_case("Global")
-        || config.currencies.iter().any(|c| {
-            let cfg_c: Currency = c.parse().unwrap();
-            cfg_c.matches_str(&event.country)
-        });
+        || config
+            .currencies
+            .iter()
+            .any(|c| c.matches_str(&event.country));
     let event_impact: Impact = event.impact.parse().unwrap();
-    let impact_match = config.impacts.iter().any(|i| {
-        let cfg_i: Impact = i.parse().unwrap();
-        cfg_i == event_impact || cfg_i.matches_str(&event.impact)
-    });
+    let impact_match = config
+        .impacts
+        .iter()
+        .any(|i| *i == event_impact || i.matches_str(&event.impact));
 
     currency_match && impact_match
 }
@@ -543,15 +594,15 @@ pub fn event_matches_config(event: &WindowEvent, config: &RedFolderConfig) -> bo
     } else {
         let currency_match = event.country.eq_ignore_ascii_case("All")
             || event.country.eq_ignore_ascii_case("Global")
-            || config.currencies.iter().any(|c| {
-                let cfg_c: Currency = c.parse().unwrap();
-                cfg_c.matches_str(&event.country)
-            });
+            || config
+                .currencies
+                .iter()
+                .any(|c| c.matches_str(&event.country));
         let event_impact: Impact = event.impact.parse().unwrap();
-        let impact_match = config.impacts.iter().any(|i| {
-            let cfg_i: Impact = i.parse().unwrap();
-            cfg_i == event_impact || cfg_i.matches_str(&event.impact)
-        });
+        let impact_match = config
+            .impacts
+            .iter()
+            .any(|i| *i == event_impact || i.matches_str(&event.impact));
 
         currency_match && impact_match
     }

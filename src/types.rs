@@ -117,6 +117,30 @@ impl AsRef<str> for Currency {
     }
 }
 
+impl PartialEq<&str> for Currency {
+    fn eq(&self, other: &&str) -> bool {
+        self.matches_str(other)
+    }
+}
+
+impl PartialEq<Currency> for &str {
+    fn eq(&self, other: &Currency) -> bool {
+        other.matches_str(self)
+    }
+}
+
+impl PartialEq<String> for Currency {
+    fn eq(&self, other: &String) -> bool {
+        self.matches_str(other)
+    }
+}
+
+impl PartialEq<Currency> for String {
+    fn eq(&self, other: &Currency) -> bool {
+        other.matches_str(self)
+    }
+}
+
 /// Impact severity level of an economic event.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Impact {
@@ -173,6 +197,12 @@ impl From<&str> for Impact {
     }
 }
 
+impl From<String> for Impact {
+    fn from(s: String) -> Self {
+        s.as_str().into()
+    }
+}
+
 impl fmt::Display for Impact {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -182,6 +212,42 @@ impl fmt::Display for Impact {
             Impact::NonEconomic => write!(f, "Non-Economic"),
             Impact::Custom(s) => write!(f, "{}", s),
         }
+    }
+}
+
+impl AsRef<str> for Impact {
+    fn as_ref(&self) -> &str {
+        match self {
+            Impact::High => "High",
+            Impact::Medium => "Medium",
+            Impact::Low => "Low",
+            Impact::NonEconomic => "Non-Economic",
+            Impact::Custom(s) => s.as_str(),
+        }
+    }
+}
+
+impl PartialEq<&str> for Impact {
+    fn eq(&self, other: &&str) -> bool {
+        self.matches_str(other)
+    }
+}
+
+impl PartialEq<Impact> for &str {
+    fn eq(&self, other: &Impact) -> bool {
+        other.matches_str(self)
+    }
+}
+
+impl PartialEq<String> for Impact {
+    fn eq(&self, other: &String) -> bool {
+        self.matches_str(other)
+    }
+}
+
+impl PartialEq<Impact> for String {
+    fn eq(&self, other: &Impact) -> bool {
+        other.matches_str(self)
     }
 }
 
@@ -277,9 +343,6 @@ impl EconomicEvent {
         self.timing.exact_time()
     }
 }
-
-/// Backwards compatibility alias for `EconomicEvent`.
-pub type NewsEvent = EconomicEvent;
 
 /// Classification discriminant for synthetic or custom-generated blackout events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

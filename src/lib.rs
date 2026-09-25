@@ -19,20 +19,21 @@ pub use calendar::{
     CacheMetadata, CachedCalendarData, CalendarClient, RawCalendarEvent, CALENDAR_URL,
     DEFAULT_CACHE_FILENAME,
 };
-pub use config::{NewsConfig, RedFolderConfig, RedFolderConfigBuilder};
+pub use config::{RedFolderConfig, RedFolderConfigBuilder};
 pub use curfew::{
-    next_weekend_window, parse_time, weekend_window_at, weekend_window_title, WeekendMode,
+    next_weekend_window, parse_time, weekend_window_at, weekend_window_for_mode,
+    weekend_window_title, weekend_window_title_for_mode, WeekendMode,
 };
 pub use engine::{
     current_window_for_config, event_matches_config, event_matches_economic_event,
-    is_blackout_for_config, BlackoutEngine,
+    find_window_binary_search, is_blackout_for_config, BlackoutEngine,
 };
 pub use error::{RedFolderError, Result};
 pub use events::{EventListener, RedFolderEvent};
-pub use service::{NewsBlackoutService, RedFolderService};
+pub use service::RedFolderService;
 pub use types::{
     BlackoutNotification, BlackoutWindow, Currency, CustomEventKind, EconomicEvent, EventTiming,
-    FailSafeMode, Impact, NewsEvent, WindowEvent,
+    FailSafeMode, Impact, WindowEvent,
 };
 
 /// Common prelude items for quick import.

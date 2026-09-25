@@ -5,13 +5,63 @@ use std::fmt;
 use std::str::FromStr;
 
 /// Mode for weekend market close curfew windows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum WeekendMode {
+    #[serde(alias = "Short", alias = "SHORT")]
     /// Window ends at the configured end time on Friday evening.
+    #[default]
     Short,
+    #[serde(alias = "Weekend", alias = "WEEKEND")]
     /// Window extends throughout the entire weekend until Monday 00:00 UTC.
     Weekend,
+}
+
+impl AsRef<str> for WeekendMode {
+    fn as_ref(&self) -> &str {
+        match self {
+            WeekendMode::Short => "short",
+            WeekendMode::Weekend => "weekend",
+        }
+    }
+}
+
+impl PartialEq<&str> for WeekendMode {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_ref().eq_ignore_ascii_case(other)
+    }
+}
+
+impl PartialEq<WeekendMode> for &str {
+    fn eq(&self, other: &WeekendMode) -> bool {
+        other.eq(self)
+    }
+}
+
+impl PartialEq<String> for WeekendMode {
+    fn eq(&self, other: &String) -> bool {
+        self.as_ref().eq_ignore_ascii_case(other)
+    }
+}
+
+impl PartialEq<WeekendMode> for String {
+    fn eq(&self, other: &WeekendMode) -> bool {
+        other.eq(self)
+    }
+}
+
+impl TryFrom<&str> for WeekendMode {
+    type Error = RedFolderError;
+    fn try_from(s: &str) -> Result<Self> {
+        s.parse()
+    }
+}
+
+impl TryFrom<String> for WeekendMode {
+    type Error = RedFolderError;
+    fn try_from(s: String) -> Result<Self> {
+        s.parse()
+    }
 }
 
 impl fmt::Display for WeekendMode {
@@ -64,23 +114,14 @@ pub fn parse_time(s: &str) -> Result<(u32, u32)> {
     Err(RedFolderError::ParseTime(s.to_string()))
 }
 
-/// Calculates the weekend market close blackout window for a given timestamp.
-///
-/// If `at` is currently inside the active weekend window, returns that active window.
-/// If `at` is outside (or past) the previous window, returns the next upcoming window.
-///
-/// - `at`: The evaluation timestamp in UTC (enables 100% deterministic queries/backtesting).
-/// - `start_str`: Time in UTC when curfew begins on Friday (e.g. "20:30").
-/// - `end_str`: Time in UTC when curfew ends on Friday (or Saturday if cross-midnight) for "short" mode.
-/// - `mode`: "short" or "weekend" (runs through to Monday 00:00 UTC).
-pub fn weekend_window_at(
+/// Calculates the weekend market close blackout window for a given timestamp and typed mode.
+pub fn weekend_window_for_mode(
     at: DateTime<Utc>,
     start_str: &str,
     end_str: &str,
-    mode: &str,
+    mode: WeekendMode,
 ) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
     let (sh, sm) = parse_time(start_str)?;
-    let parsed_mode: WeekendMode = mode.parse()?;
 
     // Monday = 0 .. Friday = 4 .. Sunday = 6
     let weekday_num = at.weekday().num_days_from_monday() as i64;
@@ -94,7 +135,7 @@ pub fn weekend_window_at(
         Utc,
     );
 
-    let recent_end = match parsed_mode {
+    let recent_end = match mode {
         WeekendMode::Weekend => {
             let monday_date = recent_friday + Duration::days(3);
             DateTime::<Utc>::from_naive_utc_and_offset(
@@ -133,6 +174,25 @@ pub fn weekend_window_at(
     }
 }
 
+/// Calculates the weekend market close blackout window for a given timestamp.
+///
+/// If `at` is currently inside the active weekend window, returns that active window.
+/// If `at` is outside (or past) the previous window, returns the next upcoming window.
+///
+/// - `at`: The evaluation timestamp in UTC (enables 100% deterministic queries/backtesting).
+/// - `start_str`: Time in UTC when curfew begins on Friday (e.g. "20:30").
+/// - `end_str`: Time in UTC when curfew ends on Friday (or Saturday if cross-midnight) for "short" mode.
+/// - `mode`: "short" or "weekend" (runs through to Monday 00:00 UTC).
+pub fn weekend_window_at(
+    at: DateTime<Utc>,
+    start_str: &str,
+    end_str: &str,
+    mode: &str,
+) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+    let parsed_mode: WeekendMode = mode.parse()?;
+    weekend_window_for_mode(at, start_str, end_str, parsed_mode)
+}
+
 /// Calculates the next weekend market close blackout window based on current UTC time.
 ///
 /// Backwards-compatible convenience wrapper around [`weekend_window_at`].
@@ -144,14 +204,20 @@ pub fn next_weekend_window(
     weekend_window_at(Utc::now(), start_str, end_str, mode)
 }
 
+/// Helper that generates human-readable description for typed weekend curfew mode.
+#[must_use]
+pub fn weekend_window_title_for_mode(start_str: &str, end_str: &str, mode: WeekendMode) -> String {
+    match mode {
+        WeekendMode::Weekend => "Weekend Blackout (Market Close)".to_string(),
+        WeekendMode::Short => format!("Weekend Curfew ({start_str}-{end_str} UTC)"),
+    }
+}
+
 /// Helper that generates human-readable description for weekend curfew.
 #[must_use]
 pub fn weekend_window_title(start_str: &str, end_str: &str, mode: &str) -> String {
-    if mode.eq_ignore_ascii_case("weekend") {
-        "Weekend Blackout (Market Close)".to_string()
-    } else {
-        format!("Weekend Curfew ({start_str}-{end_str} UTC)")
-    }
+    let m: WeekendMode = mode.parse().unwrap_or(WeekendMode::Short);
+    weekend_window_title_for_mode(start_str, end_str, m)
 }
 
 #[cfg(test)]

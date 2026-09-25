@@ -85,7 +85,7 @@ redfolder/
 ├── src/
 │   ├── lib.rs                 # Library entry point and public re-exports
 │   ├── calendar.rs            # FairEconomy HTTP client, cache fallback, DST parsing
-│   ├── config.rs              # RedFolderConfig, NewsConfig, and builders
+│   ├── config.rs              # RedFolderConfig and builders
 │   ├── curfew.rs              # Weekend market close calculation (short/weekend modes)
 │   ├── engine.rs              # In-memory interval compiler and window merge engine
 │   ├── error.rs               # RedFolderError enumeration via thiserror

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, Mutex, Notify};
+use tokio::sync::{broadcast, mpsc, Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -36,46 +36,131 @@ struct WorkerState {
     last_warned_window_start: Option<DateTime<Utc>>,
 }
 
-/// Internal mutable state protected by an async mutex.
-struct ServiceInner {
-    workers: HashMap<String, WorkerState>,
-    engine: BlackoutEngine,
-    last_fetch_date: Option<NaiveDate>,
+/// Internal synchronization and client metadata protected by an async Mutex.
+struct ServiceSyncMeta {
     client: CalendarClient,
     check_interval: std::time::Duration,
-    broadcast_tx: broadcast::Sender<RedFolderEvent>,
-    listeners: Vec<Arc<dyn EventListener>>,
     state: ServiceState,
-    notify: Arc<Notify>,
+    last_fetch_date: Option<NaiveDate>,
     last_sync_time: Option<DateTime<Utc>>,
     last_sync_error: Option<String>,
 }
 
-impl ServiceInner {
-    fn new(
-        client: CalendarClient,
-        check_interval: std::time::Duration,
-        broadcast_tx: broadcast::Sender<RedFolderEvent>,
-        notify: Arc<Notify>,
-    ) -> Self {
+/// Async service that orchestrates daily economic calendar synchronization and event-driven blackout alerts.
+///
+/// Features:
+/// - Granular split locking model (`RwLock` for `engine`, `workers`, and `listeners`; `Mutex` for sync metadata)
+///   to ensure high-throughput concurrent evaluation and status queries without lock contention across workers.
+/// - Event-driven architecture with broadcast channels (`subscribe()`) and concurrent listener callbacks.
+/// - Early warning notifications before blackout periods commence.
+/// - Background daily refresh at midnight UTC with automatic disk fallback.
+/// - Transition-driven background evaluation loop dispatching alerts at exact start and end timestamps.
+/// - Multi-worker independent registration with dedicated typed streams.
+/// - Deterministic lifecycle management with `CancellationToken` and tracked join handles.
+#[derive(Clone)]
+pub struct RedFolderService {
+    engine: Arc<RwLock<BlackoutEngine>>,
+    workers: Arc<RwLock<HashMap<String, WorkerState>>>,
+    listeners: Arc<RwLock<Vec<Arc<dyn EventListener>>>>,
+    sync_meta: Arc<Mutex<ServiceSyncMeta>>,
+    refresh_lock: Arc<Mutex<()>>,
+    broadcast_tx: broadcast::Sender<RedFolderEvent>,
+    cancel_token: Arc<Mutex<Option<CancellationToken>>>,
+    task_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    notify: Arc<Notify>,
+}
+
+/// Minimum allowable check interval for periodic evaluation to prevent CPU busy loops.
+pub const MIN_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+impl RedFolderService {
+    /// Create a new `RedFolderService` with an optional cache directory.
+    pub fn new(cache_dir: Option<PathBuf>) -> Self {
+        Self::with_client(CalendarClient::new(cache_dir))
+    }
+
+    /// Create with an existing `CalendarClient`.
+    pub fn with_client(client: CalendarClient) -> Self {
+        let (broadcast_tx, _) = broadcast::channel(256);
+        let notify = Arc::new(Notify::new());
         Self {
-            workers: HashMap::new(),
-            engine: BlackoutEngine::new(),
-            last_fetch_date: None,
-            client,
-            check_interval,
+            engine: Arc::new(RwLock::new(BlackoutEngine::new())),
+            workers: Arc::new(RwLock::new(HashMap::new())),
+            listeners: Arc::new(RwLock::new(Vec::new())),
+            sync_meta: Arc::new(Mutex::new(ServiceSyncMeta {
+                client,
+                check_interval: std::time::Duration::from_secs(15),
+                state: ServiceState::Stopped,
+                last_fetch_date: None,
+                last_sync_time: None,
+                last_sync_error: None,
+            })),
+            refresh_lock: Arc::new(Mutex::new(())),
             broadcast_tx,
-            listeners: Vec::new(),
-            state: ServiceState::Stopped,
+            cancel_token: Arc::new(Mutex::new(None)),
+            task_handles: Arc::new(Mutex::new(Vec::new())),
             notify,
-            last_sync_time: None,
-            last_sync_error: None,
         }
     }
 
-    fn check_calendar_staleness(&mut self) -> bool {
-        let is_stale = if let Some(last_sync) = self.last_sync_time {
-            if let Some(max_age) = self.client.max_stale_cache_age() {
+    /// Current lifecycle state of the service.
+    pub async fn state(&self) -> ServiceState {
+        self.sync_meta.lock().await.state
+    }
+
+    /// Subscribe to the global broadcast event bus.
+    ///
+    /// Any system component (e.g. risk manager, Telegram bot, MT5 bridge)
+    /// can receive a cloned stream of all `RedFolderEvent`s.
+    pub fn subscribe(&self) -> broadcast::Receiver<RedFolderEvent> {
+        self.broadcast_tx.subscribe()
+    }
+
+    /// Add an asynchronous event listener implementing `EventListener`.
+    pub async fn add_listener(&self, listener: Arc<dyn EventListener>) {
+        self.listeners.write().await.push(listener);
+    }
+
+    /// Configure the periodic evaluation loop frequency or watchdog interval.
+    ///
+    /// Returns an error if the requested interval is zero or less than [`MIN_CHECK_INTERVAL`] (100ms)
+    /// to prevent busy evaluation loops and excessive CPU consumption.
+    pub async fn set_check_interval(&self, interval: std::time::Duration) -> Result<()> {
+        if interval < MIN_CHECK_INTERVAL {
+            return Err(crate::error::RedFolderError::Config(format!(
+                "check interval must be at least {:?} (got {:?})",
+                MIN_CHECK_INTERVAL, interval
+            )));
+        }
+        self.sync_meta.lock().await.check_interval = interval;
+        self.notify.notify_waiters();
+        Ok(())
+    }
+
+    /// Manually trigger blackout evaluation and worker notifications immediately.
+    pub async fn evaluate_and_notify(&self) {
+        self.check_and_notify_workers().await;
+    }
+
+    /// Set an explicit `BlackoutEngine` instance for testing or simulation.
+    pub async fn set_engine(&self, engine: BlackoutEngine) {
+        *self.engine.write().await = engine;
+        self.notify.notify_waiters();
+    }
+
+    /// Checks if calendar data is considered stale based on configured maximum stale age.
+    pub async fn is_calendar_stale(&self) -> bool {
+        self.check_calendar_staleness().await
+    }
+
+    async fn check_calendar_staleness(&self) -> bool {
+        let (last_sync, max_age) = {
+            let meta = self.sync_meta.lock().await;
+            (meta.last_sync_time, meta.client.max_stale_cache_age())
+        };
+        let is_empty = self.engine.read().await.is_empty();
+        let is_stale = if let Some(last_sync) = last_sync {
+            if let Some(max_age) = max_age {
                 if let Ok(chrono_dur) = Duration::from_std(max_age) {
                     Utc::now() - last_sync > chrono_dur
                 } else {
@@ -85,22 +170,24 @@ impl ServiceInner {
                 false
             }
         } else {
-            self.engine.is_empty()
+            is_empty
         };
-        self.engine.set_stale(is_stale);
+        self.engine.write().await.set_stale(is_stale);
         is_stale
     }
 
     /// Evaluates blackout status and warnings for all registered workers,
     /// broadcasting domain events on transitions.
     /// Returns the earliest timestamp of the next expected state transition across all workers.
-    fn check_and_notify_workers(&mut self) -> Option<DateTime<Utc>> {
-        self.check_calendar_staleness();
+    pub async fn check_and_notify_workers(&self) -> Option<DateTime<Utc>> {
+        self.check_calendar_staleness().await;
 
-        if self.workers.is_empty() {
+        let mut workers = self.workers.write().await;
+        if workers.is_empty() {
             return None;
         }
 
+        let engine = self.engine.read().await;
         let now = Utc::now();
         let mut events_to_dispatch: Vec<RedFolderEvent> = Vec::new();
         let mut next_transition: Option<DateTime<Utc>> = None;
@@ -116,18 +203,18 @@ impl ServiceInner {
         };
 
         // 1. Check blackout active transitions and upcoming warnings per worker
-        for (worker_id, ws) in self.workers.iter_mut() {
+        for (worker_id, ws) in workers.iter_mut() {
             if !ws.config.enabled {
                 continue;
             }
 
-            let is_active = self.engine.is_blackout(&ws.config);
+            let is_active = engine.is_blackout(&ws.config);
 
             // State transition: Enter or Exit
             if is_active != ws.in_blackout {
                 ws.in_blackout = is_active;
                 let window = if is_active {
-                    self.engine.current_window(&ws.config)
+                    engine.current_window(&ws.config)
                 } else {
                     None
                 };
@@ -158,7 +245,6 @@ impl ServiceInner {
                     }
                 } else {
                     info!(worker=%worker_id, "EXITING news blackout window");
-                    // Send the actual window that concluded (or fallback dummy if none tracked)
                     let ended_window = ws.active_window.take().unwrap_or_else(|| BlackoutWindow {
                         start: now,
                         end: now,
@@ -181,7 +267,7 @@ impl ServiceInner {
                     update_next(&mut next_transition, w.end);
                 }
             } else {
-                let upcoming = self.engine.upcoming_blackouts(&ws.config, 24);
+                let upcoming = engine.upcoming_blackouts(&ws.config, 24);
                 if let Some(next_window) = upcoming.first() {
                     update_next(&mut next_transition, next_window.start);
 
@@ -214,18 +300,22 @@ impl ServiceInner {
             }
         }
 
+        drop(workers);
+        drop(engine);
+
         // 2. Dispatch events to global broadcast bus and registered event listeners (with timeout guard)
         for ev in events_to_dispatch {
-            self.dispatch_event(ev);
+            self.dispatch_event(ev).await;
         }
 
         next_transition
     }
 
     /// Dispatches an event to the global broadcast bus and registered event listeners.
-    fn dispatch_event(&self, event: RedFolderEvent) {
+    async fn dispatch_event(&self, event: RedFolderEvent) {
         self.broadcast_tx.send(event.clone()).ok();
-        for listener in &self.listeners {
+        let listeners_guard = self.listeners.read().await;
+        for listener in listeners_guard.iter() {
             let listener_clone = listener.clone();
             let ev_clone = event.clone();
             tokio::spawn(async move {
@@ -236,98 +326,6 @@ impl ServiceInner {
                 .await;
             });
         }
-    }
-}
-
-/// Async service that orchestrates daily economic calendar synchronization and event-driven blackout alerts.
-///
-/// Features:
-/// - Event-driven architecture with broadcast channels (`subscribe()`) and listener callbacks.
-/// - Early warning notifications before blackout periods commence.
-/// - Background daily refresh at midnight UTC with automatic disk fallback.
-/// - Transition-driven background evaluation loop dispatching alerts at exact start and end timestamps.
-/// - Multi-worker independent registration with dedicated typed streams.
-/// - Deterministic lifecycle management with `CancellationToken` and tracked join handles.
-pub struct RedFolderService {
-    inner: Arc<Mutex<ServiceInner>>,
-    refresh_lock: Arc<Mutex<()>>,
-    broadcast_tx: broadcast::Sender<RedFolderEvent>,
-    cancel_token: Arc<Mutex<Option<CancellationToken>>>,
-    task_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
-    notify: Arc<Notify>,
-}
-
-/// Minimum allowable check interval for periodic evaluation to prevent CPU busy loops.
-pub const MIN_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-
-impl RedFolderService {
-    /// Create a new `RedFolderService` with an optional cache directory.
-    pub fn new(cache_dir: Option<PathBuf>) -> Self {
-        Self::with_client(CalendarClient::new(cache_dir))
-    }
-
-    /// Create with an existing `CalendarClient`.
-    pub fn with_client(client: CalendarClient) -> Self {
-        let (broadcast_tx, _) = broadcast::channel(256);
-        let notify = Arc::new(Notify::new());
-        Self {
-            inner: Arc::new(Mutex::new(ServiceInner::new(
-                client,
-                std::time::Duration::from_secs(15),
-                broadcast_tx.clone(),
-                notify.clone(),
-            ))),
-            refresh_lock: Arc::new(Mutex::new(())),
-            broadcast_tx,
-            cancel_token: Arc::new(Mutex::new(None)),
-            task_handles: Arc::new(Mutex::new(Vec::new())),
-            notify,
-        }
-    }
-
-    /// Current lifecycle state of the service.
-    pub async fn state(&self) -> ServiceState {
-        self.inner.lock().await.state
-    }
-
-    /// Subscribe to the global broadcast event bus.
-    ///
-    /// Any system component (e.g. risk manager, Telegram bot, MT5 bridge)
-    /// can receive a cloned stream of all `RedFolderEvent`s.
-    pub fn subscribe(&self) -> broadcast::Receiver<RedFolderEvent> {
-        self.broadcast_tx.subscribe()
-    }
-
-    /// Add an asynchronous event listener implementing `EventListener`.
-    pub async fn add_listener(&self, listener: Arc<dyn EventListener>) {
-        self.inner.lock().await.listeners.push(listener);
-    }
-
-    /// Configure the periodic evaluation loop frequency or watchdog interval.
-    ///
-    /// Returns an error if the requested interval is zero or less than [`MIN_CHECK_INTERVAL`] (100ms)
-    /// to prevent busy evaluation loops and excessive CPU consumption.
-    pub async fn set_check_interval(&self, interval: std::time::Duration) -> Result<()> {
-        if interval < MIN_CHECK_INTERVAL {
-            return Err(crate::error::RedFolderError::Config(format!(
-                "check interval must be at least {:?} (got {:?})",
-                MIN_CHECK_INTERVAL, interval
-            )));
-        }
-        self.inner.lock().await.check_interval = interval;
-        self.notify.notify_waiters();
-        Ok(())
-    }
-
-    /// Manually trigger blackout evaluation and worker notifications immediately.
-    pub async fn evaluate_and_notify(&self) {
-        self.inner.lock().await.check_and_notify_workers();
-    }
-
-    /// Set an explicit `BlackoutEngine` instance for testing or simulation.
-    pub async fn set_engine(&self, engine: BlackoutEngine) {
-        self.inner.lock().await.engine = engine;
-        self.notify.notify_waiters();
     }
 
     /// Internal unified worker registration routine to ensure atomic registration and channel initialization.
@@ -342,8 +340,8 @@ impl RedFolderService {
         config.validate()?;
         let worker_id = worker_id.into();
 
-        let mut inner = self.inner.lock().await;
-        if inner.workers.contains_key(&worker_id) {
+        let mut workers = self.workers.write().await;
+        if workers.contains_key(&worker_id) {
             if allow_overwrite {
                 warn!(worker=%worker_id, "re-registering worker: overwriting previous worker state and channels");
             } else {
@@ -353,17 +351,19 @@ impl RedFolderService {
             }
         }
 
-        let is_active = inner.engine.is_blackout(&config);
+        let engine = self.engine.read().await;
+        let is_active = engine.is_blackout(&config);
         let active_window = if is_active {
-            inner.engine.current_window(&config)
+            engine.current_window(&config)
         } else {
             None
         };
+        drop(engine);
 
         let (state, rx) = setup(&worker_id, &config, is_active, active_window);
-        inner.workers.insert(worker_id.clone(), state);
+        workers.insert(worker_id.clone(), state);
+        drop(workers);
 
-        drop(inner);
         self.notify.notify_waiters();
 
         if allow_overwrite {
@@ -376,10 +376,6 @@ impl RedFolderService {
 
     /// Register a worker or trading strategy, returning a legacy `BlackoutNotification` receiver.
     /// Immediately notifies if worker is currently in blackout.
-    ///
-    /// Validates `config` before registering. If a worker with `worker_id` is already registered,
-    /// returns an error to prevent silent disconnection of existing receivers.
-    /// To deliberately update or replace a worker, use [`reregister_worker`](Self::reregister_worker).
     pub async fn register_worker(
         &self,
         worker_id: impl Into<String>,
@@ -415,10 +411,6 @@ impl RedFolderService {
 
     /// Register a worker or trading strategy, returning an event-driven `RedFolderEvent` receiver.
     /// Immediately notifies if worker is currently in blackout.
-    ///
-    /// Validates `config` before registering. If a worker with `worker_id` is already registered,
-    /// returns an error to prevent silent disconnection of existing receivers.
-    /// To deliberately update or replace a worker, use [`reregister_worker_events`](Self::reregister_worker_events).
     pub async fn register_worker_events(
         &self,
         worker_id: impl Into<String>,
@@ -528,15 +520,19 @@ impl RedFolderService {
 
     /// Unregister a worker by ID.
     pub async fn unregister_worker(&self, worker_id: &str) {
-        self.inner.lock().await.workers.remove(worker_id);
+        self.workers.write().await.remove(worker_id);
         self.notify.notify_waiters();
     }
 
     /// Returns the active and upcoming blackout windows derived specifically for the given worker.
     pub async fn windows_for_worker(&self, worker_id: &str) -> Vec<BlackoutWindow> {
-        let inner = self.inner.lock().await;
-        if let Some(w) = inner.workers.get(worker_id) {
-            inner.engine.windows_for_config(&w.config, Utc::now())
+        let cfg = {
+            let workers = self.workers.read().await;
+            workers.get(worker_id).map(|w| w.config.clone())
+        };
+        if let Some(config) = cfg {
+            let engine = self.engine.read().await;
+            engine.windows_for_config(&config, Utc::now())
         } else {
             Vec::new()
         }
@@ -544,41 +540,34 @@ impl RedFolderService {
 
     /// Whether the background worker tasks are currently running.
     pub async fn is_running(&self) -> bool {
-        self.inner.lock().await.state == ServiceState::Running
+        self.sync_meta.lock().await.state == ServiceState::Running
     }
 
     /// Start the background synchronization and evaluation loops.
-    ///
-    /// # Worker Requirement
-    /// At least one worker must be registered with `config.enabled == true` before calling `start()`.
-    /// If no workers are registered or all registered workers have `config.enabled == false`,
-    /// `start()` logs a warning/info message and returns `Ok(())` without spawning background tasks
-    /// or changing state away from `ServiceState::Stopped`. Callers can verify active running state via
-    /// [`is_running`](Self::is_running) or [`state`](Self::state).
     pub async fn start(&self) -> Result<()> {
         {
-            let mut inner = self.inner.lock().await;
-            if inner.state == ServiceState::Running || inner.state == ServiceState::Starting {
+            let mut meta = self.sync_meta.lock().await;
+            if meta.state == ServiceState::Running || meta.state == ServiceState::Starting {
                 return Err(crate::error::RedFolderError::Service(
                     "service is already running".to_string(),
                 ));
             }
-            if inner.workers.is_empty() {
+            let workers = self.workers.read().await;
+            if workers.is_empty() {
                 warn!("no workers registered — RedFolderService not starting");
                 return Ok(());
             }
-            if !inner.workers.values().any(|w| w.config.enabled) {
+            if !workers.values().any(|w| w.config.enabled) {
                 info!("all registered worker blackout configs are disabled");
                 return Ok(());
             }
-            inner.state = ServiceState::Starting;
+            meta.state = ServiceState::Starting;
         }
 
         // Perform initial calendar synchronization fallibly
-        if let Err(e) = Self::fetch_and_compile(&self.inner, &self.refresh_lock, false, false).await
-        {
-            let mut inner = self.inner.lock().await;
-            inner.state = ServiceState::Stopped;
+        if let Err(e) = self.refresh_internal(false, false).await {
+            let mut meta = self.sync_meta.lock().await;
+            meta.state = ServiceState::Stopped;
             return Err(e);
         }
 
@@ -589,8 +578,7 @@ impl RedFolderService {
 
         // 1. Daily midnight fetch loop (with short-interval retry on failure)
         {
-            let inner_arc = self.inner.clone();
-            let refresh_lock_arc = self.refresh_lock.clone();
+            let this = self.clone();
             let token = cancel_token.child_token();
             let handle = tokio::spawn(async move {
                 loop {
@@ -605,7 +593,7 @@ impl RedFolderService {
                     tokio::select! {
                         _ = tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)) => {
                             let res = tokio::select! {
-                                res = Self::fetch_and_compile(&inner_arc, &refresh_lock_arc, false, true) => res,
+                                res = this.refresh_internal(false, true) => res,
                                 _ = token.cancelled() => {
                                     break;
                                 }
@@ -616,7 +604,7 @@ impl RedFolderService {
                                 loop {
                                     tokio::select! {
                                         _ = tokio::time::sleep(tokio::time::Duration::from_secs(900)) => {
-                                            let retry_res = Self::fetch_and_compile(&inner_arc, &refresh_lock_arc, false, true).await;
+                                            let retry_res = this.refresh_internal(false, true).await;
                                             if retry_res.is_ok() {
                                                 info!("calendar sync successfully recovered after retry");
                                                 break;
@@ -642,16 +630,14 @@ impl RedFolderService {
 
         // 2. Transition-driven blackout evaluation loop (with watchdog and interruptible notify)
         {
-            let inner_arc = self.inner.clone();
+            let this = self.clone();
             let token = cancel_token.child_token();
             let notify = self.notify.clone();
 
             let handle = tokio::spawn(async move {
                 loop {
-                    let (next_transition, check_interval) = {
-                        let mut inner = inner_arc.lock().await;
-                        (inner.check_and_notify_workers(), inner.check_interval)
-                    };
+                    let next_transition = this.check_and_notify_workers().await;
+                    let check_interval = this.sync_meta.lock().await.check_interval;
 
                     let now = Utc::now();
                     let sleep_duration = if let Some(target) = next_transition {
@@ -676,8 +662,8 @@ impl RedFolderService {
         *self.task_handles.lock().await = handles;
 
         {
-            let mut inner = self.inner.lock().await;
-            inner.state = ServiceState::Running;
+            let mut meta = self.sync_meta.lock().await;
+            meta.state = ServiceState::Running;
         }
 
         info!("RedFolderService background tasks started successfully");
@@ -687,11 +673,11 @@ impl RedFolderService {
     /// Stop all background tasks gracefully and await their termination.
     pub async fn stop(&self) {
         {
-            let mut inner = self.inner.lock().await;
-            if inner.state == ServiceState::Stopped || inner.state == ServiceState::Stopping {
+            let mut meta = self.sync_meta.lock().await;
+            if meta.state == ServiceState::Stopped || meta.state == ServiceState::Stopping {
                 return;
             }
-            inner.state = ServiceState::Stopping;
+            meta.state = ServiceState::Stopping;
         }
 
         info!("stopping RedFolderService");
@@ -711,35 +697,35 @@ impl RedFolderService {
         }
 
         {
-            let mut inner = self.inner.lock().await;
-            inner.state = ServiceState::Stopped;
+            let mut meta = self.sync_meta.lock().await;
+            meta.state = ServiceState::Stopped;
         }
     }
 
     /// Manually trigger a calendar download and recompile blackout windows.
     pub async fn refresh(&self) -> Result<()> {
-        Self::fetch_and_compile(&self.inner, &self.refresh_lock, false, false).await
+        self.refresh_internal(false, false).await
     }
 
     /// Force a fresh calendar fetch from the remote API, bypassing cache.
     pub async fn force_refresh(&self) -> Result<()> {
-        Self::fetch_and_compile(&self.inner, &self.refresh_lock, true, false).await
+        self.refresh_internal(true, false).await
     }
 
     /// Internal helper that fetches events and compiles windows without holding mutex across network I/O.
-    async fn fetch_and_compile(
-        inner: &Arc<Mutex<ServiceInner>>,
-        refresh_lock: &Arc<Mutex<()>>,
+    async fn refresh_internal(
+        &self,
         force_remote: bool,
         skip_if_already_fetched_today: bool,
     ) -> Result<()> {
-        let _refresh_guard = refresh_lock.lock().await;
+        let _refresh_guard = self.refresh_lock.lock().await;
         let today = Utc::now().date_naive();
 
         // 1. Check if already fetched today under lock (if requested by scheduled loop)
         if skip_if_already_fetched_today {
-            let state = inner.lock().await;
-            if state.last_fetch_date == Some(today) && !state.engine.is_empty() {
+            let meta = self.sync_meta.lock().await;
+            let engine_empty = self.engine.read().await.is_empty();
+            if meta.last_fetch_date == Some(today) && !engine_empty {
                 debug!("calendar already fetched and compiled for today");
                 return Ok(());
             }
@@ -747,8 +733,8 @@ impl RedFolderService {
 
         // 2. Perform HTTP request outside lock
         let (client, client_tz) = {
-            let state = inner.lock().await;
-            (state.client.clone(), state.client.calendar_timezone())
+            let meta = self.sync_meta.lock().await;
+            (meta.client.clone(), meta.client.calendar_timezone())
         };
         let fetch_res = if force_remote {
             client.force_fetch().await
@@ -760,94 +746,115 @@ impl RedFolderService {
             Ok(raw) => raw,
             Err(e) => {
                 let err_str = e.to_string();
-                let mut state = inner.lock().await;
-                state.last_sync_error = Some(err_str.clone());
-                state.check_calendar_staleness();
-                state.check_and_notify_workers();
-                state.notify.notify_waiters();
-                state.dispatch_event(RedFolderEvent::CalendarSyncFailed { error: err_str });
+                {
+                    let mut meta = self.sync_meta.lock().await;
+                    meta.last_sync_error = Some(err_str.clone());
+                }
+                self.check_calendar_staleness().await;
+                self.check_and_notify_workers().await;
+                self.notify.notify_waiters();
+                self.dispatch_event(RedFolderEvent::CalendarSyncFailed { error: err_str })
+                    .await;
                 return Err(e);
             }
         };
 
-        // 3. Re-acquire lock to compile windows into engine
-        let mut state = inner.lock().await;
-        let configs: Vec<RedFolderConfig> = state
-            .workers
-            .values()
-            .filter(|w| w.config.enabled)
-            .map(|w| w.config.clone())
-            .collect();
+        // 3. Re-acquire locks to compile windows into engine
+        let configs: Vec<RedFolderConfig> = {
+            let workers = self.workers.read().await;
+            workers
+                .values()
+                .filter(|w| w.config.enabled)
+                .map(|w| w.config.clone())
+                .collect()
+        };
         let config_refs: Vec<&RedFolderConfig> = configs.iter().collect();
 
-        state.engine = BlackoutEngine::compile_with_tz(&raw, &config_refs, Utc::now(), client_tz);
-        state.last_fetch_date = Some(today);
-        state.last_sync_time = Some(Utc::now());
-        state.last_sync_error = None;
+        let new_engine = BlackoutEngine::compile_with_tz(&raw, &config_refs, Utc::now(), client_tz);
+        let total_windows = new_engine.windows().len();
+
+        {
+            let mut engine = self.engine.write().await;
+            *engine = new_engine;
+        }
+
+        {
+            let mut meta = self.sync_meta.lock().await;
+            meta.last_fetch_date = Some(today);
+            meta.last_sync_time = Some(Utc::now());
+            meta.last_sync_error = None;
+        }
 
         // Immediately reconcile worker states with newly compiled engine
-        state.check_and_notify_workers();
-        state.notify.notify_waiters();
+        self.check_and_notify_workers().await;
+        self.notify.notify_waiters();
 
-        let total_windows = state.engine.windows().len();
         info!(windows=%total_windows, "refreshed economic calendar windows");
 
         // Centralized dispatch to both broadcast channel and EventListeners
-        state.dispatch_event(RedFolderEvent::CalendarUpdated {
+        self.dispatch_event(RedFolderEvent::CalendarUpdated {
             total_events: raw.len(),
             total_windows,
-        });
+        })
+        .await;
 
         Ok(())
     }
 
     /// Returns the timestamp of the last successful calendar synchronization, if any.
     pub async fn last_sync_time(&self) -> Option<DateTime<Utc>> {
-        self.inner.lock().await.last_sync_time
+        self.sync_meta.lock().await.last_sync_time
     }
 
     /// Returns the error message from the most recent failed calendar synchronization, if any.
     pub async fn last_sync_error(&self) -> Option<String> {
-        self.inner.lock().await.last_sync_error.clone()
-    }
-
-    /// Checks if calendar data is considered stale based on configured maximum stale age.
-    pub async fn is_calendar_stale(&self) -> bool {
-        let mut inner = self.inner.lock().await;
-        inner.check_calendar_staleness()
+        self.sync_meta.lock().await.last_sync_error.clone()
     }
 
     /// Check if a specific worker is currently in blackout.
     pub async fn is_blackout(&self, worker_id: &str) -> bool {
-        let mut inner = self.inner.lock().await;
-        inner.check_calendar_staleness();
-        inner
-            .workers
-            .get(worker_id)
-            .map(|w| inner.engine.is_blackout(&w.config))
-            .unwrap_or(false)
+        self.check_calendar_staleness().await;
+        let cfg = {
+            let workers = self.workers.read().await;
+            workers.get(worker_id).map(|w| w.config.clone())
+        };
+        if let Some(config) = cfg {
+            let engine = self.engine.read().await;
+            engine.is_blackout(&config)
+        } else {
+            false
+        }
     }
 
     /// Get current active window for a worker, if any.
     pub async fn current_window(&self, worker_id: &str) -> Option<BlackoutWindow> {
-        let mut inner = self.inner.lock().await;
-        inner.check_calendar_staleness();
-        let worker = inner.workers.get(worker_id)?;
-        inner.engine.current_window(&worker.config)
+        self.check_calendar_staleness().await;
+        let cfg = {
+            let workers = self.workers.read().await;
+            workers.get(worker_id).map(|w| w.config.clone())
+        };
+        if let Some(config) = cfg {
+            let engine = self.engine.read().await;
+            engine.current_window(&config)
+        } else {
+            None
+        }
     }
 
     /// Return upcoming blackout windows for a specific worker within `hours` hours.
     pub async fn get_upcoming_blackouts(&self, worker_id: &str, hours: u32) -> Vec<BlackoutWindow> {
-        let inner = self.inner.lock().await;
-        let Some(worker) = inner.workers.get(worker_id) else {
-            return Vec::new();
+        let cfg = {
+            let workers = self.workers.read().await;
+            workers.get(worker_id).map(|w| w.config.clone())
         };
-        inner.engine.upcoming_blackouts(&worker.config, hours)
+        if let Some(config) = cfg {
+            let engine = self.engine.read().await;
+            engine.upcoming_blackouts(&config, hours)
+        } else {
+            Vec::new()
+        }
     }
 }
-
-/// Backwards compatibility alias for `RedFolderService`.
-pub type NewsBlackoutService = RedFolderService;
 
 #[cfg(test)]
 mod tests {
@@ -880,17 +887,16 @@ mod tests {
             impact: "High".into(),
         }];
 
-        {
-            let mut inner = service.inner.lock().await;
-            let cfg = RedFolderConfig {
-                weekend_enabled: false,
-                before_min: 0,
-                after_min: 15,
-                ..Default::default()
-            };
-            inner.engine = BlackoutEngine::compile(&raw, &[&cfg], now);
-            inner.check_and_notify_workers();
-        }
+        let cfg = RedFolderConfig {
+            weekend_enabled: false,
+            before_min: 0,
+            after_min: 15,
+            ..Default::default()
+        };
+        service
+            .set_engine(BlackoutEngine::compile(&raw, &[&cfg], now))
+            .await;
+        service.evaluate_and_notify().await;
 
         // Verify worker event channel received BlackoutWarning
         let ev = worker_events
