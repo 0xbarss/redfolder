@@ -593,6 +593,7 @@ async fn test_cache_preservation_on_empty_response() {
             fetched_at: Utc::now(),
             expires_at: None,
             event_count: 1,
+            sha256: None,
         },
         events: good_events.clone(),
     };
@@ -711,6 +712,7 @@ fn test_cache_rejects_event_count_mismatch() {
             fetched_at: Utc::now(),
             expires_at: None,
             event_count: 10,
+            sha256: None,
         },
         events: vec![redfolder::calendar::RawCalendarEvent {
             title: "Corrupt Test Event".into(),
@@ -748,6 +750,7 @@ async fn test_stale_cache_policy_enforcement() {
             fetched_at: old_fetched_at,
             expires_at: None,
             event_count: 1,
+            sha256: None,
         },
         events: vec![redfolder::calendar::RawCalendarEvent {
             title: "Stale NFP".into(),
@@ -1780,4 +1783,219 @@ fn test_atomic_status_accessor_consistency() {
     // Non-matching currency returns None
     let eur_config = RedFolderConfig::builder().currencies(vec!["EUR"]).build();
     assert!(engine.status(&eur_config).is_none());
+}
+
+#[tokio::test]
+async fn test_response_body_size_limit_rejection() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock_url = format!("http://{}", addr);
+
+    let _server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+
+                // Send response with body exceeding 200 bytes
+                let large_body = format!(
+                    r#"[ {{"title":"Large Payload Event {}", "country":"USD", "date":"2026-06-15T12:30:00Z", "time":"", "impact":"High"}} ]"#,
+                    "A".repeat(500)
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    large_body.len(),
+                    large_body
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    // Configure client with max 200 bytes
+    let client = redfolder::calendar::CalendarClient::with_options(
+        reqwest::Client::new(),
+        mock_url,
+        None,
+        std::time::Duration::from_secs(3),
+    )
+    .with_max_response_bytes(200);
+
+    let res = client.fetch_remote().await;
+    assert!(res.is_err());
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("exceeds maximum") || err_msg.contains("exceeded maximum"),
+        "error must cite response exceeding maximum limit: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_fallback_url_failover() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    // Server 1: Primary fails with 404 Not Found
+    let listener_primary = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_primary = listener_primary.local_addr().unwrap();
+    let primary_url = format!("http://{}/primary", addr_primary);
+
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener_primary.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let resp =
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = socket.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    // Server 2: Fallback succeeds with 200 OK
+    let listener_fallback = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_fallback = listener_fallback.local_addr().unwrap();
+    let fallback_url = format!("http://{}/fallback", addr_fallback);
+
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener_fallback.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let body = r#"[{"title":"Fallback NFP","country":"USD","date":"2026-06-15T12:30:00Z","time":"","impact":"High"}]"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let client = redfolder::calendar::CalendarClient::with_options(
+        reqwest::Client::new(),
+        primary_url,
+        None,
+        std::time::Duration::from_secs(2),
+    )
+    .with_fallback_url(fallback_url);
+
+    let events = client
+        .fetch_remote()
+        .await
+        .expect("must failover to fallback URL");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].title, "Fallback NFP");
+}
+
+#[tokio::test]
+async fn test_retry_latency_ceiling_bounded() {
+    use std::time::Instant;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock_url = format!("http://{}", addr);
+
+    // Mock server returning 429 repeatedly with Retry-After: 0
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let resp = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = socket.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let client = redfolder::calendar::CalendarClient::with_options(
+        reqwest::Client::new(),
+        mock_url,
+        None,
+        std::time::Duration::from_millis(500),
+    )
+    .with_max_retries(2)
+    .with_backoff(
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(200),
+    )
+    .with_overall_timeout(std::time::Duration::from_secs(3));
+
+    let start = Instant::now();
+    let res = client.fetch_remote().await;
+    let elapsed = start.elapsed();
+
+    assert!(res.is_err(), "must fail after retries are exhausted");
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "fetch_remote must strictly respect latency bound (elapsed: {:?})",
+        elapsed
+    );
+}
+
+#[test]
+fn test_cache_integrity_checksum_tamper_detection() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+
+    let client = redfolder::calendar::CalendarClient::new(Some(cache_dir.clone()));
+    let events = vec![redfolder::calendar::RawCalendarEvent {
+        title: "Integrity Release".into(),
+        country: "USD".into(),
+        date: "2026-06-15T12:30:00Z".into(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+
+    client.save_cache(&events).unwrap();
+
+    let cache_file = cache_dir.join(redfolder::calendar::DEFAULT_CACHE_FILENAME);
+    let original_json = std::fs::read_to_string(&cache_file).unwrap();
+
+    // Verify clean load
+    let loaded = client.load_cache_data().expect("must load clean cache");
+    assert_eq!(loaded.events[0].title, "Integrity Release");
+
+    // Tamper with event text without corrupting JSON or changing count
+    let tampered_json = original_json.replace("Integrity Release", "Forged Event Time");
+    std::fs::write(&cache_file, tampered_json).unwrap();
+
+    // Load must reject tampered cache via sha256 checksum mismatch
+    let tampered_load = client.load_cache_data();
+    assert!(
+        tampered_load.is_none(),
+        "load_cache_data must reject tampered cache with modified event content"
+    );
+}
+
+#[tokio::test]
+async fn test_prop_firm_strict_defaults_to_fail_closed() {
+    let service = RedFolderService::new(None);
+    let config = RedFolderConfig::prop_firm_strict();
+
+    assert!(config.fail_safe_mode.is_fail_closed());
+
+    let mut rx = service
+        .register_worker("prop_bot", config)
+        .await
+        .expect("registration succeeds");
+
+    // Worker immediately receives fail-closed active blackout notification
+    assert!(service.is_blackout("prop_bot").await);
+
+    let active = service.current_window("prop_bot").await;
+    assert!(active.is_some());
+    assert!(active
+        .unwrap()
+        .summary_title()
+        .contains("Fail-Closed Safety Blackout"));
+
+    let notif = rx.try_recv().expect("must receive notification");
+    assert!(notif.active);
 }

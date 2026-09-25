@@ -351,6 +351,43 @@ pub struct BlackoutNotification {
     pub window: Option<BlackoutWindow>,
 }
 
+/// Policy governing trading blackout behavior when calendar data is unavailable, empty, or stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum FailSafeMode {
+    /// Permissive mode: if calendar data is unavailable or stale, assume no economic blackout is active (fail open).
+    #[default]
+    #[serde(rename = "fail_open", alias = "open", alias = "permissive")]
+    FailOpen,
+
+    /// Defensive mode: if calendar data is unavailable or stale, assume blackout is active (fail closed).
+    /// Halts automated trading during data feed outages to protect prop firm accounts from disqualification.
+    #[serde(rename = "fail_closed", alias = "closed", alias = "strict")]
+    FailClosed,
+}
+
+impl FailSafeMode {
+    /// Returns true if this policy dictates failing closed (blackout on data loss).
+    #[must_use]
+    pub fn is_fail_closed(&self) -> bool {
+        matches!(self, FailSafeMode::FailClosed)
+    }
+
+    /// Returns true if this policy dictates failing open (allow trading on data loss).
+    #[must_use]
+    pub fn is_fail_open(&self) -> bool {
+        matches!(self, FailSafeMode::FailOpen)
+    }
+}
+
+impl fmt::Display for FailSafeMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FailSafeMode::FailOpen => write!(f, "fail_open"),
+            FailSafeMode::FailClosed => write!(f, "fail_closed"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,5 +451,16 @@ mod tests {
 
         assert_eq!(String::from(Currency::EUR), "EUR");
         assert_eq!(Currency::from("GBP"), Currency::GBP);
+    }
+
+    #[test]
+    fn test_fail_safe_mode() {
+        assert_eq!(FailSafeMode::default(), FailSafeMode::FailOpen);
+        assert!(FailSafeMode::FailClosed.is_fail_closed());
+        assert!(!FailSafeMode::FailClosed.is_fail_open());
+        assert!(FailSafeMode::FailOpen.is_fail_open());
+        assert!(!FailSafeMode::FailOpen.is_fail_closed());
+        assert_eq!(FailSafeMode::FailOpen.to_string(), "fail_open");
+        assert_eq!(FailSafeMode::FailClosed.to_string(), "fail_closed");
     }
 }

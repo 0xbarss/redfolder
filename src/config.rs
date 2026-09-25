@@ -74,6 +74,15 @@ pub struct RedFolderConfig {
     /// Defaults to `false` to avoid premature blackout timing for unconfirmed releases.
     #[serde(default)]
     pub include_tentative: bool,
+
+    /// Policy governing trading blackout behavior when calendar data is unavailable, empty, or stale.
+    ///
+    /// - [`FailSafeMode::FailOpen`]: Treats data outages permissively (assumes no blackout, continues trading).
+    /// - [`FailSafeMode::FailClosed`]: Treats data outages defensively (assumes blackout active, halts trading).
+    ///
+    /// Defaults to [`FailSafeMode::FailOpen`] for standard setups; prop firm presets default to `FailClosed`.
+    #[serde(default)]
+    pub fail_safe_mode: crate::types::FailSafeMode,
 }
 
 fn default_true() -> bool {
@@ -120,6 +129,7 @@ impl Default for RedFolderConfig {
             warning_before_min: None,
             include_all_day: false,
             include_tentative: false,
+            fail_safe_mode: crate::types::FailSafeMode::FailOpen,
         }
     }
 }
@@ -135,6 +145,7 @@ impl RedFolderConfig {
 
     /// Preset tailored for prop firm trading challenges (FTMO, FundedNext, MFF):
     /// Strict 5 minutes before and after high-impact news, plus full weekend curfew until Monday.
+    /// Uses [`FailSafeMode::FailClosed`] to halt trading on data feed outages.
     #[must_use]
     pub fn prop_firm_strict() -> Self {
         Self {
@@ -160,10 +171,12 @@ impl RedFolderConfig {
             warning_before_min: Some(15),
             include_all_day: false,
             include_tentative: false,
+            fail_safe_mode: crate::types::FailSafeMode::FailClosed,
         }
     }
 
     /// Preset with conservative 30-minute buffers for high and medium impact releases.
+    /// Uses [`FailSafeMode::FailClosed`] to halt trading on data feed outages.
     #[must_use]
     pub fn conservative() -> Self {
         Self {
@@ -180,6 +193,7 @@ impl RedFolderConfig {
             warning_before_min: Some(30),
             include_all_day: false,
             include_tentative: false,
+            fail_safe_mode: crate::types::FailSafeMode::FailClosed,
         }
     }
 
@@ -242,12 +256,13 @@ impl RedFolderConfig {
                 )));
             }
         }
-        if self.weekend_enabled {
-            crate::curfew::parse_time(&self.weekend_start)?;
-            let mode: crate::curfew::WeekendMode = self.weekend_mode.parse()?;
-            if mode == crate::curfew::WeekendMode::Short {
-                crate::curfew::parse_time(&self.weekend_end)?;
-            }
+
+        // Unconditionally validate weekend curfew time formats and mode even if weekend_enabled is false,
+        // ensuring the config is sound if weekend_enabled is toggled on later or curfew math is queried.
+        crate::curfew::parse_time(&self.weekend_start)?;
+        let mode: crate::curfew::WeekendMode = self.weekend_mode.parse()?;
+        if mode == crate::curfew::WeekendMode::Short || !self.weekend_end.is_empty() {
+            crate::curfew::parse_time(&self.weekend_end)?;
         }
         Ok(())
     }
@@ -412,6 +427,13 @@ impl RedFolderConfigBuilder {
         self
     }
 
+    /// Sets the policy for data loss or stale calendar handling ([`crate::types::FailSafeMode`]).
+    #[must_use]
+    pub fn fail_safe_mode(mut self, mode: crate::types::FailSafeMode) -> Self {
+        self.config.fail_safe_mode = mode;
+        self
+    }
+
     /// Builds the configuration, panicking if parameters fail validation.
     ///
     /// # Panics
@@ -573,6 +595,65 @@ mod tests {
         assert_eq!(
             cfg.typed_weekend_mode().unwrap(),
             crate::curfew::WeekendMode::Weekend
+        );
+    }
+
+    #[test]
+    fn test_weekend_validation_when_disabled() {
+        // Bad weekend start time should fail even if weekend_enabled == false
+        let bad_start = RedFolderConfig::builder()
+            .weekend_curfew(false, "99:99", "21:00", "short")
+            .try_build();
+        assert!(
+            bad_start.is_err(),
+            "invalid start time must fail validation even when weekend_enabled is false"
+        );
+
+        // Bad weekend mode should fail even if weekend_enabled == false
+        let bad_mode = RedFolderConfig::builder()
+            .weekend_curfew(false, "20:00", "21:00", "bogus_mode")
+            .try_build();
+        assert!(
+            bad_mode.is_err(),
+            "invalid weekend mode must fail validation even when weekend_enabled is false"
+        );
+
+        // Bad weekend end time in short mode should fail even if weekend_enabled == false
+        let bad_end = RedFolderConfig::builder()
+            .weekend_curfew(false, "20:00", "25:99", "short")
+            .try_build();
+        assert!(
+            bad_end.is_err(),
+            "invalid end time must fail validation even when weekend_enabled is false"
+        );
+    }
+
+    #[test]
+    fn test_fail_safe_mode_config() {
+        let default_cfg = RedFolderConfig::default();
+        assert_eq!(
+            default_cfg.fail_safe_mode,
+            crate::types::FailSafeMode::FailOpen
+        );
+
+        let prop_firm = RedFolderConfig::prop_firm_strict();
+        assert_eq!(
+            prop_firm.fail_safe_mode,
+            crate::types::FailSafeMode::FailClosed
+        );
+
+        let conservative = RedFolderConfig::conservative();
+        assert_eq!(
+            conservative.fail_safe_mode,
+            crate::types::FailSafeMode::FailClosed
+        );
+
+        let custom = RedFolderConfig::builder()
+            .fail_safe_mode(crate::types::FailSafeMode::FailClosed)
+            .build();
+        assert_eq!(
+            custom.fail_safe_mode,
+            crate::types::FailSafeMode::FailClosed
         );
     }
 }

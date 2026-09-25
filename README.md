@@ -20,6 +20,11 @@ A reliable, asynchronous economic calendar client and event-driven trading black
   - [Dynamic Window Clustering & Merging](#dynamic-window-clustering--merging)
   - [Weekend Market Close Curfew Engine](#weekend-market-close-curfew-engine)
   - [Offline Durability & Rate Limit Resilience](#offline-durability--rate-limit-resilience)
+  - [Data Sources, Compliance & Multi-Feed Fallback](#data-sources-compliance--multi-feed-fallback)
+  - [Response Bounding & Memory Hardening](#response-bounding--memory-hardening)
+  - [Cryptographic Disk Integrity & File Permissions](#cryptographic-disk-integrity--file-permissions)
+  - [Retry Latency Ceilings & Execution SLAs](#retry-latency-ceilings--execution-slas)
+  - [Fail-Safe Risk Policies (Fail-Open vs. Fail-Closed)](#fail-safe-risk-policies-fail-open-vs-fail-closed)
 - [Key Features](#key-features)
 - [Repository Structure](#repository-structure)
 - [Installation](#installation)
@@ -35,6 +40,7 @@ A reliable, asynchronous economic calendar client and event-driven trading black
   - [RedFolderService](#redfolderservice)
   - [BlackoutEngine](#blackoutengine)
   - [CalendarClient](#calendarclient)
+  - [RedFolderConfig](#redfolderconfig)
   - [Types & Domain Models](#types--domain-models)
 - [Testing & Quality Assurance](#testing--quality-assurance)
   - [Failure Modes & Edge Case Matrix](#failure-modes--edge-case-matrix)
@@ -148,10 +154,44 @@ Weekend curfew windows apply globally to the worker when enabled, intentionally 
 ### Offline Durability & Rate Limit Resilience
 
 External calendar APIs enforce strict Cloudflare rate limiting (HTTP 429). `CalendarClient` includes a multi-tier fallback mechanism:
-1. Fresh remote synchronization writes a pretty-printed JSON copy to disk with schema metadata (`version`, `event_count`, `fetched_at`).
-2. When loading from disk, the client validates that `metadata.event_count == events.len()`, rejecting corrupted or truncated cache files.
+1. Fresh remote synchronization writes a pretty-printed JSON copy to disk with schema metadata (`version`, `event_count`, `fetched_at`, `sha256`).
+2. When loading from disk, the client validates that `metadata.event_count == events.len()` and verifies the SHA-256 cryptographic checksum, rejecting corrupted, truncated, or tampered cache files.
 3. Fallback to stale cache on network failure respects a configurable maximum allowable staleness boundary (`max_stale_cache_age`, default 36 hours), preventing ancient calendars from silently driving live trading.
 4. An internal lock-split design ensures network downloads execute without holding the service mutex, guaranteeing that worker evaluations are never stalled by remote latency.
+
+### Data Sources, Compliance & Multi-Feed Fallback
+
+- **Unofficial Feed Transparency & Risks**: By default, `redfolder` ingests releases from FairEconomy's JSON endpoint (`nfs.faireconomy.media/ff_calendar_thisweek.json`). Because this is an unofficial endpoint without a formal enterprise SLA, downstream applications must account for potential schema shifts or provider downtime.
+- **Anti-Bot Mitigation & User-Agent Disclosure**: Upstream Cloudflare mitigations reject default bot User-Agents with HTTP 403 Forbidden. To provide out-of-the-box reliability, `CalendarClient` provides a standard browser User-Agent by default. For institutional environments or strict corporate compliance policies, custom identification strings can be configured via [`CalendarClient::with_user_agent`](#calendarclient).
+- **Multi-Endpoint Redundancy**: Redundant endpoints, internal cache mirrors, or backup proxies can be chained using `with_fallback_url` or `with_fallback_urls`. If the primary endpoint fails or returns a non-retryable error, `fetch_remote` automatically fails over to the next candidate mirror.
+
+### Response Bounding & Memory Hardening
+
+To guard against malicious, misconfigured, or corrupted upstream payloads consuming unbounded heap memory:
+- **Pre-Flight Content-Length Enforcement**: Validates the HTTP `Content-Length` header before allocating buffers. If the advertised size exceeds `max_response_bytes` (default: 10 MiB, configurable via `with_max_response_bytes`), retrieval is immediately aborted.
+- **Streamed Chunk Size Capping**: When receiving chunked transfer encoding (where `Content-Length` is omitted), incoming chunks are streamed incrementally with a strict byte counter. If accumulated bytes exceed the limit, streaming terminates immediately with a typed `RedFolderError::Calendar`.
+- **Event Count Upper Bound**: Parsed JSON arrays are bounded by `max_event_count` (default: 50,000 events, configurable via `with_max_event_count`), preventing CPU and memory exhaustion from upstream event loops or malformed JSON matrices.
+
+### Cryptographic Disk Integrity & File Permissions
+
+Macroeconomic release schedules directly govern live trading execution and risk parameters. `redfolder` incorporates file-level and disk-level defenses:
+- **SHA-256 Cache Checksum**: Every atomic write computes a SHA-256 digest of the serialized events array stored in `CacheMetadata.sha256`. Upon disk load, the digest is re-verified. Any unauthorized out-of-process modification or bit rot triggers immediate cache rejection.
+- **Shared Host File Permissions**: On Unix platforms, cache directories are created with owner-only access (`0700`), and temporary/final cache files are locked to read/write owner-only permissions (`0600`) via `std::os::unix::fs`.
+- **Pluggable Integrity Validation**: Institutional teams can attach a custom verification closure via [`CalendarClient::with_integrity_validator`](#calendarclient) to assert custom HMAC signatures, PGP validation, or domain-specific sanity rules prior to committing releases into memory.
+
+### Retry Latency Ceilings & Execution SLAs
+
+Gatekeeping real-time order execution requires strictly bounded network latency. `fetch_remote` provides deterministic latency boundaries:
+- **Bounded Exponential Backoff**: Retries are capped at `max_retries` (default: 2), initial backoff begins at 500ms, and `Retry-After` header values from upstream 429 responses are hard-capped at 10s.
+- **Worst-Case Wall-Clock Bounds**: Under total connection timeout conditions, total wall-clock latency per endpoint candidate is bounded to $(1 + 2) \times 30\text{s} + 20\text{s} = 110\text{s}$. Under instant HTTP 429/5xx status responses, maximum total latency is $\le 21\text{s}$.
+- **End-to-End Operation Timeout**: Callers can configure [`CalendarClient::with_overall_timeout`](#calendarclient) (e.g. 5s or 10s) to establish a firm cancellation deadline across all candidates and backoffs.
+
+### Fail-Safe Risk Policies (Fail-Open vs. Fail-Closed)
+
+When upstream network feeds, fallback mirrors, and local disk caches fail concurrently, risk engines must enforce an unambiguous safety policy:
+- **`FailSafeMode::FailOpen`** (Permissive): If calendar data is missing or exceeds `max_stale_cache_age`, the engine assumes no economic blackout is active, permitting trading (weekend curfews remain enforced if enabled).
+- **`FailSafeMode::FailClosed`** (Defensive / Prop Firm Shield): If calendar data is missing, corrupted, or stale, the engine assumes an active blackout condition. A synthetic `Fail-Closed Safety Blackout` window is dynamically injected, immediately halting trades and protecting prop-firm challenge accounts from catastrophic disqualification during provider outages.
+- **Preset Defaults**: [`RedFolderConfig::prop_firm_strict`](#redfolderconfig) and [`RedFolderConfig::conservative`](#redfolderconfig) default to `FailSafeMode::FailClosed`.
 
 ---
 
@@ -472,6 +512,14 @@ redfolder sync
 | `new` | `fn(Option<PathBuf>) -> Self` | Creates client with standard browser User-Agent and default cache. |
 | `without_cache` | `fn() -> Self` | Creates client strictly performing live network requests. |
 | `with_user_agent` | `fn(Option<PathBuf>, &str) -> Result<Self>` | Creates client with custom User-Agent and optional cache directory. |
+| `with_fallback_url` | `fn(self, impl Into<String>) -> Self` | Configures secondary mirror URL for automated failover on network/HTTP errors. |
+| `with_fallback_urls` | `fn(self, impl IntoIterator<Item = S>) -> Self` | Configures multiple fallback mirror URLs in failover priority order. |
+| `with_max_response_bytes` | `fn(self, usize) -> Self` | Enforces upper bound on response payload body (default 10 MiB) to prevent OOM DOS. |
+| `with_max_event_count` | `fn(self, usize) -> Self` | Enforces upper limit on parsed calendar events (default 50,000). |
+| `with_max_retries` | `fn(self, usize) -> Self` | Sets maximum HTTP retry attempts on transient network errors (default 3). |
+| `with_backoff` | `fn(self, Duration, Duration) -> Self` | Configures initial backoff delay and max retry-after cap for exponential backoff. |
+| `with_overall_timeout` | `fn(self, Duration) -> Self` | Enforces hard wall-clock latency ceiling across the entire fetch-and-retry cycle. |
+| `with_integrity_validator` | `fn(self, impl Fn(&[RawCalendarEvent]) -> Result<()>) -> Self` | Injects custom cryptographic verification or semantic sanity checks on fetched events. |
 | `with_timezone` | `fn(self, chrono_tz::Tz) -> Self` | Configures default source timezone for resolving naive calendar timestamps. |
 | `with_max_stale_age` | `fn(self, Option<Duration>) -> Self` | Sets maximum allowable cache age for fallback on network failure. |
 | `with_ttl` | `fn(self, Duration) -> Self` | Configures cache Time-To-Live before remote re-fetch is permitted. |
@@ -482,9 +530,37 @@ redfolder sync
 | `save_cache` | `fn(&self, &[RawCalendarEvent]) -> Result<()>` | Atomically writes JSON-serialized events using PID + nanoseconds + atomic counter. |
 | `load_cache_data` | `fn(&self) -> Option<CachedCalendarData>` | Loads structured cache validating `event_count == events.len()`. |
 
+### RedFolderConfig
+
+| Method / Associated Fn | Signature | Description |
+| :--- | :--- | :--- |
+| `builder` | `fn() -> RedFolderConfigBuilder` | Creates a fluent builder with sensible defaults (USD, High impact, 30m buffers). |
+| `prop_firm_strict` | `fn() -> Self` | High-risk prop firm preset: 8 major currencies, High impact, 5m buffers, weekend curfew, and `FailSafeMode::FailClosed`. |
+| `conservative` | `fn() -> Self` | Wide buffer preset: 8 major currencies, High + Medium impacts, 15m buffers, weekend curfew, and `FailSafeMode::FailClosed`. |
+| `crypto_curfew` | `fn() -> Self` | Pure weekend curfew preset without macroeconomic currency filters. |
+| `validate` | `fn(&self) -> Result<()>` | Performs semantic validation on buffers, curfews, and intervals (unconditionally checks weekend parameters). |
+| `validate_strict` | `fn(&self) -> Result<()>` | Strict validation ensuring currency and impact lists contain no blank strings and recognized codes. |
+
+#### RedFolderConfigBuilder
+
+| Method | Signature | Description |
+| :--- | :--- | :--- |
+| `currencies` | `fn(self, impl IntoIterator<Item = S>) -> Self` | Sets target currency symbols (e.g. `["USD", "EUR"]`). |
+| `impacts` | `fn(self, impl IntoIterator<Item = S>) -> Self` | Sets impact tiers to filter (e.g. `["High"]`, `"Red"`). |
+| `buffer_minutes` | `fn(self, u32, u32) -> Self` | Sets pre-event and post-event blackout safety buffers in minutes. |
+| `warning_minutes` | `fn(self, u32) -> Self` | Configures advance warning alert threshold prior to blackout onset. |
+| `merge_threshold_minutes` | `fn(self, u32) -> Self` | Maximum gap between successive events to merge into a single window. |
+| `weekend_curfew` | `fn(self, bool, &str, &str, WeekendMode) -> Self` | Enables and configures weekend market-close curfew start, end, and mode. |
+| `include_all_day` | `fn(self, bool) -> Self` | Controls whether all-day events (e.g. bank holidays) trigger 24h blackouts. |
+| `include_tentative` | `fn(self, bool) -> Self` | Controls whether unscheduled tentative releases trigger blackouts. |
+| `fail_safe_mode` | `fn(self, FailSafeMode) -> Self` | Sets safety policy (`FailOpen` or `FailClosed`) for handling stale or failed feeds. |
+| `build` | `fn(self) -> RedFolderConfig` | Validates parameters and constructs config; panics if invalid. |
+| `try_build` | `fn(self) -> Result<RedFolderConfig>` | Validates parameters and returns typed `Result<RedFolderConfig, RedFolderError>`. |
+
 ### Types & Domain Models
 
 - **`RedFolderEvent`**: Typed enum (`BlackoutWarning`, `BlackoutStarted`, `BlackoutEnded`, `CalendarUpdated`, `CalendarSyncFailed`).
+- **`FailSafeMode`**: Policy enum (`FailOpen`, `FailClosed`). In `FailClosed` mode, missing or stale calendar feeds trigger an immediate safety blackout to protect prop firm accounts from unexpected macroeconomic volatility.
 - **`EventTiming`**: Precision timing enum (`Exact(DateTime<Utc>)`, `AllDay(NaiveDate)`, `TentativeDate(NaiveDate)`).
 - **`ServiceState`**: Service lifecycle enum (`Stopped`, `Starting`, `Running`, `Stopping`).
 - **`BlackoutWindow`**: Struct containing `start: DateTime<Utc>`, `end: DateTime<Utc>`, and `events: Vec<WindowEvent>`. Uses standard half-open interval semantics `[start, end)`. Provides helper methods `remaining_minutes()`, `duration_minutes()`, `is_active()`, and `summary_title()`.
@@ -495,7 +571,7 @@ redfolder sync
 
 ## Testing & Quality Assurance
 
-`redfolder` includes an automated test battery with **80 unit and integration tests** (41 unit + 39 integration) covering interval calculations, state machines, and resilience guarantees.
+`redfolder` includes an automated test battery with **93 unit and integration tests** (49 unit + 44 integration) covering interval calculations, state machines, and resilience guarantees.
 
 Run the test suite:
 
@@ -545,6 +621,13 @@ cargo clippy --all-targets --all-features -- -D warnings
 | **Deterministic Timestamp Replay** | Historical queries evaluate deterministically without depending on `Utc::now()`. | Verified |
 | **Empty Upstream Feed Protection** | Preserves known-good cache if upstream returns 0 events or invalid array. | Verified |
 | **Service Concurrency & Restart** | Multiple `start()` calls error cleanly; `start -> stop -> start` restarts properly. | Verified |
+| **OOM Response / Payload Size Exceeded** | `fetch_remote` enforces `max_response_bytes` via `Content-Length` pre-check and streaming chunk counter, rejecting oversized payloads. | Verified |
+| **Cache Tampering / Checksum Mismatch** | `load_cache_data` verifies SHA-256 digest against `CacheMetadata.sha256`; rejects tampered or corrupted files. | Verified |
+| **Upstream Feed Primary Outage / Failover** | `fetch_remote` automatically fails over to configured secondary mirrors in order when primary fails. | Verified |
+| **Cache File & Directory Permissions** | Enforces POSIX `0o700` directory and `0o600` file permissions on Unix systems to protect against unauthorized multi-user access. | Verified |
+| **Sync Failure under Fail-Closed Policy** | Automatically injects a synthetic `Fail-Closed Safety Blackout` window for `FailClosed` workers, halting trading during feed outages. | Verified |
+| **Retry Latency Ceiling Exceeded** | Aborts retry loop once cumulative duration exceeds `overall_timeout` (default 30s), avoiding stalled caller tasks. | Verified |
+| **Disabled Weekend Config Validation** | `validate()` unconditionally checks weekend curfew parameters even when `weekend_enabled` is false, preventing latent runtime bugs. | Verified |
 
 ---
 
@@ -598,6 +681,19 @@ cargo bench --bench blackout_benchmark
 #### 4. "Can I run redfolder without local file caching?"
 - **Cause**: Embedded systems or restricted environments where filesystem access is read-only.
 - **Fix**: Instantiate the client with `CalendarClient::without_cache()`.
+
+#### 5. "How do I configure backup mirrors or custom endpoints?"
+- **Cause**: Institutional setups requiring internal proxies or redundant mirrors if the primary feed is unreachable.
+- **Fix**: Chain `.with_fallback_url()` or `.with_fallback_urls()` on the client:
+  ```rust
+  let client = CalendarClient::new(None)
+      .with_fallback_url("https://internal-mirror.corp/calendar.json");
+  let service = RedFolderService::with_client(client);
+  ```
+
+#### 6. "How does redfolder protect prop firm accounts during feed outages?"
+- **Cause**: If external feeds are blocked and the local cache expires, trading during an unannounced CPI release would breach prop firm rules.
+- **Fix**: Use [`RedFolderConfig::prop_firm_strict()`](#redfolderconfig) or explicitly configure `.fail_safe_mode(FailSafeMode::FailClosed)`. If synchronization fails or the cache exceeds staleness limits, a synthetic safety blackout window is immediately enforced, pausing trades until verified calendar data is restored.
 
 ---
 

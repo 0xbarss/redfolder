@@ -73,10 +73,30 @@ impl ServiceInner {
         }
     }
 
+    fn check_calendar_staleness(&mut self) -> bool {
+        let is_stale = if let Some(last_sync) = self.last_sync_time {
+            if let Some(max_age) = self.client.max_stale_cache_age() {
+                if let Ok(chrono_dur) = Duration::from_std(max_age) {
+                    Utc::now() - last_sync > chrono_dur
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            self.engine.is_empty()
+        };
+        self.engine.set_stale(is_stale);
+        is_stale
+    }
+
     /// Evaluates blackout status and warnings for all registered workers,
     /// broadcasting domain events on transitions.
     /// Returns the earliest timestamp of the next expected state transition across all workers.
     fn check_and_notify_workers(&mut self) -> Option<DateTime<Utc>> {
+        self.check_calendar_staleness();
+
         if self.workers.is_empty() {
             return None;
         }
@@ -759,6 +779,9 @@ impl RedFolderService {
                 let err_str = e.to_string();
                 let mut state = inner.lock().await;
                 state.last_sync_error = Some(err_str.clone());
+                state.check_calendar_staleness();
+                state.check_and_notify_workers();
+                state.notify.notify_waiters();
                 state.dispatch_event(RedFolderEvent::CalendarSyncFailed { error: err_str });
                 return Err(e);
             }
@@ -807,22 +830,14 @@ impl RedFolderService {
 
     /// Checks if calendar data is considered stale based on configured maximum stale age.
     pub async fn is_calendar_stale(&self) -> bool {
-        let inner = self.inner.lock().await;
-        if let Some(last_sync) = inner.last_sync_time {
-            if let Some(max_age) = inner.client.max_stale_cache_age() {
-                if let Ok(chrono_dur) = Duration::from_std(max_age) {
-                    return Utc::now() - last_sync > chrono_dur;
-                }
-            }
-            false
-        } else {
-            inner.engine.is_empty()
-        }
+        let mut inner = self.inner.lock().await;
+        inner.check_calendar_staleness()
     }
 
     /// Check if a specific worker is currently in blackout.
     pub async fn is_blackout(&self, worker_id: &str) -> bool {
-        let inner = self.inner.lock().await;
+        let mut inner = self.inner.lock().await;
+        inner.check_calendar_staleness();
         inner
             .workers
             .get(worker_id)
@@ -832,7 +847,8 @@ impl RedFolderService {
 
     /// Get current active window for a worker, if any.
     pub async fn current_window(&self, worker_id: &str) -> Option<BlackoutWindow> {
-        let inner = self.inner.lock().await;
+        let mut inner = self.inner.lock().await;
+        inner.check_calendar_staleness();
         let worker = inner.workers.get(worker_id)?;
         inner.engine.current_window(&worker.config)
     }
@@ -1005,5 +1021,47 @@ mod tests {
         // Service health check should report error
         let err = service.last_sync_error().await;
         assert!(err.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_fail_closed_worker_in_service() {
+        let service = RedFolderService::new(None);
+
+        let open_cfg = RedFolderConfig::builder()
+            .weekend_curfew(false, "20:00", "21:00", "short")
+            .fail_safe_mode(crate::types::FailSafeMode::FailOpen)
+            .build();
+
+        let closed_cfg = RedFolderConfig::builder()
+            .weekend_curfew(false, "20:00", "21:00", "short")
+            .fail_safe_mode(crate::types::FailSafeMode::FailClosed)
+            .build();
+
+        let _open_rx = service
+            .register_worker("open_worker", open_cfg)
+            .await
+            .unwrap();
+        let mut closed_rx = service
+            .register_worker("closed_worker", closed_cfg)
+            .await
+            .unwrap();
+
+        // 1. Without calendar data, open worker is NOT in blackout, closed worker IS in blackout
+        assert!(!service.is_blackout("open_worker").await);
+        assert!(service.is_blackout("closed_worker").await);
+
+        // 2. Closed worker gets active window
+        let win = service
+            .current_window("closed_worker")
+            .await
+            .expect("fail-closed worker must have active window");
+        assert!(win.summary_title().contains("Fail-Closed Safety Blackout"));
+
+        // 3. Closed worker channel received immediate active notification
+        let notification = closed_rx
+            .try_recv()
+            .expect("must receive initial notification");
+        assert!(notification.active);
+        assert!(notification.window.is_some());
     }
 }

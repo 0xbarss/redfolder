@@ -16,6 +16,8 @@ pub struct BlackoutEngine {
     windows: Vec<BlackoutWindow>,
     /// Configured source timezone for naive and all-day timestamps.
     timezone: Option<chrono_tz::Tz>,
+    /// Whether calendar data has been flagged as stale.
+    stale: bool,
 }
 
 impl BlackoutEngine {
@@ -27,6 +29,7 @@ impl BlackoutEngine {
             parsed_events: Vec::new(),
             windows: Vec::new(),
             timezone: None,
+            stale: false,
         }
     }
 
@@ -67,6 +70,7 @@ impl BlackoutEngine {
             parsed_events,
             windows: Vec::new(),
             timezone: default_tz,
+            stale: false,
         }
     }
 
@@ -165,6 +169,24 @@ impl BlackoutEngine {
     #[must_use]
     pub fn timezone(&self) -> Option<chrono_tz::Tz> {
         self.timezone
+    }
+
+    /// Whether this engine has been flagged as having stale or expired calendar data.
+    #[must_use]
+    pub fn is_stale(&self) -> bool {
+        self.stale
+    }
+
+    /// Mark the engine's calendar data as stale or fresh.
+    pub fn set_stale(&mut self, stale: bool) {
+        self.stale = stale;
+    }
+
+    /// Builder method to configure the stale flag on the engine.
+    #[must_use]
+    pub fn with_stale(mut self, stale: bool) -> Self {
+        self.stale = stale;
+        self
     }
 
     /// Derives worker-specific blackout windows at runtime using the worker's own
@@ -304,6 +326,26 @@ impl BlackoutEngine {
                     );
                 }
             }
+        }
+
+        // 2b. Add fail-closed safety window if data is unavailable or stale
+        if config.fail_safe_mode.is_fail_closed() && (self.raw_events.is_empty() || self.stale) {
+            let reason = if self.stale {
+                "Calendar Data Stale (Fail-Closed Safety Blackout)"
+            } else {
+                "Calendar Data Unavailable (Fail-Closed Safety Blackout)"
+            };
+            individual.push((
+                now - Duration::hours(1),
+                now + Duration::hours(24),
+                WindowEvent {
+                    is_custom: true,
+                    event_time: now,
+                    country: "Global".into(),
+                    impact: "High".into(),
+                    title: reason.into(),
+                },
+            ));
         }
 
         // 3. Sort individual windows by start time
@@ -486,7 +528,11 @@ pub fn event_matches_economic_event(event: &EconomicEvent, config: &RedFolderCon
 #[must_use]
 pub fn event_matches_config(event: &WindowEvent, config: &RedFolderConfig) -> bool {
     if event.is_custom {
-        config.weekend_enabled
+        if event.title.contains("Fail-Closed") {
+            config.enabled && config.fail_safe_mode.is_fail_closed()
+        } else {
+            config.weekend_enabled
+        }
     } else {
         let currency_match = event.country.eq_ignore_ascii_case("All")
             || event.country.eq_ignore_ascii_case("Global")
@@ -727,5 +773,52 @@ mod tests {
             engine.status_at(&config, now),
             engine.current_window_at(&config, now)
         );
+    }
+
+    #[test]
+    fn test_fail_safe_closed_blackout() {
+        let now = Utc::now();
+        let empty_engine = BlackoutEngine::new();
+
+        let fail_open_cfg = RedFolderConfig::builder()
+            .weekend_curfew(false, "20:00", "21:00", "short")
+            .fail_safe_mode(crate::types::FailSafeMode::FailOpen)
+            .build();
+
+        let fail_closed_cfg = RedFolderConfig::builder()
+            .weekend_curfew(false, "20:00", "21:00", "short")
+            .fail_safe_mode(crate::types::FailSafeMode::FailClosed)
+            .build();
+
+        // 1. On empty data, fail-open returns false, fail-closed returns true (safety halt)
+        assert!(!empty_engine.is_blackout(&fail_open_cfg));
+        assert!(empty_engine.is_blackout(&fail_closed_cfg));
+
+        let status = empty_engine.status(&fail_closed_cfg);
+        assert!(status.is_some());
+        assert!(status
+            .unwrap()
+            .summary_title()
+            .contains("Fail-Closed Safety Blackout"));
+
+        // 2. On stale data, fail-closed returns true even if past events exist
+        let past_raw = vec![RawCalendarEvent {
+            title: "Old News".into(),
+            country: "USD".into(),
+            date: (now - Duration::hours(50)).to_rfc3339(),
+            time: "".into(),
+            impact: "High".into(),
+        }];
+
+        let mut stale_engine = BlackoutEngine::compile(&past_raw, &[&fail_closed_cfg], now);
+        assert!(!stale_engine.is_blackout(&fail_closed_cfg)); // not stale yet
+
+        stale_engine.set_stale(true);
+        assert!(stale_engine.is_blackout(&fail_closed_cfg)); // now stale -> fail closed triggers
+        let stale_status = stale_engine.status(&fail_closed_cfg);
+        assert!(stale_status
+            .unwrap()
+            .summary_title()
+            .contains("Calendar Data Stale"));
     }
 }

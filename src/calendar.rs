@@ -3,7 +3,9 @@ use crate::types::EventTiming;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
@@ -13,18 +15,42 @@ pub const CALENDAR_URL: &str = "https://nfs.faireconomy.media/ff_calendar_thiswe
 /// Default file name for the local disk cache.
 pub const DEFAULT_CACHE_FILENAME: &str = "economic_calendar.json";
 
+/// Default maximum response body size in bytes (10 MiB) to prevent unbounded memory allocation.
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Default maximum raw event count permitted from upstream feed.
+pub const DEFAULT_MAX_EVENT_COUNT: usize = 50_000;
+
 /// Default User-Agent header used for calendar HTTP requests.
 ///
 /// FairEconomy / ForexFactory endpoints block generic bot User-Agents (including the default
-/// reqwest header) with HTTP 403. This standard browser User-Agent is used by default to ensure
+/// reqwest header) with HTTP 403 Forbidden. This standard browser User-Agent is used by default to ensure
 /// reliable retrieval.
 ///
-/// Note: Scraping third-party feeds under a spoofed browser User-Agent carries ToS and reliability
-/// risks if upstream providers employ more aggressive fingerprinting or rate limiting.
-/// Callers who prefer explicit custom identification or compliant client configurations can use
-/// [`CalendarClient::with_options`] or [`CalendarClient::with_user_agent`].
+/// # Upstream Dependency & Compliance Notice
+///
+/// Scraping third-party feeds under a spoofed browser User-Agent carries Terms of Service (ToS)
+/// and availability risks if upstream providers employ more aggressive fingerprinting, rate limiting,
+/// or alter their endpoint structure.
+///
+/// Callers who prefer explicit custom identification or organization-compliant client configurations
+/// can specify a custom User-Agent via [`CalendarClient::with_user_agent`], or provide alternate/backup
+/// feeds via [`CalendarClient::with_fallback_url`].
 pub const DEFAULT_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+/// Computes a deterministic SHA-256 hex string over serialized raw calendar events for cache integrity verification.
+fn compute_events_sha256(events: &[RawCalendarEvent]) -> String {
+    let mut hasher = Sha256::new();
+    if let Ok(bytes) = serde_json::to_vec(events) {
+        hasher.update(&bytes);
+    }
+    let result = hasher.finalize();
+    format!("{result:x}")
+}
+
+/// Pluggable validator callback for custom cryptographic verification or business sanity checks on fetched calendar events.
+pub type CalendarIntegrityValidator = Arc<dyn Fn(&[RawCalendarEvent]) -> Result<()> + Send + Sync>;
 
 /// Metadata associated with cached economic calendar data.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -37,6 +63,9 @@ pub struct CacheMetadata {
     pub expires_at: Option<DateTime<Utc>>,
     /// Number of raw events contained in the cached dataset.
     pub event_count: usize,
+    /// SHA-256 digest of the serialized events array for disk integrity verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 /// Disk cache envelope bundling events with validation metadata.
@@ -79,15 +108,50 @@ impl RawCalendarEvent {
 }
 
 /// Client responsible for fetching economic calendar releases over HTTP and managing disk caching.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CalendarClient {
     client: Client,
     calendar_url: String,
+    fallback_urls: Vec<String>,
     cache_path: Option<PathBuf>,
     request_timeout: Duration,
     cache_ttl: Option<Duration>,
     calendar_timezone: Option<chrono_tz::Tz>,
     max_stale_cache_age: Option<Duration>,
+    max_response_bytes: usize,
+    max_event_count: usize,
+    max_retries: usize,
+    backoff_initial_delay: Duration,
+    max_retry_after: Duration,
+    overall_timeout: Option<Duration>,
+    integrity_validator: Option<CalendarIntegrityValidator>,
+}
+
+impl std::fmt::Debug for CalendarClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CalendarClient")
+            .field("calendar_url", &self.calendar_url)
+            .field("fallback_urls", &self.fallback_urls)
+            .field("cache_path", &self.cache_path)
+            .field("request_timeout", &self.request_timeout)
+            .field("cache_ttl", &self.cache_ttl)
+            .field("calendar_timezone", &self.calendar_timezone)
+            .field("max_stale_cache_age", &self.max_stale_cache_age)
+            .field("max_response_bytes", &self.max_response_bytes)
+            .field("max_event_count", &self.max_event_count)
+            .field("max_retries", &self.max_retries)
+            .field("backoff_initial_delay", &self.backoff_initial_delay)
+            .field("max_retry_after", &self.max_retry_after)
+            .field("overall_timeout", &self.overall_timeout)
+            .field(
+                "integrity_validator",
+                &self
+                    .integrity_validator
+                    .as_ref()
+                    .map(|_| "<custom_validator>"),
+            )
+            .finish()
+    }
 }
 
 impl Default for CalendarClient {
@@ -163,6 +227,9 @@ impl CalendarClient {
             return PathBuf::from(user_profile).join(".cache").join("redfolder");
         }
 
+        warn!(
+            "falling back to system temp directory for calendar cache. On shared/multi-user systems, consider configuring an explicit cache path or XDG_CACHE_HOME/LOCALAPPDATA to prevent cache tampering"
+        );
         std::env::temp_dir().join("redfolder_cache")
     }
 
@@ -241,12 +308,152 @@ impl CalendarClient {
         Self {
             client,
             calendar_url: calendar_url.into(),
+            fallback_urls: Vec::new(),
             cache_path,
             request_timeout,
             cache_ttl: None,
             calendar_timezone: None,
             max_stale_cache_age: Some(Duration::from_secs(36 * 3600)),
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            max_event_count: DEFAULT_MAX_EVENT_COUNT,
+            max_retries: 2,
+            backoff_initial_delay: Duration::from_millis(500),
+            max_retry_after: Duration::from_secs(10),
+            overall_timeout: None,
+            integrity_validator: None,
         }
+    }
+
+    /// Add a fallback calendar endpoint URL used if the primary URL fails.
+    #[must_use]
+    pub fn with_fallback_url(mut self, url: impl Into<String>) -> Self {
+        self.fallback_urls.push(url.into());
+        self
+    }
+
+    /// Add multiple fallback calendar endpoint URLs.
+    #[must_use]
+    pub fn with_fallback_urls<I, S>(mut self, urls: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.fallback_urls.extend(urls.into_iter().map(Into::into));
+        self
+    }
+
+    /// Configured fallback calendar URLs.
+    #[must_use]
+    pub fn fallback_urls(&self) -> &[String] {
+        &self.fallback_urls
+    }
+
+    /// Primary calendar URL.
+    #[must_use]
+    pub fn calendar_url(&self) -> &str {
+        &self.calendar_url
+    }
+
+    /// Set the primary calendar URL.
+    pub fn set_calendar_url(&mut self, url: impl Into<String>) {
+        self.calendar_url = url.into();
+    }
+
+    /// Add a fallback calendar URL.
+    pub fn add_fallback_url(&mut self, url: impl Into<String>) {
+        self.fallback_urls.push(url.into());
+    }
+
+    /// Configure the maximum response body size in bytes to prevent unbounded allocations.
+    #[must_use]
+    pub fn with_max_response_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_response_bytes = max_bytes;
+        self
+    }
+
+    /// Set maximum allowable response body size in bytes.
+    pub fn set_max_response_bytes(&mut self, max_bytes: usize) {
+        self.max_response_bytes = max_bytes;
+    }
+
+    /// Maximum allowable response body size in bytes.
+    #[must_use]
+    pub fn max_response_bytes(&self) -> usize {
+        self.max_response_bytes
+    }
+
+    /// Configure the maximum number of raw events permitted from upstream.
+    #[must_use]
+    pub fn with_max_event_count(mut self, max_events: usize) -> Self {
+        self.max_event_count = max_events;
+        self
+    }
+
+    /// Set maximum allowable raw event count.
+    pub fn set_max_event_count(&mut self, max_events: usize) {
+        self.max_event_count = max_events;
+    }
+
+    /// Maximum allowable raw event count.
+    #[must_use]
+    pub fn max_event_count(&self) -> usize {
+        self.max_event_count
+    }
+
+    /// Configure maximum HTTP retry attempts for transient errors (429, 408, 5xx).
+    #[must_use]
+    pub fn with_max_retries(mut self, max_retries: usize) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
+    /// Configured maximum retry attempts.
+    #[must_use]
+    pub fn max_retries(&self) -> usize {
+        self.max_retries
+    }
+
+    /// Configure exponential backoff parameters.
+    #[must_use]
+    pub fn with_backoff(mut self, initial_delay: Duration, max_retry_after: Duration) -> Self {
+        self.backoff_initial_delay = initial_delay;
+        self.max_retry_after = max_retry_after;
+        self
+    }
+
+    /// Initial exponential backoff delay duration.
+    #[must_use]
+    pub fn backoff_initial_delay(&self) -> Duration {
+        self.backoff_initial_delay
+    }
+
+    /// Maximum duration allowed for server-specified Retry-After delays.
+    #[must_use]
+    pub fn max_retry_after(&self) -> Duration {
+        self.max_retry_after
+    }
+
+    /// Configure an overall wall-clock timeout ceiling spanning all retry attempts and backoffs.
+    #[must_use]
+    pub fn with_overall_timeout(mut self, timeout: Duration) -> Self {
+        self.overall_timeout = Some(timeout);
+        self
+    }
+
+    /// Overall wall-clock timeout ceiling if set.
+    #[must_use]
+    pub fn overall_timeout(&self) -> Option<Duration> {
+        self.overall_timeout
+    }
+
+    /// Configure a custom pluggable integrity validator callback.
+    #[must_use]
+    pub fn with_integrity_validator(
+        mut self,
+        validator: impl Fn(&[RawCalendarEvent]) -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.integrity_validator = Some(Arc::new(validator));
+        self
     }
 
     /// Configure the default source timezone for naive calendar timestamps.
@@ -315,134 +522,240 @@ impl CalendarClient {
         self.cache_path.as_deref()
     }
 
-    /// Fetch fresh calendar events directly from the remote API with bounded retry for transient errors.
+    /// Fetch fresh calendar events directly from the remote API with bounded retry, response size checks,
+    /// and fallback URL failover.
+    ///
+    /// # Latency Ceiling Guarantee
+    ///
+    /// Worst-case wall-clock latency per URL candidate is strictly bounded:
+    /// with default settings (30s request timeout, 2 retries, 10s max backoff), worst-case latency under
+    /// total network timeouts is `(1 + 2) * 30s + 20s = 110s`. Under immediate 429/5xx status responses,
+    /// worst-case latency is `<= 21s`.
+    ///
+    /// If an [`overall_timeout`](Self::with_overall_timeout) is set, the entire operation across all candidates
+    /// is terminated when the deadline expires.
     pub async fn fetch_remote(&self) -> Result<Vec<RawCalendarEvent>> {
-        debug!(url=%self.calendar_url, "fetching economic calendar");
-        let max_retries = 2;
+        if let Some(timeout) = self.overall_timeout {
+            tokio::time::timeout(timeout, self.fetch_remote_candidates())
+                .await
+                .map_err(|_| {
+                    crate::error::RedFolderError::Calendar(format!(
+                        "calendar fetch exceeded overall timeout ceiling of {:?}",
+                        timeout
+                    ))
+                })?
+        } else {
+            self.fetch_remote_candidates().await
+        }
+    }
+
+    async fn fetch_remote_candidates(&self) -> Result<Vec<RawCalendarEvent>> {
+        let mut candidate_urls: Vec<&str> = Vec::with_capacity(1 + self.fallback_urls.len());
+        candidate_urls.push(&self.calendar_url);
+        for fb in &self.fallback_urls {
+            candidate_urls.push(fb);
+        }
+
         let mut last_error = None;
 
-        for attempt in 0..=max_retries {
-            match self
-                .client
-                .get(&self.calendar_url)
-                .timeout(self.request_timeout)
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.is_success() {
-                        match resp.json::<Vec<serde_json::Value>>().await {
-                            Ok(raw_items) => {
-                                let total_count = raw_items.len();
-                                let mut events = Vec::with_capacity(total_count);
-                                let mut malformed_count = 0;
+        for (url_idx, &url) in candidate_urls.iter().enumerate() {
+            debug!(url=%url, url_idx, "fetching economic calendar");
+            let mut url_error = None;
 
-                                for item in raw_items {
-                                    match serde_json::from_value::<RawCalendarEvent>(item) {
-                                        Ok(ev) => {
-                                            if ev.date.trim().is_empty() {
-                                                malformed_count += 1;
-                                            } else {
-                                                events.push(ev);
-                                            }
-                                        }
-                                        Err(_) => {
-                                            malformed_count += 1;
-                                        }
-                                    }
+            for attempt in 0..=self.max_retries {
+                match self
+                    .client
+                    .get(url)
+                    .timeout(self.request_timeout)
+                    .send()
+                    .await
+                {
+                    Ok(mut resp) => {
+                        let status = resp.status();
+                        if status.is_success() {
+                            // 1. Content-Length check
+                            if let Some(len) = resp.content_length() {
+                                if len > self.max_response_bytes as u64 {
+                                    url_error = Some(crate::error::RedFolderError::Calendar(format!(
+                                        "upstream response Content-Length ({len} bytes) exceeds maximum limit of {} bytes",
+                                        self.max_response_bytes
+                                    )));
+                                    break;
                                 }
-
-                                if total_count > 0 && malformed_count == total_count {
-                                    return Err(crate::error::RedFolderError::Calendar(
-                                        "all upstream calendar events were malformed".to_string(),
-                                    ));
-                                }
-
-                                if malformed_count > 0 {
-                                    warn!(
-                                        malformed = %malformed_count,
-                                        total = %total_count,
-                                        "some upstream events failed validation"
-                                    );
-                                    if malformed_count * 5 > total_count {
-                                        return Err(crate::error::RedFolderError::Calendar(format!(
-                                            "upstream response corrupted: {malformed_count}/{total_count} events malformed"
-                                        )));
-                                    }
-                                }
-
-                                info!(count = %events.len(), "downloaded calendar events successfully");
-                                return Ok(events);
                             }
-                            Err(e) => {
-                                warn!(err = %e, attempt, "failed to parse calendar response JSON");
-                                last_error = Some(crate::error::RedFolderError::Http(e));
-                                if attempt < max_retries {
-                                    let delay = Duration::from_millis(500 * (1 << attempt));
+
+                            // 2. Stream chunks with byte cap
+                            let mut body_bytes = Vec::new();
+                            let mut stream_err = None;
+                            while let Some(chunk_res) = resp.chunk().await.transpose() {
+                                match chunk_res {
+                                    Ok(chunk) => {
+                                        if body_bytes.len() + chunk.len() > self.max_response_bytes
+                                        {
+                                            stream_err = Some(crate::error::RedFolderError::Calendar(format!(
+                                                "upstream response body exceeded maximum limit of {} bytes",
+                                                self.max_response_bytes
+                                            )));
+                                            break;
+                                        }
+                                        body_bytes.extend_from_slice(&chunk);
+                                    }
+                                    Err(e) => {
+                                        stream_err = Some(crate::error::RedFolderError::Http(e));
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if let Some(e) = stream_err {
+                                warn!(err = %e, attempt, url = %url, "failed streaming response body");
+                                url_error = Some(e);
+                                if attempt < self.max_retries {
+                                    let delay = self.backoff_initial_delay * (1 << attempt);
                                     tokio::time::sleep(delay).await;
                                     continue;
                                 }
+                                break;
                             }
-                        }
-                    } else {
-                        // Rate limit (429), timeout (408), or server errors (5xx) are retryable
-                        let is_rate_limited = status == reqwest::StatusCode::TOO_MANY_REQUESTS;
-                        let is_timeout = status == reqwest::StatusCode::REQUEST_TIMEOUT;
-                        let is_server_err = status.is_server_error();
-                        let is_retryable = is_rate_limited || is_timeout || is_server_err;
 
-                        let retry_after_duration = if is_rate_limited {
-                            resp.headers()
-                                .get(reqwest::header::RETRY_AFTER)
-                                .and_then(|val| val.to_str().ok())
-                                .and_then(|s| s.trim().parse::<u64>().ok())
-                                .map(|secs| Duration::from_secs(secs.min(10)))
+                            match serde_json::from_slice::<Vec<serde_json::Value>>(&body_bytes) {
+                                Ok(raw_items) => {
+                                    let total_count = raw_items.len();
+                                    if total_count > self.max_event_count {
+                                        return Err(crate::error::RedFolderError::Calendar(format!(
+                                            "upstream response contained {total_count} events, exceeding limit of {}",
+                                            self.max_event_count
+                                        )));
+                                    }
+
+                                    let mut events = Vec::with_capacity(total_count);
+                                    let mut malformed_count = 0;
+
+                                    for item in raw_items {
+                                        match serde_json::from_value::<RawCalendarEvent>(item) {
+                                            Ok(ev) => {
+                                                let trimmed_date = ev.date.trim();
+                                                let is_length_valid =
+                                                    ev.title.len() <= 500 && ev.country.len() <= 10;
+                                                if trimmed_date.is_empty() || !is_length_valid {
+                                                    malformed_count += 1;
+                                                } else {
+                                                    events.push(ev);
+                                                }
+                                            }
+                                            Err(_) => {
+                                                malformed_count += 1;
+                                            }
+                                        }
+                                    }
+
+                                    if total_count > 0 && malformed_count == total_count {
+                                        return Err(crate::error::RedFolderError::Calendar(
+                                            "all upstream calendar events were malformed"
+                                                .to_string(),
+                                        ));
+                                    }
+
+                                    if malformed_count > 0 {
+                                        warn!(
+                                            malformed = %malformed_count,
+                                            total = %total_count,
+                                            "some upstream events failed validation"
+                                        );
+                                        if malformed_count * 5 > total_count {
+                                            return Err(crate::error::RedFolderError::Calendar(format!(
+                                                "upstream response corrupted: {malformed_count}/{total_count} events malformed"
+                                            )));
+                                        }
+                                    }
+
+                                    // Run pluggable integrity validator if configured
+                                    if let Some(ref validator) = self.integrity_validator {
+                                        validator(&events)?;
+                                    }
+
+                                    info!(url=%url, count = %events.len(), "downloaded calendar events successfully");
+                                    return Ok(events);
+                                }
+                                Err(e) => {
+                                    warn!(err = %e, attempt, url = %url, "failed to parse calendar response JSON");
+                                    url_error = Some(crate::error::RedFolderError::Json(e));
+                                    if attempt < self.max_retries {
+                                        let delay = self.backoff_initial_delay * (1 << attempt);
+                                        tokio::time::sleep(delay).await;
+                                        continue;
+                                    }
+                                }
+                            }
                         } else {
-                            None
-                        };
+                            let is_rate_limited = status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+                            let is_timeout = status == reqwest::StatusCode::REQUEST_TIMEOUT;
+                            let is_server_err = status.is_server_error();
+                            let is_retryable = is_rate_limited || is_timeout || is_server_err;
 
-                        warn!(
-                            status = %status,
-                            retryable = is_retryable,
-                            retry_after = ?retry_after_duration,
-                            attempt,
-                            "calendar HTTP fetch returned non-success status"
-                        );
+                            let retry_after_duration = if is_rate_limited {
+                                resp.headers()
+                                    .get(reqwest::header::RETRY_AFTER)
+                                    .and_then(|val| val.to_str().ok())
+                                    .and_then(|s| s.trim().parse::<u64>().ok())
+                                    .map(|secs| Duration::from_secs(secs).min(self.max_retry_after))
+                            } else {
+                                None
+                            };
 
-                        if let Err(e) = resp.error_for_status() {
-                            last_error = Some(crate::error::RedFolderError::Http(e));
+                            warn!(
+                                status = %status,
+                                retryable = is_retryable,
+                                retry_after = ?retry_after_duration,
+                                attempt,
+                                url = %url,
+                                "calendar HTTP fetch returned non-success status"
+                            );
+
+                            if let Err(e) = resp.error_for_status() {
+                                url_error = Some(crate::error::RedFolderError::Http(e));
+                            }
+
+                            if !is_retryable || attempt == self.max_retries {
+                                break;
+                            }
+
+                            let delay = retry_after_duration
+                                .unwrap_or_else(|| self.backoff_initial_delay * (1 << attempt));
+                            debug!(delay = ?delay, "sleeping before retrying rate-limited or transient failure");
+                            tokio::time::sleep(delay).await;
+                            continue;
                         }
-
-                        if !is_retryable || attempt == max_retries {
-                            break;
+                    }
+                    Err(e) => {
+                        warn!(err = %e, attempt, url = %url, "calendar HTTP transport request failed");
+                        url_error = Some(crate::error::RedFolderError::Http(e));
+                        if attempt < self.max_retries {
+                            let delay = self.backoff_initial_delay * (1 << attempt);
+                            tokio::time::sleep(delay).await;
+                            continue;
                         }
-
-                        let delay = retry_after_duration
-                            .unwrap_or_else(|| Duration::from_millis(500 * (1 << attempt)));
-                        debug!(delay = ?delay, "sleeping before retrying rate-limited or transient failure");
-                        tokio::time::sleep(delay).await;
-                        continue;
                     }
                 }
-                Err(e) => {
-                    warn!(err = %e, attempt, "calendar HTTP transport request failed");
-                    last_error = Some(crate::error::RedFolderError::Http(e));
-                    if attempt < max_retries {
-                        let delay = Duration::from_millis(500 * (1 << attempt));
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-                }
+            }
+
+            if let Some(err) = url_error {
+                warn!(url=%url, err=%err, "calendar candidate endpoint failed; trying next fallback if available");
+                last_error = Some(err);
             }
         }
 
         Err(last_error.unwrap_or_else(|| {
-            crate::error::RedFolderError::Calendar("fetch failed after retries".into())
+            crate::error::RedFolderError::Calendar(
+                "fetch failed after retries on all candidate endpoints".into(),
+            )
         }))
     }
 
     /// Save raw calendar events to the local disk cache atomically (if cache path is set).
+    ///
+    /// On Unix systems, applies restrictive file permissions (0600) and directory permissions (0700)
+    /// to prevent unauthorized access or tampering on shared multi-user hosts.
     pub fn save_cache(&self, events: &[RawCalendarEvent]) -> Result<()> {
         let Some(path) = &self.cache_path else {
             return Ok(());
@@ -450,6 +763,11 @@ impl CalendarClient {
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
         }
 
         let now = Utc::now();
@@ -457,12 +775,15 @@ impl CalendarClient {
             .cache_ttl
             .and_then(|ttl| chrono::Duration::from_std(ttl).ok().map(|d| now + d));
 
+        let events_sha256 = compute_events_sha256(events);
+
         let cached_data = CachedCalendarData {
             metadata: CacheMetadata {
                 version: 1,
                 fetched_at: now,
                 expires_at,
                 event_count: events.len(),
+                sha256: Some(events_sha256),
             },
             events: events.to_vec(),
         };
@@ -472,7 +793,8 @@ impl CalendarClient {
         static CACHE_WRITE_COUNTER: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(0);
 
-        // Atomic write: write to unique sibling temp file, flush to disk, then rename.
+        // Atomic write: write to unique sibling temp file with restrictive 0600 perms on Unix,
+        // flush to disk, then rename.
         // Combines PID, timestamp nanoseconds, and an atomic counter to prevent collision
         // when multiple threads or tasks write cache concurrently within the same process.
         let counter = CACHE_WRITE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -484,10 +806,29 @@ impl CalendarClient {
         let temp_path = path.with_extension(format!("tmp.{pid}.{nanos}.{counter}"));
         let write_result = (|| -> std::io::Result<()> {
             use std::io::Write;
+            #[cfg(unix)]
+            let mut file = {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&temp_path)?
+            };
+            #[cfg(not(unix))]
             let mut file = std::fs::File::create(&temp_path)?;
+
             file.write_all(json.as_bytes())?;
             file.sync_all()?;
             std::fs::rename(&temp_path, path)?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+
             Ok(())
         })();
 
@@ -496,7 +837,7 @@ impl CalendarClient {
             return Err(crate::error::RedFolderError::Io(e));
         }
 
-        debug!(path=%path.display(), count=%events.len(), "saved calendar cache atomically with metadata");
+        debug!(path=%path.display(), count=%events.len(), "saved calendar cache atomically with metadata and checksum");
         Ok(())
     }
 
@@ -527,6 +868,20 @@ impl CalendarClient {
                     );
                     return None;
                 }
+
+                if let Some(ref expected_sha) = cached.metadata.sha256 {
+                    let actual_sha = compute_events_sha256(&cached.events);
+                    if actual_sha != *expected_sha {
+                        warn!(
+                            path = %path.display(),
+                            expected = %expected_sha,
+                            actual = %actual_sha,
+                            "calendar cache sha256 checksum mismatch; rejecting tampered or corrupted cache"
+                        );
+                        return None;
+                    }
+                }
+
                 debug!(path=%path.display(), version=%cached.metadata.version, count=%cached.events.len(), "loaded structured calendar cache v1");
                 return Some(cached);
             } else {
@@ -544,6 +899,7 @@ impl CalendarClient {
                     fetched_at: DateTime::<Utc>::UNIX_EPOCH,
                     expires_at: None,
                     event_count: events.len(),
+                    sha256: None,
                 },
                 events,
             });
@@ -1118,5 +1474,90 @@ mod tests {
         let dir = CalendarClient::default_cache_dir();
         assert!(!dir.as_os_str().is_empty());
         assert!(dir.to_string_lossy().contains("redfolder"));
+    }
+
+    #[test]
+    fn test_cache_sha256_checksum_and_tampering() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = CalendarClient::new(Some(dir.path().to_path_buf()));
+
+        let events = vec![RawCalendarEvent {
+            title: "US CPI Release".into(),
+            country: "USD".into(),
+            date: "2026-06-05".into(),
+            time: "12:30".into(),
+            impact: "High".into(),
+        }];
+
+        // Save cache
+        client.save_cache(&events).expect("cache save must succeed");
+
+        // Verify valid load with sha256
+        let loaded = client.load_cache_data().expect("cache should load cleanly");
+        assert_eq!(loaded.events.len(), 1);
+        assert!(loaded.metadata.sha256.is_some());
+
+        // Tamper with cache file content while keeping valid JSON structure
+        let cache_file = dir.path().join(DEFAULT_CACHE_FILENAME);
+        let content = std::fs::read_to_string(&cache_file).unwrap();
+        // Replace "US CPI Release" with "Tampered Event"
+        let tampered = content.replace("US CPI Release", "Tampered Event");
+        std::fs::write(&cache_file, tampered).unwrap();
+
+        // Loading tampered cache must detect checksum mismatch and return None
+        let result = client.load_cache_data();
+        assert!(
+            result.is_none(),
+            "load_cache_data must reject cache with modified content due to sha256 checksum mismatch"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cache_file_permissions_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let client = CalendarClient::new(Some(dir.path().to_path_buf()));
+
+        let events = vec![RawCalendarEvent {
+            title: "Permission Test Event".into(),
+            country: "USD".into(),
+            date: "2026-06-05".into(),
+            time: "12:30".into(),
+            impact: "High".into(),
+        }];
+
+        client.save_cache(&events).unwrap();
+        let cache_file = dir.path().join(DEFAULT_CACHE_FILENAME);
+        let metadata = std::fs::metadata(&cache_file).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "cache file must have restrictive 0600 permissions on Unix"
+        );
+    }
+
+    #[test]
+    fn test_client_builder_options() {
+        let client = CalendarClient::without_cache()
+            .with_fallback_url("https://fallback1.internal.org/calendar.json")
+            .with_fallback_urls(vec!["https://fallback2.internal.org/calendar.json"])
+            .with_max_response_bytes(5 * 1024 * 1024)
+            .with_max_event_count(10_000)
+            .with_max_retries(4)
+            .with_backoff(Duration::from_millis(200), Duration::from_secs(5))
+            .with_overall_timeout(Duration::from_secs(15));
+
+        assert_eq!(client.fallback_urls().len(), 2);
+        assert_eq!(
+            client.fallback_urls()[0],
+            "https://fallback1.internal.org/calendar.json"
+        );
+        assert_eq!(client.max_response_bytes(), 5 * 1024 * 1024);
+        assert_eq!(client.max_event_count(), 10_000);
+        assert_eq!(client.max_retries(), 4);
+        assert_eq!(client.backoff_initial_delay(), Duration::from_millis(200));
+        assert_eq!(client.max_retry_after(), Duration::from_secs(5));
+        assert_eq!(client.overall_timeout(), Some(Duration::from_secs(15)));
     }
 }
