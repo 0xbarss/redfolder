@@ -132,7 +132,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cache_dir = cli
         .cache_dir
-        .or_else(|| Some(CalendarClient::default_cache_dir()));
+        .or_else(|| CalendarClient::try_default_cache_dir().ok());
 
     // Configure a 15-minute default cache TTL to prevent rate limit hammering
     let client = CalendarClient::new(cache_dir).with_ttl(Duration::from_secs(900));

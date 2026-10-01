@@ -48,7 +48,30 @@ pub const MAX_RETRIES_LIMIT: usize = 10;
 pub const DEFAULT_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-/// Computes a deterministic SHA-256 hex string over serialized raw calendar events for cache integrity verification.
+/// Computes a deterministic SHA-256 hex string over cache schema version, fetched_at timestamp,
+/// event count, and serialized raw calendar events for cache v2 integrity verification.
+fn compute_cache_digest(
+    version: u32,
+    fetched_at: DateTime<Utc>,
+    events: &[RawCalendarEvent],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"redfolder-cache\0");
+    hasher.update(version.to_le_bytes());
+    hasher.update(
+        fetched_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+            .as_bytes(),
+    );
+    hasher.update((events.len() as u64).to_le_bytes());
+    if let Ok(bytes) = serde_json::to_vec(events) {
+        hasher.update(&bytes);
+    }
+    let result = hasher.finalize();
+    format!("{result:x}")
+}
+
+/// Computes a deterministic SHA-256 hex string over serialized raw calendar events for legacy cache v1 integrity verification.
 fn compute_events_sha256(events: &[RawCalendarEvent]) -> String {
     let mut hasher = Sha256::new();
     if let Ok(bytes) = serde_json::to_vec(events) {
@@ -56,6 +79,53 @@ fn compute_events_sha256(events: &[RawCalendarEvent]) -> String {
     }
     let result = hasher.finalize();
     format!("{result:x}")
+}
+
+#[cfg(unix)]
+fn verify_private_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let md = std::fs::symlink_metadata(dir)?;
+    if md.file_type().is_symlink() || !md.is_dir() {
+        return Err(crate::error::RedFolderError::Config(format!(
+            "cache dir {} is not a plain directory",
+            dir.display()
+        )));
+    }
+    // Ownership without unsafe/libc: a file we create is owned by our effective uid.
+    let probe = dir.join(format!(".rf_probe_{}", std::process::id()));
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)?;
+    let my_uid = f.metadata()?.uid();
+    drop(f);
+    let _ = std::fs::remove_file(&probe);
+    if md.uid() != my_uid {
+        return Err(crate::error::RedFolderError::Config(format!(
+            "cache dir {} is owned by another user",
+            dir.display()
+        )));
+    }
+    if md.permissions().mode() & 0o022 != 0 {
+        return Err(crate::error::RedFolderError::Config(format!(
+            "cache dir {} is accessible by group/others (mode {:o})",
+            dir.display(),
+            md.permissions().mode() & 0o777
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_private_dir(dir: &Path) -> Result<()> {
+    let md = std::fs::symlink_metadata(dir)?;
+    if !md.is_dir() {
+        return Err(crate::error::RedFolderError::Config(format!(
+            "cache dir {} is not a directory",
+            dir.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Pluggable validator callback for custom cryptographic verification or business sanity checks on fetched calendar events.
@@ -254,63 +324,62 @@ fn fallback_client() -> Client {
 }
 
 impl CalendarClient {
-    /// Returns the default platform cache directory for redfolder.
+    /// Returns the default platform cache directory for redfolder, derived safely from the environment.
     ///
-    /// - On Windows: Respects `%LOCALAPPDATA%\redfolder\cache`, `%APPDATA%\redfolder\cache`, or `%USERPROFILE%\.cache\redfolder`.
-    /// - On Linux/Unix: Respects `$XDG_CACHE_HOME/redfolder` or `$HOME/.cache/redfolder`.
-    /// - Fallback: System temporary directory (`redfolder_cache`).
-    #[must_use]
-    pub fn default_cache_dir() -> PathBuf {
+    /// Refuses to fall back to a shared system temporary directory to prevent cache poisoning
+    /// and local privilege escalation vulnerabilities on multi-user hosts.
+    pub fn try_default_cache_dir() -> Result<PathBuf> {
         #[cfg(windows)]
         {
             if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-                return PathBuf::from(local_app_data)
+                return Ok(PathBuf::from(local_app_data)
                     .join("redfolder")
-                    .join("cache");
+                    .join("cache"));
             }
             if let Ok(app_data) = std::env::var("APPDATA") {
-                return PathBuf::from(app_data).join("redfolder").join("cache");
+                return Ok(PathBuf::from(app_data).join("redfolder").join("cache"));
             }
             if let Ok(user_profile) = std::env::var("USERPROFILE") {
-                return PathBuf::from(user_profile).join(".cache").join("redfolder");
+                return Ok(PathBuf::from(user_profile).join(".cache").join("redfolder"));
             }
         }
 
         #[cfg(not(windows))]
         {
             if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
-                return PathBuf::from(xdg).join("redfolder");
+                return Ok(PathBuf::from(xdg).join("redfolder"));
             }
             if let Ok(home) = std::env::var("HOME") {
-                return PathBuf::from(home).join(".cache").join("redfolder");
+                return Ok(PathBuf::from(home).join(".cache").join("redfolder"));
             }
         }
 
-        // Generic cross-platform fallback for custom or test environments
-        if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
-            return PathBuf::from(xdg).join("redfolder");
-        }
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(".cache").join("redfolder");
-        }
-        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-            return PathBuf::from(local_app_data)
-                .join("redfolder")
-                .join("cache");
-        }
-        if let Ok(user_profile) = std::env::var("USERPROFILE") {
-            return PathBuf::from(user_profile).join(".cache").join("redfolder");
-        }
+        Err(crate::error::RedFolderError::Config(
+            "no standard user cache directory found in environment (XDG_CACHE_HOME, HOME, LOCALAPPDATA); refusing to fall back to shared temp directory".into(),
+        ))
+    }
 
-        warn!(
-            "falling back to system temp directory for calendar cache. On shared/multi-user systems, consider configuring an explicit cache path or XDG_CACHE_HOME/LOCALAPPDATA to prevent cache tampering"
-        );
-        std::env::temp_dir().join("redfolder_cache")
+    /// Returns the default platform cache directory for redfolder.
+    ///
+    /// Deprecated: may fall back to a shared temporary directory if environment variables are missing.
+    /// Prefer [`try_default_cache_dir`](Self::try_default_cache_dir).
+    #[deprecated(note = "may fall back to a shared temp directory; use try_default_cache_dir()")]
+    #[must_use]
+    pub fn default_cache_dir() -> PathBuf {
+        Self::try_default_cache_dir().unwrap_or_else(|_| {
+            warn!(
+                "falling back to system temp directory for calendar cache. On shared/multi-user systems, consider configuring an explicit cache path or XDG_CACHE_HOME/LOCALAPPDATA to prevent cache tampering"
+            );
+            std::env::temp_dir().join("redfolder_cache")
+        })
     }
 
     /// Create a new `CalendarClient` with an optional cache directory fallibly.
     pub fn try_new(cache_dir: Option<PathBuf>) -> Result<Self> {
-        let dir = cache_dir.or_else(|| Some(Self::default_cache_dir()));
+        let dir = match cache_dir {
+            Some(d) => Some(d),
+            None => Self::try_default_cache_dir().ok(),
+        };
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .user_agent(DEFAULT_USER_AGENT)
@@ -324,12 +393,15 @@ impl CalendarClient {
     }
 
     /// Create a new `CalendarClient` with an optional cache directory.
-    /// If `None`, defaults to `CalendarClient::default_cache_dir()`.
+    /// If `None`, attempts to safely derive platform default user cache or runs without cache.
     #[must_use]
     pub fn new(cache_dir: Option<PathBuf>) -> Self {
         Self::try_new(cache_dir.clone()).unwrap_or_else(|err| {
             error!(err=%err, "failed to build configured HTTP client; falling back to default with User-Agent");
-            let dir = cache_dir.or_else(|| Some(Self::default_cache_dir()));
+            let dir = match cache_dir {
+                Some(d) => Some(d),
+                None => Self::try_default_cache_dir().ok(),
+            };
             Self::with_options(fallback_client(), CALENDAR_URL, dir, Duration::from_secs(30))
         })
     }
@@ -359,7 +431,10 @@ impl CalendarClient {
 
     /// Create a new `CalendarClient` with a custom User-Agent string.
     pub fn with_user_agent(cache_dir: Option<PathBuf>, user_agent: &str) -> Result<Self> {
-        let dir = cache_dir.or_else(|| Some(Self::default_cache_dir()));
+        let dir = match cache_dir {
+            Some(d) => Some(d),
+            None => Self::try_default_cache_dir().ok(),
+        };
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .user_agent(user_agent)
@@ -980,12 +1055,20 @@ impl CalendarClient {
         };
 
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            if !parent.exists() {
+                std::fs::create_dir_all(parent)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if parent.file_name() == Some(std::ffi::OsStr::new("redfolder")) {
+                        let _ = std::fs::set_permissions(
+                            parent,
+                            std::fs::Permissions::from_mode(0o700),
+                        );
+                    }
+                }
             }
+            verify_private_dir(parent)?;
         }
 
         let now = fetched_at;
@@ -993,15 +1076,15 @@ impl CalendarClient {
             .cache_ttl
             .and_then(|ttl| chrono::Duration::from_std(ttl).ok().map(|d| now + d));
 
-        let events_sha256 = compute_events_sha256(events);
+        let cache_digest = compute_cache_digest(2, now, events);
 
         let cached_data = CachedCalendarData {
             metadata: CacheMetadata {
-                version: 1,
+                version: 2,
                 fetched_at: now,
                 expires_at,
                 event_count: events.len(),
-                sha256: Some(events_sha256),
+                sha256: Some(cache_digest),
             },
             events: events.to_vec(),
         };
@@ -1043,6 +1126,9 @@ impl CalendarClient {
 
             #[cfg(unix)]
             {
+                if let Some(p) = path.parent() {
+                    let _ = std::fs::File::open(p).and_then(|d| d.sync_all());
+                }
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
             }
@@ -1055,7 +1141,7 @@ impl CalendarClient {
             return Err(crate::error::RedFolderError::Io(e));
         }
 
-        debug!(path=%path.display(), count=%events.len(), "saved calendar cache atomically with metadata and checksum");
+        debug!(path=%path.display(), count=%events.len(), "saved calendar cache atomically with v2 metadata and digest");
         Ok(())
     }
 
@@ -1064,6 +1150,25 @@ impl CalendarClient {
         let path = self.cache_path.as_ref()?;
         if !path.exists() {
             return None;
+        }
+
+        if let Some(parent) = path.parent() {
+            if let Err(e) = verify_private_dir(parent) {
+                error!(path=%path.display(), err=%e, "cache directory security verification failed; refusing to read cache");
+                return None;
+            }
+        }
+
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() > (self.max_response_bytes as u64).saturating_mul(2) {
+                warn!(
+                    path = %path.display(),
+                    size = meta.len(),
+                    limit = self.max_response_bytes * 2,
+                    "cache file exceeds maximum size limit; rejecting corrupted cache"
+                );
+                return None;
+            }
         }
 
         let data = match std::fs::read_to_string(path) {
@@ -1076,7 +1181,7 @@ impl CalendarClient {
 
         // 1. Try parsing full CachedCalendarData with metadata
         if let Ok(cached) = serde_json::from_str::<CachedCalendarData>(&data) {
-            if cached.metadata.version == 1 {
+            if cached.metadata.version == 2 {
                 if cached.metadata.event_count != cached.events.len() {
                     warn!(
                         path = %path.display(),
@@ -1087,20 +1192,117 @@ impl CalendarClient {
                     return None;
                 }
 
-                if let Some(ref expected_sha) = cached.metadata.sha256 {
-                    let actual_sha = compute_events_sha256(&cached.events);
-                    if actual_sha != *expected_sha {
+                let Some(ref expected_sha) = cached.metadata.sha256 else {
+                    warn!(
+                        path = %path.display(),
+                        "cache v2 missing mandatory sha256 digest; rejecting"
+                    );
+                    return None;
+                };
+
+                let actual_sha =
+                    compute_cache_digest(2, cached.metadata.fetched_at, &cached.events);
+                if actual_sha != *expected_sha {
+                    warn!(
+                        path = %path.display(),
+                        expected = %expected_sha,
+                        actual = %actual_sha,
+                        "calendar cache v2 digest mismatch; rejecting tampered or corrupted cache"
+                    );
+                    return None;
+                }
+
+                if cached.events.len() > self.max_event_count {
+                    warn!(
+                        path = %path.display(),
+                        count = cached.events.len(),
+                        max = self.max_event_count,
+                        "cache contains more events than allowed by max_event_count; rejecting"
+                    );
+                    return None;
+                }
+
+                for ev in &cached.events {
+                    if ev.title.len() > 500 || ev.country.len() > 10 || ev.date.trim().is_empty() {
                         warn!(
                             path = %path.display(),
-                            expected = %expected_sha,
-                            actual = %actual_sha,
-                            "calendar cache sha256 checksum mismatch; rejecting tampered or corrupted cache"
+                            title_len = ev.title.len(),
+                            country_len = ev.country.len(),
+                            "cache contains malformed events violating ingestion bounds; rejecting"
                         );
                         return None;
                     }
                 }
 
-                debug!(path=%path.display(), version=%cached.metadata.version, count=%cached.events.len(), "loaded structured calendar cache v1");
+                if let Some(ref validator) = self.integrity_validator {
+                    if let Err(e) = validator(&cached.events) {
+                        warn!(path = %path.display(), err = %e, "integrity validator rejected cached payload");
+                        return None;
+                    }
+                }
+
+                debug!(path=%path.display(), count=%cached.events.len(), "loaded structured calendar cache v2");
+                return Some(cached);
+            } else if cached.metadata.version == 1 {
+                if cached.metadata.event_count != cached.events.len() {
+                    warn!(
+                        path = %path.display(),
+                        expected = cached.metadata.event_count,
+                        actual = cached.events.len(),
+                        "calendar cache event count mismatch; rejecting corrupted cache"
+                    );
+                    return None;
+                }
+
+                let Some(ref expected_sha) = cached.metadata.sha256 else {
+                    warn!(
+                        path = %path.display(),
+                        "legacy cache v1 missing sha256 checksum; rejecting"
+                    );
+                    return None;
+                };
+
+                let actual_sha = compute_events_sha256(&cached.events);
+                if actual_sha != *expected_sha {
+                    warn!(
+                        path = %path.display(),
+                        expected = %expected_sha,
+                        actual = %actual_sha,
+                        "calendar cache v1 sha256 checksum mismatch; rejecting tampered cache"
+                    );
+                    return None;
+                }
+
+                if cached.events.len() > self.max_event_count {
+                    warn!(
+                        path = %path.display(),
+                        count = cached.events.len(),
+                        max = self.max_event_count,
+                        "cache contains more events than allowed by max_event_count; rejecting"
+                    );
+                    return None;
+                }
+
+                for ev in &cached.events {
+                    if ev.title.len() > 500 || ev.country.len() > 10 || ev.date.trim().is_empty() {
+                        warn!(
+                            path = %path.display(),
+                            title_len = ev.title.len(),
+                            country_len = ev.country.len(),
+                            "cache contains malformed events violating ingestion bounds; rejecting"
+                        );
+                        return None;
+                    }
+                }
+
+                if let Some(ref validator) = self.integrity_validator {
+                    if let Err(e) = validator(&cached.events) {
+                        warn!(path = %path.display(), err = %e, "integrity validator rejected cached payload");
+                        return None;
+                    }
+                }
+
+                debug!(path=%path.display(), count=%cached.events.len(), "loaded legacy calendar cache v1; will upgrade to v2 on next save");
                 return Some(cached);
             } else {
                 warn!(path=%path.display(), version=%cached.metadata.version, "unsupported cache version; ignoring");
@@ -1165,6 +1367,9 @@ impl CalendarClient {
         }
         if data.metadata.version == 0 {
             return Some("legacy cache has no fetch timestamp".into());
+        }
+        if data.metadata.version == 1 && data.metadata.sha256.is_none() {
+            return Some("legacy cache v1 has no integrity checksum".into());
         }
         let Some(max_stale) = self.max_stale_cache_age else {
             return Some("stale-cache fallback is disabled".into());
@@ -1561,7 +1766,7 @@ mod tests {
         let structured = client
             .load_cache_data()
             .expect("structured cache should load");
-        assert_eq!(structured.metadata.version, 1);
+        assert_eq!(structured.metadata.version, 2);
         assert_eq!(structured.metadata.event_count, 1);
         assert!(client.is_cache_valid());
     }
@@ -1758,6 +1963,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_default_cache_dir() {
         let dir = CalendarClient::default_cache_dir();
         assert!(!dir.as_os_str().is_empty());

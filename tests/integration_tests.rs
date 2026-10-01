@@ -3,6 +3,7 @@ mod common;
 use chrono::{Duration, Utc};
 use redfolder::events::{EventListener, RedFolderEvent};
 use redfolder::prelude::*;
+use sha2::Digest;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -746,24 +747,17 @@ async fn test_stale_cache_policy_enforcement() {
 
     // Write a cache with fetched_at set to 48 hours ago
     let old_fetched_at = Utc::now() - chrono::Duration::hours(48);
-    let old_cache = redfolder::calendar::CachedCalendarData {
-        metadata: redfolder::calendar::CacheMetadata {
-            version: 1,
-            fetched_at: old_fetched_at,
-            expires_at: None,
-            event_count: 1,
-            sha256: None,
-        },
-        events: vec![redfolder::calendar::RawCalendarEvent {
-            title: "Stale NFP".into(),
-            country: "USD".into(),
-            date: "2026-06-05T12:30:00Z".into(),
-            time: "".into(),
-            impact: "High".into(),
-        }],
-    };
-    let json = serde_json::to_string(&old_cache).unwrap();
-    std::fs::write(cache_dir.join(redfolder::DEFAULT_CACHE_FILENAME), json).unwrap();
+    let events = vec![redfolder::calendar::RawCalendarEvent {
+        title: "Stale NFP".into(),
+        country: "USD".into(),
+        date: "2026-06-05T12:30:00Z".into(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+    let client_writer = common::offline_client(Some(cache_dir.clone()));
+    client_writer
+        .save_cache_at(&events, old_fetched_at)
+        .unwrap();
 
     // 1. Client with max_stale_age = 24h (cache is 48h old, so it MUST be rejected)
     let client_strict = redfolder::calendar::CalendarClient::with_options(
@@ -2931,4 +2925,225 @@ async fn test_disabling_fallback_does_not_disable_staleness() {
 
     assert!(service.is_calendar_stale().await);
     assert!(service.is_blackout("prop").await);
+}
+
+#[test]
+fn test_tampered_fetched_at_is_rejected() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+    let client = common::offline_client(Some(cache_dir.clone()));
+
+    let events = vec![redfolder::calendar::RawCalendarEvent {
+        title: "CPI Release".into(),
+        country: "USD".into(),
+        date: "2026-06-15T12:30:00Z".into(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+
+    client.save_cache(&events).expect("clean save");
+    let cache_file = cache_dir.join(redfolder::DEFAULT_CACHE_FILENAME);
+    let original_json = std::fs::read_to_string(&cache_file).unwrap();
+
+    // Verify clean load
+    let loaded = client.load_cache_data().expect("must load clean cache v2");
+    assert_eq!(loaded.metadata.version, 2);
+
+    // Tamper with fetched_at timestamp only (simulating an attacker or bug trying to make stale cache appear fresh)
+    let mut val: serde_json::Value = serde_json::from_str(&original_json).unwrap();
+    let new_fetched_at = (loaded.metadata.fetched_at + chrono::Duration::hours(5)).to_rfc3339();
+    val["metadata"]["fetched_at"] = serde_json::Value::String(new_fetched_at);
+    std::fs::write(&cache_file, serde_json::to_string(&val).unwrap()).unwrap();
+
+    // Load must reject tampered cache because v2 digest covers fetched_at
+    assert!(
+        client.load_cache_data().is_none(),
+        "load_cache_data must reject cache with tampered fetched_at timestamp"
+    );
+}
+
+#[test]
+fn test_missing_sha256_is_rejected_for_v2() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+    let client = common::offline_client(Some(cache_dir.clone()));
+
+    let events = vec![redfolder::calendar::RawCalendarEvent {
+        title: "FOMC Rate Decision".into(),
+        country: "USD".into(),
+        date: "2026-06-15T18:00:00Z".into(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+
+    client.save_cache(&events).expect("clean save");
+    let cache_file = cache_dir.join(redfolder::DEFAULT_CACHE_FILENAME);
+    let mut data: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&cache_file).unwrap()).unwrap();
+
+    // Strip sha256 from metadata
+    if let Some(meta) = data.get_mut("metadata") {
+        if let Some(obj) = meta.as_object_mut() {
+            obj.remove("sha256");
+        }
+    }
+    std::fs::write(&cache_file, serde_json::to_string(&data).unwrap()).unwrap();
+
+    // Missing sha256 is rejected for v2 cache
+    assert!(
+        client.load_cache_data().is_none(),
+        "cache v2 with missing sha256 must be rejected"
+    );
+}
+
+#[test]
+fn test_legacy_v1_cache_with_valid_sha256_is_accepted_and_upgrades_to_v2() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+    let client = common::offline_client(Some(cache_dir.clone()));
+
+    let events = vec![redfolder::calendar::RawCalendarEvent {
+        title: "NFP Employment".into(),
+        country: "USD".into(),
+        date: "2026-06-05T12:30:00Z".into(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+
+    // Compute legacy events-only sha256
+    let mut hasher = sha2::Sha256::new();
+    sha2::Digest::update(&mut hasher, serde_json::to_vec(&events).unwrap());
+    let events_sha = format!("{:x}", sha2::Digest::finalize(hasher));
+
+    let v1_cache = redfolder::calendar::CachedCalendarData {
+        metadata: redfolder::calendar::CacheMetadata {
+            version: 1,
+            fetched_at: chrono::Utc::now() - chrono::Duration::hours(1),
+            expires_at: None,
+            event_count: 1,
+            sha256: Some(events_sha),
+        },
+        events: events.clone(),
+    };
+
+    let cache_file = cache_dir.join(redfolder::DEFAULT_CACHE_FILENAME);
+    std::fs::write(&cache_file, serde_json::to_string(&v1_cache).unwrap()).unwrap();
+
+    // Load v1 cache with valid sha256 succeeds
+    let loaded = client.load_cache_data().expect("legacy v1 cache must load");
+    assert_eq!(loaded.metadata.version, 1);
+
+    // Saving cache rewrites it as v2
+    client.save_cache(&events).expect("save must succeed");
+    let upgraded = client
+        .load_cache_data()
+        .expect("upgraded v2 cache must load");
+    assert_eq!(upgraded.metadata.version, 2);
+}
+
+#[test]
+fn test_cache_exceeding_max_response_bytes_is_rejected() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+    let client = common::offline_client(Some(cache_dir.clone())).with_max_response_bytes(100);
+
+    let cache_file = cache_dir.join(redfolder::DEFAULT_CACHE_FILENAME);
+    // Write 500 bytes of data (exceeds 100 * 2 = 200 bytes limit)
+    let large_garbage = "x".repeat(500);
+    std::fs::write(&cache_file, large_garbage).unwrap();
+
+    assert!(
+        client.load_cache_data().is_none(),
+        "cache file exceeding max_response_bytes limit must be rejected"
+    );
+}
+
+#[test]
+fn test_cache_with_oversized_fields_rejected() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+    let client = common::offline_client(Some(cache_dir.clone()));
+
+    let oversized_event = redfolder::calendar::RawCalendarEvent {
+        title: "A".repeat(600), // Exceeds 500 characters limit
+        country: "USD".into(),
+        date: "2026-06-05T12:30:00Z".into(),
+        time: "".into(),
+        impact: "High".into(),
+    };
+
+    let cache_file = cache_dir.join(redfolder::DEFAULT_CACHE_FILENAME);
+    // Save valid structure with oversized event
+    let now = chrono::Utc::now();
+    let mut hasher = sha2::Sha256::new();
+    sha2::Digest::update(&mut hasher, b"redfolder-cache\0");
+    sha2::Digest::update(&mut hasher, 2u32.to_le_bytes());
+    sha2::Digest::update(
+        &mut hasher,
+        now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+            .as_bytes(),
+    );
+    sha2::Digest::update(&mut hasher, 1u64.to_le_bytes());
+    sha2::Digest::update(
+        &mut hasher,
+        serde_json::to_vec(std::slice::from_ref(&oversized_event)).unwrap(),
+    );
+    let digest = format!("{:x}", sha2::Digest::finalize(hasher));
+
+    let cache_data = redfolder::calendar::CachedCalendarData {
+        metadata: redfolder::calendar::CacheMetadata {
+            version: 2,
+            fetched_at: now,
+            expires_at: None,
+            event_count: 1,
+            sha256: Some(digest),
+        },
+        events: vec![oversized_event],
+    };
+    std::fs::write(&cache_file, serde_json::to_string(&cache_data).unwrap()).unwrap();
+
+    assert!(
+        client.load_cache_data().is_none(),
+        "cache containing oversized event fields must be rejected"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_group_writable_cache_dir_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let group_writable_dir = temp_dir.path().join("group_shared");
+    std::fs::create_dir(&group_writable_dir).unwrap();
+    std::fs::set_permissions(&group_writable_dir, std::fs::Permissions::from_mode(0o770)).unwrap();
+
+    let client = common::offline_client(Some(group_writable_dir));
+    let events = vec![redfolder::calendar::RawCalendarEvent {
+        title: "Test Event".into(),
+        country: "USD".into(),
+        date: "2026-06-05T12:30:00Z".into(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+
+    // save_cache must fail on group-writable directory
+    let save_res = client.save_cache(&events);
+    assert!(
+        save_res.is_err(),
+        "save_cache must return error on group-writable cache directory"
+    );
+
+    // load_cache_data must refuse to read from group-writable directory
+    assert!(
+        client.load_cache_data().is_none(),
+        "load_cache_data must return None on group-writable directory"
+    );
+}
+
+#[test]
+fn test_try_default_cache_dir_returns_valid_path() {
+    let res = redfolder::calendar::CalendarClient::try_default_cache_dir();
+    assert!(res.is_ok());
+    let path = res.unwrap();
+    assert!(path.to_string_lossy().contains("redfolder"));
 }
