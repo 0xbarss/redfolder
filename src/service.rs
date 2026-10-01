@@ -1,4 +1,4 @@
-use crate::calendar::CalendarClient;
+use crate::calendar::{CalendarClient, IngestStats, SnapshotSource};
 use crate::config::RedFolderConfig;
 use crate::engine::BlackoutEngine;
 use crate::error::Result;
@@ -26,6 +26,36 @@ pub enum ServiceState {
     Stopping,
 }
 
+/// The outcome of an economic calendar refresh attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshOutcome {
+    /// Fresh data (remote or valid TTL cache). Next attempt: next midnight.
+    Fresh,
+    /// Usable but degraded (fallback / empty-feed cache). Keep retrying.
+    Degraded,
+}
+
+impl RefreshOutcome {
+    /// Whether this outcome represents a freshly synchronized calendar.
+    #[must_use]
+    pub fn is_fresh(self) -> bool {
+        matches!(self, Self::Fresh)
+    }
+
+    /// Whether this outcome represents a degraded calendar served from fallback cache.
+    #[must_use]
+    pub fn is_degraded(self) -> bool {
+        matches!(self, Self::Degraded)
+    }
+}
+
+/// Default maximum acceptable age for calendar data (36 hours).
+pub const DEFAULT_MAX_DATA_AGE: std::time::Duration = std::time::Duration::from_secs(36 * 3600);
+
+/// Default maximum ratio of unparseable events allowed before snapshot rejection (5%).
+pub const DEFAULT_MAX_UNPARSEABLE_RATIO: f64 = 0.05;
+
 /// Internal state tracking for an individual registered worker or strategy.
 struct WorkerState {
     config: RedFolderConfig,
@@ -43,7 +73,12 @@ struct ServiceSyncMeta {
     state: ServiceState,
     last_fetch_date: Option<NaiveDate>,
     last_sync_time: Option<DateTime<Utc>>,
+    last_remote_success: Option<DateTime<Utc>>,
+    data_source: Option<SnapshotSource>,
+    ingest: Option<IngestStats>,
     last_sync_error: Option<String>,
+    max_data_age: std::time::Duration,
+    max_unparseable_ratio: f64,
 }
 
 /// Async service that orchestrates daily economic calendar synchronization and event-driven blackout alerts.
@@ -73,6 +108,23 @@ pub struct RedFolderService {
 /// Minimum allowable check interval for periodic evaluation to prevent CPU busy loops.
 pub const MIN_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Single retry ladder delays in seconds for degraded or failed refreshes (1m -> 2m -> 5m -> 15m).
+const RETRY_LADDER: [u64; 4] = [60, 120, 300, 900];
+
+/// Calculates duration until next UTC midnight.
+fn until_next_midnight() -> std::time::Duration {
+    let now = Utc::now();
+    let next = (now + Duration::days(1))
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc();
+    (next - now)
+        .to_std()
+        .unwrap_or(std::time::Duration::from_secs(1))
+        .max(std::time::Duration::from_secs(1))
+}
+
 impl RedFolderService {
     /// Create a new `RedFolderService` with an optional cache directory.
     pub fn new(cache_dir: Option<PathBuf>) -> Self {
@@ -83,6 +135,7 @@ impl RedFolderService {
     pub fn with_client(client: CalendarClient) -> Self {
         let (broadcast_tx, _) = broadcast::channel(256);
         let notify = Arc::new(Notify::new());
+        let max_data_age = client.max_stale_cache_age().unwrap_or(DEFAULT_MAX_DATA_AGE);
         Self {
             engine: Arc::new(RwLock::new(BlackoutEngine::new())),
             workers: Arc::new(RwLock::new(HashMap::new())),
@@ -93,7 +146,12 @@ impl RedFolderService {
                 state: ServiceState::Stopped,
                 last_fetch_date: None,
                 last_sync_time: None,
+                last_remote_success: None,
+                data_source: None,
+                ingest: None,
                 last_sync_error: None,
+                max_data_age,
+                max_unparseable_ratio: DEFAULT_MAX_UNPARSEABLE_RATIO,
             })),
             refresh_lock: Arc::new(Mutex::new(())),
             broadcast_tx,
@@ -148,32 +206,70 @@ impl RedFolderService {
         self.notify.notify_waiters();
     }
 
-    /// Checks if calendar data is considered stale based on configured maximum stale age.
+    /// Checks if calendar data is considered stale based on configured maximum data age.
     pub async fn is_calendar_stale(&self) -> bool {
         self.check_calendar_staleness().await
     }
 
-    async fn check_calendar_staleness(&self) -> bool {
-        let (last_sync, max_age) = {
-            let meta = self.sync_meta.lock().await;
-            (meta.last_sync_time, meta.client.max_stale_cache_age())
-        };
-        let is_empty = self.engine.read().await.is_empty();
-        let is_stale = if let Some(last_sync) = last_sync {
-            if let Some(max_age) = max_age {
-                if let Ok(chrono_dur) = Duration::from_std(max_age) {
-                    Utc::now() - last_sync > chrono_dur
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            is_empty
-        };
-        self.engine.write().await.set_stale(is_stale);
-        is_stale
+    /// Pure read-lock staleness check without mutating the engine lock.
+    pub async fn check_calendar_staleness(&self) -> bool {
+        let engine = self.engine.read().await;
+        engine.is_empty() || engine.is_stale_at(Utc::now())
+    }
+
+    /// Returns the data source provenance for the currently loaded calendar snapshot, if any.
+    pub async fn data_source(&self) -> Option<SnapshotSource> {
+        self.sync_meta.lock().await.data_source
+    }
+
+    /// Returns the ingestion statistics for the currently loaded calendar snapshot, if any.
+    pub async fn ingest_stats(&self) -> Option<IngestStats> {
+        self.sync_meta.lock().await.ingest.clone()
+    }
+
+    /// Returns the timestamp of the last successful remote download, if any.
+    pub async fn last_remote_success(&self) -> Option<DateTime<Utc>> {
+        self.sync_meta.lock().await.last_remote_success
+    }
+
+    /// Returns the configured maximum acceptable data age.
+    pub async fn max_data_age(&self) -> std::time::Duration {
+        self.sync_meta.lock().await.max_data_age
+    }
+
+    /// Set the maximum acceptable age before calendar data is considered stale.
+    ///
+    /// Must be at least 60 seconds.
+    pub async fn set_max_data_age(&self, age: std::time::Duration) -> Result<()> {
+        if age < std::time::Duration::from_secs(60) {
+            return Err(crate::error::RedFolderError::Config(
+                "max_data_age must be at least 60s".to_string(),
+            ));
+        }
+        self.sync_meta.lock().await.max_data_age = age;
+        if let Ok(chrono_age) = Duration::from_std(age) {
+            self.engine.write().await.set_max_data_age(chrono_age);
+        }
+        self.notify.notify_waiters();
+        Ok(())
+    }
+
+    /// Returns the configured maximum ratio of unparseable events allowed (0.0 ..= 1.0).
+    pub async fn max_unparseable_ratio(&self) -> f64 {
+        self.sync_meta.lock().await.max_unparseable_ratio
+    }
+
+    /// Set the maximum ratio of unparseable events allowed before a calendar snapshot is rejected.
+    ///
+    /// Must be within 0.0..=1.0.
+    pub async fn set_max_unparseable_ratio(&self, ratio: f64) -> Result<()> {
+        if !(0.0..=1.0).contains(&ratio) {
+            return Err(crate::error::RedFolderError::Config(
+                "max_unparseable_ratio must be within 0.0..=1.0".to_string(),
+            ));
+        }
+        self.sync_meta.lock().await.max_unparseable_ratio = ratio;
+        Ok(())
     }
 
     /// Evaluates blackout status and warnings for all registered workers,
@@ -565,62 +661,49 @@ impl RedFolderService {
         }
 
         // Perform initial calendar synchronization fallibly
-        if let Err(e) = self.refresh_internal(false, false).await {
-            let mut meta = self.sync_meta.lock().await;
-            meta.state = ServiceState::Stopped;
-            return Err(e);
-        }
+        let initial = self.refresh_outcome(false, false).await;
+        let first_delay = match initial {
+            Ok(RefreshOutcome::Fresh) => until_next_midnight(),
+            Ok(RefreshOutcome::Degraded) => std::time::Duration::from_secs(RETRY_LADDER[0]),
+            Err(e) => {
+                let mut meta = self.sync_meta.lock().await;
+                meta.state = ServiceState::Stopped;
+                return Err(e);
+            }
+        };
 
         let cancel_token = CancellationToken::new();
         *self.cancel_token.lock().await = Some(cancel_token.clone());
 
         let mut handles = Vec::new();
 
-        // 1. Daily midnight fetch loop (with short-interval retry on failure)
+        // 1. Daily midnight fetch loop with single retry cadence ladder
         {
             let this = self.clone();
             let token = cancel_token.child_token();
             let handle = tokio::spawn(async move {
+                let mut delay = first_delay;
+                let mut failures = 0usize;
                 loop {
-                    let now = Utc::now();
-                    let next_midnight = (now + Duration::days(1))
-                        .date_naive()
-                        .and_hms_opt(0, 0, 0)
-                        .unwrap()
-                        .and_utc();
-                    let sleep_secs = (next_midnight - now).num_seconds().max(1) as u64;
-
                     tokio::select! {
-                        _ = tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)) => {
-                            let res = tokio::select! {
-                                res = this.refresh_internal(false, true) => res,
-                                _ = token.cancelled() => {
-                                    break;
-                                }
-                            };
-
-                            if let Err(ref e) = res {
-                                warn!(err = %e, "daily midnight calendar sync failed; will retry every 15 minutes");
-                                loop {
-                                    tokio::select! {
-                                        _ = tokio::time::sleep(tokio::time::Duration::from_secs(900)) => {
-                                            let retry_res = this.refresh_internal(false, true).await;
-                                            if retry_res.is_ok() {
-                                                info!("calendar sync successfully recovered after retry");
-                                                break;
-                                            } else if let Err(err) = retry_res {
-                                                warn!(err = %err, "calendar sync retry failed; will retry in 15 minutes");
-                                            }
-                                        }
-                                        _ = token.cancelled() => {
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = token.cancelled() => break,
+                    }
+                    let outcome = tokio::select! {
+                        res = this.refresh_outcome(false, true) => res,
+                        _ = token.cancelled() => break,
+                    };
+                    match outcome {
+                        Ok(RefreshOutcome::Fresh) => {
+                            failures = 0;
+                            delay = until_next_midnight();
                         }
-                        _ = token.cancelled() => {
-                            break;
+                        Ok(RefreshOutcome::Degraded) | Err(_) => {
+                            delay = std::time::Duration::from_secs(
+                                RETRY_LADDER[failures.min(RETRY_LADDER.len() - 1)],
+                            );
+                            failures = failures.saturating_add(1);
+                            warn!(?delay, "calendar not freshly synchronized; retrying");
                         }
                     }
                 }
@@ -712,12 +795,23 @@ impl RedFolderService {
         self.refresh_internal(true, false).await
     }
 
-    /// Internal helper that fetches events and compiles windows without holding mutex across network I/O.
+    /// Internal helper that invokes `refresh_outcome` and discards the outcome variant.
     async fn refresh_internal(
         &self,
         force_remote: bool,
         skip_if_already_fetched_today: bool,
     ) -> Result<()> {
+        self.refresh_outcome(force_remote, skip_if_already_fetched_today)
+            .await
+            .map(|_| ())
+    }
+
+    /// Perform a calendar refresh attempt returning the detailed `RefreshOutcome`.
+    pub async fn refresh_outcome(
+        &self,
+        force_remote: bool,
+        skip_if_already_fetched_today: bool,
+    ) -> Result<RefreshOutcome> {
         let _refresh_guard = self.refresh_lock.lock().await;
         let today = Utc::now().date_naive();
 
@@ -727,39 +821,33 @@ impl RedFolderService {
             let engine_empty = self.engine.read().await.is_empty();
             if meta.last_fetch_date == Some(today) && !engine_empty {
                 debug!("calendar already fetched and compiled for today");
-                return Ok(());
+                return Ok(RefreshOutcome::Fresh);
             }
         }
 
         // 2. Perform HTTP request outside lock
-        let (client, client_tz) = {
-            let meta = self.sync_meta.lock().await;
-            (meta.client.clone(), meta.client.calendar_timezone())
+        let (client, tz, max_age, max_ratio) = {
+            let m = self.sync_meta.lock().await;
+            (
+                m.client.clone(),
+                m.client.calendar_timezone(),
+                m.max_data_age,
+                m.max_unparseable_ratio,
+            )
         };
-        let fetch_res = if force_remote {
-            client.force_fetch().await
+
+        let fetched = if force_remote {
+            client.force_fetch_snapshot().await
         } else {
-            client.fetch_or_cached().await
+            client.fetch_snapshot().await
         };
 
-        let raw = match fetch_res {
-            Ok(raw) => raw,
-            Err(e) => {
-                let err_str = e.to_string();
-                {
-                    let mut meta = self.sync_meta.lock().await;
-                    meta.last_sync_error = Some(err_str.clone());
-                }
-                self.check_calendar_staleness().await;
-                self.check_and_notify_workers().await;
-                self.notify.notify_waiters();
-                self.dispatch_event(RedFolderEvent::CalendarSyncFailed { error: err_str })
-                    .await;
-                return Err(e);
-            }
+        let mut snapshot = match fetched {
+            Ok(s) => s,
+            Err(e) => return self.fail_refresh(e).await,
         };
 
-        // 3. Re-acquire locks to compile windows into engine
+        // 3. Compile new engine from the snapshot (does not touch the live engine yet)
         let configs: Vec<RedFolderConfig> = {
             let workers = self.workers.read().await;
             workers
@@ -769,36 +857,96 @@ impl RedFolderService {
                 .collect()
         };
         let config_refs: Vec<&RedFolderConfig> = configs.iter().collect();
+        let chrono_age = Duration::from_std(max_age).unwrap_or_else(|_| Duration::hours(36));
+        let new_engine =
+            BlackoutEngine::compile_snapshot(&snapshot, &config_refs, Utc::now(), tz, chrono_age);
 
-        let new_engine = BlackoutEngine::compile_with_tz(&raw, &config_refs, Utc::now(), client_tz);
-        let total_windows = new_engine.windows().len();
-
-        {
-            let mut engine = self.engine.write().await;
-            *engine = new_engine;
+        // 4. Reject data we cannot actually interpret
+        let raw = snapshot.events.len();
+        let parsed = new_engine.parsed_events().len();
+        snapshot.stats.unparseable = raw.saturating_sub(parsed);
+        let ratio = (raw.saturating_sub(parsed)) as f64 / raw.max(1) as f64;
+        if parsed == 0 || ratio > max_ratio {
+            let e = crate::error::RedFolderError::Calendar(format!(
+                "{}/{} calendar events could not be parsed (limit {:.0}%); keeping previous calendar",
+                raw.saturating_sub(parsed),
+                raw,
+                max_ratio * 100.0
+            ));
+            return self.fail_refresh(e).await;
         }
 
+        let total_windows = new_engine.windows().len();
+        *self.engine.write().await = new_engine;
+
+        let outcome = if snapshot.source.is_fresh() {
+            RefreshOutcome::Fresh
+        } else {
+            RefreshOutcome::Degraded
+        };
+
         {
-            let mut meta = self.sync_meta.lock().await;
-            meta.last_fetch_date = Some(today);
-            meta.last_sync_time = Some(Utc::now());
-            meta.last_sync_error = None;
+            let mut m = self.sync_meta.lock().await;
+            m.last_sync_time = Some(snapshot.data_fetched_at);
+            m.data_source = Some(snapshot.source);
+            m.ingest = Some(snapshot.stats.clone());
+            if snapshot.source == SnapshotSource::Remote {
+                m.last_remote_success = Some(snapshot.data_fetched_at);
+            }
+            match outcome {
+                RefreshOutcome::Fresh => {
+                    m.last_fetch_date = Some(today);
+                    m.last_sync_error = None;
+                }
+                RefreshOutcome::Degraded => {
+                    // Do not set last_fetch_date: the skip-if-fetched-today guard must not suppress retries
+                    m.last_sync_error = Some(format!(
+                        "serving {:?} data from {}: {}",
+                        snapshot.source,
+                        snapshot.data_fetched_at,
+                        snapshot
+                            .remote_error
+                            .as_deref()
+                            .unwrap_or("remote unavailable")
+                    ));
+                }
+            }
         }
 
         // Immediately reconcile worker states with newly compiled engine
         self.check_and_notify_workers().await;
         self.notify.notify_waiters();
 
-        info!(windows=%total_windows, "refreshed economic calendar windows");
+        info!(windows=%total_windows, ?outcome, "refreshed economic calendar windows");
 
-        // Centralized dispatch to both broadcast channel and EventListeners
+        if outcome == RefreshOutcome::Degraded {
+            let err = self
+                .sync_meta
+                .lock()
+                .await
+                .last_sync_error
+                .clone()
+                .unwrap_or_default();
+            self.dispatch_event(RedFolderEvent::CalendarSyncFailed { error: err })
+                .await;
+        }
         self.dispatch_event(RedFolderEvent::CalendarUpdated {
-            total_events: raw.len(),
+            total_events: raw,
             total_windows,
         })
         .await;
 
-        Ok(())
+        Ok(outcome)
+    }
+
+    async fn fail_refresh(&self, e: crate::error::RedFolderError) -> Result<RefreshOutcome> {
+        let msg = e.to_string();
+        self.sync_meta.lock().await.last_sync_error = Some(msg.clone());
+        self.check_and_notify_workers().await;
+        self.notify.notify_waiters();
+        self.dispatch_event(RedFolderEvent::CalendarSyncFailed { error: msg })
+            .await;
+        Err(e)
     }
 
     /// Returns the timestamp of the last successful calendar synchronization, if any.

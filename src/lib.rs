@@ -30,7 +30,9 @@ pub use engine::{
 };
 pub use error::{RedFolderError, Result};
 pub use events::{EventListener, RedFolderEvent};
-pub use service::RedFolderService;
+pub use service::{
+    RedFolderService, RefreshOutcome, DEFAULT_MAX_DATA_AGE, DEFAULT_MAX_UNPARSEABLE_RATIO,
+};
 pub use types::{
     BlackoutNotification, BlackoutWindow, Currency, CustomEventKind, EconomicEvent, EventTiming,
     FailSafeMode, Impact, WindowEvent,
@@ -44,7 +46,10 @@ pub mod prelude {
     pub use crate::engine::BlackoutEngine;
     pub use crate::error::{RedFolderError, Result};
     pub use crate::events::{EventListener, RedFolderEvent};
-    pub use crate::service::{RedFolderService, ServiceState};
+    pub use crate::service::{
+        RedFolderService, RefreshOutcome, ServiceState, DEFAULT_MAX_DATA_AGE,
+        DEFAULT_MAX_UNPARSEABLE_RATIO,
+    };
     pub use crate::types::{
         BlackoutNotification, BlackoutWindow, Currency, CustomEventKind, EventTiming, FailSafeMode,
         Impact, WindowEvent,

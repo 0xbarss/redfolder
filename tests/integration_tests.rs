@@ -1066,12 +1066,22 @@ async fn test_calendar_updated_reaches_both_broadcast_and_event_listener() {
     // Trigger refresh
     service.refresh().await.expect("refresh should succeed");
 
-    // Broadcast bus must receive CalendarUpdated
-    let ev = broadcast_rx
-        .recv()
-        .await
-        .expect("broadcast should receive event");
-    assert!(matches!(ev, RedFolderEvent::CalendarUpdated { .. }));
+    // Broadcast bus must receive CalendarUpdated (along with CalendarSyncFailed when degraded)
+    let mut received_calendar_updated = false;
+    for _ in 0..3 {
+        let ev = broadcast_rx
+            .recv()
+            .await
+            .expect("broadcast should receive event");
+        if matches!(ev, RedFolderEvent::CalendarUpdated { .. }) {
+            received_calendar_updated = true;
+            break;
+        }
+    }
+    assert!(
+        received_calendar_updated,
+        "broadcast bus must receive CalendarUpdated"
+    );
 
     // Allow tokio tasks to run listener callbacks
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2516,4 +2526,220 @@ async fn test_future_timestamp_cache_rejected_by_cache_rejection() {
         client.fetch_snapshot().await.is_err(),
         "fetch_snapshot must reject future timestamp cache as fallback"
     );
+}
+
+#[tokio::test]
+async fn test_fallback_cache_does_not_reset_staleness_clock() {
+    let dir = tempfile::tempdir().unwrap();
+    let mock = common::spawn_mock(vec![common::Reply::Status(503)]).await;
+    let client = redfolder::CalendarClient::with_options(
+        reqwest::Client::new(),
+        &mock.url,
+        Some(dir.path().to_path_buf()),
+        std::time::Duration::from_secs(2),
+    )
+    .with_max_retries(0)
+    .with_max_stale_age(Some(std::time::Duration::from_secs(36 * 3600)));
+
+    let cached_at = chrono::Utc::now() - chrono::Duration::hours(30);
+    client
+        .save_cache_at(
+            &[common::usd_high_in(chrono::Duration::hours(2))],
+            cached_at,
+        )
+        .unwrap();
+
+    let service = RedFolderService::with_client(client);
+    service
+        .set_max_data_age(std::time::Duration::from_secs(24 * 3600))
+        .await
+        .unwrap();
+    let _rx = service
+        .register_worker("prop", RedFolderConfig::prop_firm_strict())
+        .await
+        .unwrap();
+
+    service
+        .refresh()
+        .await
+        .expect("30h-old cache is an acceptable fallback");
+
+    // The service must report the DATA time, not "now"
+    let ts = service.last_sync_time().await.unwrap();
+    assert!((ts - cached_at).num_seconds().abs() < 5);
+    assert!(service.last_sync_error().await.is_some());
+    assert!(service.is_calendar_stale().await); // 30h > 24h
+    assert!(service.is_blackout("prop").await); // FailClosed engages
+}
+
+#[tokio::test]
+async fn test_degraded_refresh_does_not_suppress_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let mock = common::spawn_mock(vec![common::Reply::Status(503)]).await;
+    let client = redfolder::CalendarClient::with_options(
+        reqwest::Client::new(),
+        &mock.url,
+        Some(dir.path().to_path_buf()),
+        std::time::Duration::from_secs(2),
+    )
+    .with_max_retries(0)
+    .with_max_stale_age(Some(std::time::Duration::from_secs(36 * 3600)));
+
+    let cached_at = chrono::Utc::now() - chrono::Duration::hours(2);
+    client
+        .save_cache_at(
+            &[common::usd_high_in(chrono::Duration::hours(2))],
+            cached_at,
+        )
+        .unwrap();
+
+    let service = RedFolderService::with_client(client);
+    let _rx = service
+        .register_worker("w_retry", RedFolderConfig::default())
+        .await
+        .unwrap();
+
+    let outcome1 = service
+        .refresh_outcome(false, true)
+        .await
+        .expect("refresh should succeed with fallback");
+    assert_eq!(outcome1, redfolder::RefreshOutcome::Degraded);
+    assert_eq!(mock.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Calling refresh_outcome again with skip_if_already_fetched_today=true must NOT short-circuit
+    // because degraded refreshes must continue retrying
+    let outcome2 = service
+        .refresh_outcome(false, true)
+        .await
+        .expect("retry refresh should succeed with fallback");
+    assert_eq!(outcome2, redfolder::RefreshOutcome::Degraded);
+    assert_eq!(mock.hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn test_format_drift_keeps_previous_calendar_and_reports_failure() {
+    let good = common::feed_json(100, |i| format!("2026-10-02T{:02}:30:00Z", i % 24));
+    let drift = common::feed_json(100, |_| "Oct 2nd 2026".to_string()); // unparseable format
+    let mock =
+        common::spawn_mock(vec![common::Reply::Json(good), common::Reply::Json(drift)]).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let client = redfolder::CalendarClient::with_options(
+        reqwest::Client::new(),
+        &mock.url,
+        Some(dir.path().to_path_buf()),
+        std::time::Duration::from_secs(2),
+    )
+    .with_max_retries(0);
+
+    let service = RedFolderService::with_client(client);
+    let mut sub = service.subscribe();
+    let _rx = service
+        .register_worker("prop", RedFolderConfig::prop_firm_strict())
+        .await
+        .unwrap();
+
+    // 1. First refresh succeeds
+    let res1 = service.refresh().await;
+    assert!(res1.is_ok());
+    let initial_windows = service.windows_for_worker("prop").await;
+    assert!(!initial_windows.is_empty());
+
+    // 2. Second refresh encounters format drift
+    let res2 = service.force_refresh().await;
+    assert!(res2.is_err());
+    let err_str = res2.unwrap_err().to_string();
+    assert!(err_str.contains("could not be parsed"));
+
+    // Previous calendar must be preserved
+    assert_eq!(
+        service.windows_for_worker("prop").await.len(),
+        initial_windows.len()
+    );
+    assert!(service.last_sync_error().await.is_some());
+
+    // Subscriber receives CalendarSyncFailed event
+    let mut saw_sync_failed = false;
+    while let Ok(ev) = sub.try_recv() {
+        if matches!(ev, RedFolderEvent::CalendarSyncFailed { .. }) {
+            saw_sync_failed = true;
+            break;
+        }
+    }
+    assert!(saw_sync_failed);
+}
+
+#[tokio::test]
+async fn test_all_unparseable_on_cold_start_is_fail_closed() {
+    let drift = common::feed_json(50, |_| "unparseable_date".to_string());
+    let mock = common::spawn_mock(vec![common::Reply::Json(drift)]).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let client = redfolder::CalendarClient::with_options(
+        reqwest::Client::new(),
+        &mock.url,
+        Some(dir.path().to_path_buf()),
+        std::time::Duration::from_secs(2),
+    )
+    .with_max_retries(0);
+
+    let service = RedFolderService::with_client(client);
+    let _rx = service
+        .register_worker("prop", RedFolderConfig::prop_firm_strict())
+        .await
+        .unwrap();
+
+    let start_res = service.start().await;
+    assert!(start_res.is_err());
+    assert!(service.is_blackout("prop").await);
+}
+
+#[tokio::test]
+async fn test_disabling_fallback_does_not_disable_staleness() {
+    let good = common::feed_json(10, |i| format!("2026-10-02T{:02}:30:00Z", i % 24));
+    let mock = common::spawn_mock(vec![common::Reply::Json(good)]).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let client = redfolder::CalendarClient::with_options(
+        reqwest::Client::new(),
+        &mock.url,
+        Some(dir.path().to_path_buf()),
+        std::time::Duration::from_secs(2),
+    )
+    .with_max_retries(0)
+    .with_max_stale_age(None); // fallback disabled
+
+    let service = RedFolderService::with_client(client);
+    let _rx = service
+        .register_worker("prop", RedFolderConfig::prop_firm_strict())
+        .await
+        .unwrap();
+
+    service.refresh().await.expect("fresh fetch succeeds");
+    assert!(!service.is_calendar_stale().await);
+
+    // Set max_data_age to 60s and inject an engine whose data is older than 60s
+    service
+        .set_max_data_age(std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+
+    let old_snapshot = redfolder::CalendarSnapshot {
+        events: vec![common::usd_high_in(chrono::Duration::hours(2))],
+        source: redfolder::SnapshotSource::Remote,
+        data_fetched_at: chrono::Utc::now() - chrono::Duration::hours(2),
+        remote_error: None,
+        stats: redfolder::IngestStats::default(),
+    };
+    let engine = redfolder::engine::BlackoutEngine::compile_snapshot(
+        &old_snapshot,
+        &[&RedFolderConfig::prop_firm_strict()],
+        chrono::Utc::now(),
+        None,
+        chrono::Duration::seconds(60),
+    );
+    service.set_engine(engine).await;
+
+    assert!(service.is_calendar_stale().await);
+    assert!(service.is_blackout("prop").await);
 }

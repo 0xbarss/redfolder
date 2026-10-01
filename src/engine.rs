@@ -19,6 +19,10 @@ pub struct BlackoutEngine {
     timezone: Option<chrono_tz::Tz>,
     /// Whether calendar data has been flagged as stale.
     stale: bool,
+    /// Timestamp when underlying calendar data was fetched.
+    data_fetched_at: Option<DateTime<Utc>>,
+    /// Maximum acceptable age before calendar data is considered stale.
+    max_data_age: Option<Duration>,
 }
 
 impl BlackoutEngine {
@@ -31,6 +35,8 @@ impl BlackoutEngine {
             windows: Vec::new(),
             timezone: None,
             stale: false,
+            data_fetched_at: None,
+            max_data_age: None,
         }
     }
 
@@ -72,6 +78,8 @@ impl BlackoutEngine {
             windows: Vec::new(),
             timezone: default_tz,
             stale: false,
+            data_fetched_at: None,
+            max_data_age: None,
         }
     }
 
@@ -125,6 +133,20 @@ impl BlackoutEngine {
         engine
     }
 
+    /// Compile a calendar snapshot and worker configurations into blackout windows,
+    /// tracking data provenance timestamp and staleness horizon.
+    #[must_use]
+    pub fn compile_snapshot(
+        snapshot: &crate::calendar::CalendarSnapshot,
+        configs: &[&RedFolderConfig],
+        now: DateTime<Utc>,
+        tz: Option<chrono_tz::Tz>,
+        max_age: Duration,
+    ) -> Self {
+        Self::compile_with_tz(&snapshot.events, configs, now, tz)
+            .with_data_timestamp(snapshot.data_fetched_at, max_age)
+    }
+
     /// Access raw calendar events stored in the engine.
     #[must_use]
     pub fn raw_events(&self) -> &[RawCalendarEvent] {
@@ -172,10 +194,42 @@ impl BlackoutEngine {
         self.timezone
     }
 
+    /// Set data provenance timestamp and maximum acceptable data age.
+    #[must_use]
+    pub fn with_data_timestamp(mut self, fetched_at: DateTime<Utc>, max_age: Duration) -> Self {
+        self.data_fetched_at = Some(fetched_at);
+        self.max_data_age = Some(max_age);
+        self
+    }
+
+    /// Set maximum acceptable data age.
+    pub fn set_max_data_age(&mut self, max_age: Duration) {
+        self.max_data_age = Some(max_age);
+    }
+
+    /// Access data fetch timestamp if tracked.
+    #[must_use]
+    pub fn data_fetched_at(&self) -> Option<DateTime<Utc>> {
+        self.data_fetched_at
+    }
+
+    /// Access configured maximum data age if set.
+    #[must_use]
+    pub fn max_data_age(&self) -> Option<Duration> {
+        self.max_data_age
+    }
+
+    /// Evaluates staleness at the supplied instant.
+    #[must_use]
+    pub fn is_stale_at(&self, at: DateTime<Utc>) -> bool {
+        self.stale
+            || matches!((self.data_fetched_at, self.max_data_age), (Some(t), Some(m)) if at - t > m)
+    }
+
     /// Whether this engine has been flagged as having stale or expired calendar data.
     #[must_use]
     pub fn is_stale(&self) -> bool {
-        self.stale
+        self.is_stale_at(Utc::now())
     }
 
     /// Mark the engine's calendar data as stale or fresh.
@@ -333,10 +387,13 @@ impl BlackoutEngine {
             }
         }
 
-        // 2b. Add fail-closed safety window if data is unavailable or stale
-        if config.fail_safe_mode.is_fail_closed() && (self.raw_events.is_empty() || self.stale) {
-            let reason = if self.stale {
+        // 2b. Add fail-closed safety window if data is unavailable, unreadable, or stale
+        let stale = self.is_stale_at(now);
+        if config.fail_safe_mode.is_fail_closed() && (self.parsed_events.is_empty() || stale) {
+            let reason = if stale {
                 "Calendar Data Stale (Fail-Closed Safety Blackout)"
+            } else if !self.raw_events.is_empty() && self.parsed_events.is_empty() {
+                "Calendar Data Unreadable (Fail-Closed Safety Blackout)"
             } else {
                 "Calendar Data Unavailable (Fail-Closed Safety Blackout)"
             };
