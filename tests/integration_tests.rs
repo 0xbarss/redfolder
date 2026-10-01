@@ -1356,11 +1356,13 @@ async fn test_empty_remote_feed_preserves_cache_on_force_fetch() {
         std::time::Duration::from_secs(2),
     );
 
-    // Problem 8 verification: force_fetch preserves cached event when remote returns []
+    // In 1.1.0, force_fetch explicitly rejects empty remote feed with Err (no fallback returned),
+    // and preserves the disk cache so fetch_or_cached / fetch_snapshot can serve the acceptable fallback.
+    assert!(client.force_fetch().await.is_err());
     let events = client
-        .force_fetch()
+        .fetch_or_cached()
         .await
-        .expect("should return preserved cache");
+        .expect("fetch_or_cached should return preserved cache");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].title, "Good CPI");
 }
@@ -2343,5 +2345,175 @@ async fn test_mock_server_hang_triggers_client_timeout() {
     assert!(
         res.is_err(),
         "hang reply should trigger client timeout error"
+    );
+}
+
+#[tokio::test]
+async fn test_empty_feed_does_not_resurrect_old_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let mock = common::spawn_mock(vec![common::Reply::Json("[]".into())]).await;
+    let client = redfolder::CalendarClient::with_options(
+        reqwest::Client::new(),
+        &mock.url,
+        Some(dir.path().to_path_buf()),
+        std::time::Duration::from_secs(2),
+    )
+    .with_max_retries(0)
+    .with_max_stale_age(Some(std::time::Duration::from_secs(36 * 3600)));
+
+    client
+        .save_cache_at(
+            &[common::usd_high_in(Duration::hours(1))],
+            Utc::now() - Duration::days(10),
+        )
+        .unwrap();
+
+    assert!(
+        client.fetch_snapshot().await.is_err(),
+        "10-day old cache must be rejected on empty feed response"
+    );
+}
+
+#[tokio::test]
+async fn test_empty_feed_accepts_recent_cache_but_flags_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mock = common::spawn_mock(vec![common::Reply::Json("[]".into())]).await;
+    let client = redfolder::CalendarClient::with_options(
+        reqwest::Client::new(),
+        &mock.url,
+        Some(dir.path().to_path_buf()),
+        std::time::Duration::from_secs(2),
+    )
+    .with_max_retries(0)
+    .with_max_stale_age(Some(std::time::Duration::from_secs(36 * 3600)));
+
+    let cached_at = Utc::now() - Duration::hours(2);
+    client
+        .save_cache_at(&[common::usd_high_in(Duration::hours(1))], cached_at)
+        .unwrap();
+
+    let snap = client
+        .fetch_snapshot()
+        .await
+        .expect("recent cache should be accepted as degraded fallback");
+    assert_eq!(snap.source, redfolder::SnapshotSource::EmptyFeedCache);
+    assert!(snap.is_degraded());
+    assert_eq!(snap.events.len(), 1);
+    assert_eq!(snap.data_fetched_at, cached_at);
+    assert!(snap.remote_error.is_some());
+}
+
+#[tokio::test]
+async fn test_legacy_cache_never_served_on_empty_feed() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache_file = dir.path().join(redfolder::calendar::DEFAULT_CACHE_FILENAME);
+    let legacy_json = r#"[{"title":"Legacy Event","country":"USD","date":"2026-06-15","time":"12:30","impact":"High"}]"#;
+    std::fs::write(&cache_file, legacy_json).unwrap();
+
+    let mock = common::spawn_mock(vec![common::Reply::Json("[]".into())]).await;
+    let client = redfolder::CalendarClient::with_options(
+        reqwest::Client::new(),
+        &mock.url,
+        Some(dir.path().to_path_buf()),
+        std::time::Duration::from_secs(2),
+    )
+    .with_max_retries(0);
+
+    assert!(
+        client.fetch_snapshot().await.is_err(),
+        "legacy cache without timestamp must never be served on empty feed"
+    );
+}
+
+#[tokio::test]
+async fn test_corrupted_primary_fails_over_to_mirror() {
+    let bad = common::spawn_mock(vec![common::Reply::Json(r#"[{"nope":1}]"#.into())]).await;
+    let good = common::spawn_mock(vec![common::Reply::Json(common::feed_json(50, |i| {
+        format!("2026-10-02T{:02}:00:00Z", i % 24)
+    }))])
+    .await;
+
+    let client = redfolder::CalendarClient::with_options(
+        reqwest::Client::new(),
+        &bad.url,
+        None,
+        std::time::Duration::from_secs(2),
+    )
+    .with_fallback_url(&good.url)
+    .with_max_retries(0);
+
+    let (events, stats) = client
+        .fetch_remote_with_stats()
+        .await
+        .expect("must failover to good mirror");
+    assert_eq!(events.len(), 50);
+    assert_eq!(stats.kept, 50);
+    assert_eq!(stats.malformed, 0);
+    assert_eq!(bad.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(good.hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_plausibility_floor_triggers_fallback_when_below_min_expected_events() {
+    let dir = tempfile::tempdir().unwrap();
+    // Upstream returns only 3 events
+    let tiny_feed = common::feed_json(3, |i| format!("2026-10-02T{:02}:00:00Z", i));
+    let mock = common::spawn_mock(vec![common::Reply::Json(tiny_feed)]).await;
+
+    let client = redfolder::CalendarClient::with_options(
+        reqwest::Client::new(),
+        &mock.url,
+        Some(dir.path().to_path_buf()),
+        std::time::Duration::from_secs(2),
+    )
+    .with_max_retries(0)
+    .with_min_expected_events(10)
+    .with_max_stale_age(Some(std::time::Duration::from_secs(36 * 3600)));
+
+    let cached_at = Utc::now() - Duration::hours(1);
+    client
+        .save_cache_at(&[common::usd_high_in(Duration::hours(2))], cached_at)
+        .unwrap();
+
+    let snap = client
+        .fetch_snapshot()
+        .await
+        .expect("must trigger fallback when feed has fewer events than plausibility floor");
+    assert_eq!(snap.source, redfolder::SnapshotSource::EmptyFeedCache);
+    assert!(snap.is_degraded());
+    assert_eq!(snap.events.len(), 1);
+}
+
+#[tokio::test]
+async fn test_future_timestamp_cache_rejected_by_cache_rejection() {
+    let dir = tempfile::tempdir().unwrap();
+    let mock = common::spawn_mock(vec![common::Reply::Status(503)]).await;
+
+    let client = redfolder::CalendarClient::with_options(
+        reqwest::Client::new(),
+        &mock.url,
+        Some(dir.path().to_path_buf()),
+        std::time::Duration::from_secs(2),
+    )
+    .with_max_retries(0);
+
+    let future_time = Utc::now() + Duration::minutes(15);
+    client
+        .save_cache_at(&[common::usd_high_in(Duration::hours(1))], future_time)
+        .unwrap();
+
+    let cached_data = client
+        .load_cache_data()
+        .expect("cache file should be loaded");
+    let rejection = client.cache_rejection(&cached_data, Utc::now());
+    assert!(
+        rejection.is_some(),
+        "cache fetched in future must be rejected"
+    );
+    assert!(rejection.unwrap().contains("is in the future"));
+
+    assert!(
+        client.fetch_snapshot().await.is_err(),
+        "fetch_snapshot must reject future timestamp cache as fallback"
     );
 }

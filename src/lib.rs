@@ -16,8 +16,8 @@ pub mod service;
 pub mod types;
 
 pub use calendar::{
-    CacheMetadata, CachedCalendarData, CalendarClient, RawCalendarEvent, CALENDAR_URL,
-    DEFAULT_CACHE_FILENAME,
+    CacheMetadata, CachedCalendarData, CalendarClient, CalendarSnapshot, IngestStats,
+    RawCalendarEvent, SnapshotSource, CALENDAR_URL, DEFAULT_CACHE_FILENAME,
 };
 pub use config::{RedFolderConfig, RedFolderConfigBuilder};
 pub use curfew::{
@@ -38,6 +38,7 @@ pub use types::{
 
 /// Common prelude items for quick import.
 pub mod prelude {
+    pub use crate::calendar::{CalendarSnapshot, IngestStats, SnapshotSource};
     pub use crate::config::{RedFolderConfig, RedFolderConfigBuilder};
     pub use crate::curfew::WeekendMode;
     pub use crate::engine::BlackoutEngine;

@@ -107,6 +107,68 @@ impl RawCalendarEvent {
     }
 }
 
+/// Where a calendar snapshot came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotSource {
+    /// Downloaded from a remote endpoint during this call.
+    Remote,
+    /// Served from disk because the configured cache TTL is still valid.
+    TtlCache,
+    /// Remote failed; an acceptable (age-bounded) cache was served instead.
+    FallbackCache,
+    /// Remote answered with zero events; an acceptable cache was served instead.
+    EmptyFeedCache,
+}
+
+impl SnapshotSource {
+    /// `true` when the data can be treated as a successful synchronization.
+    #[must_use]
+    pub fn is_fresh(self) -> bool {
+        matches!(self, Self::Remote | Self::TtlCache)
+    }
+}
+
+/// Counters describing how much of an upstream payload was usable.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestStats {
+    /// Items present in the upstream JSON array.
+    pub received: usize,
+    /// Items rejected at ingestion (bad JSON shape, empty date, over-long fields).
+    pub malformed: usize,
+    /// Items kept after ingestion validation.
+    pub kept: usize,
+    /// Kept items whose date/time could not be parsed into a timestamp (filled in by the service).
+    pub unparseable: usize,
+}
+
+/// Calendar data together with its provenance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalendarSnapshot {
+    pub events: Vec<RawCalendarEvent>,
+    pub source: SnapshotSource,
+    /// When the *data* was downloaded (not when it was returned to the caller).
+    pub data_fetched_at: DateTime<Utc>,
+    /// Why remote data was not used (set for `FallbackCache` / `EmptyFeedCache`).
+    pub remote_error: Option<String>,
+    pub stats: IngestStats,
+}
+
+impl CalendarSnapshot {
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        !self.source.is_fresh()
+    }
+
+    /// Age of the underlying data at `now`.
+    #[must_use]
+    pub fn age_at(&self, now: DateTime<Utc>) -> chrono::Duration {
+        now - self.data_fetched_at
+    }
+}
+
+const MAX_CLOCK_SKEW: chrono::Duration = chrono::Duration::minutes(5);
+
 /// Client responsible for fetching economic calendar releases over HTTP and managing disk caching.
 #[derive(Clone)]
 pub struct CalendarClient {
@@ -120,6 +182,7 @@ pub struct CalendarClient {
     max_stale_cache_age: Option<Duration>,
     max_response_bytes: usize,
     max_event_count: usize,
+    min_expected_events: usize,
     max_retries: usize,
     backoff_initial_delay: Duration,
     max_retry_after: Duration,
@@ -139,6 +202,7 @@ impl std::fmt::Debug for CalendarClient {
             .field("max_stale_cache_age", &self.max_stale_cache_age)
             .field("max_response_bytes", &self.max_response_bytes)
             .field("max_event_count", &self.max_event_count)
+            .field("min_expected_events", &self.min_expected_events)
             .field("max_retries", &self.max_retries)
             .field("backoff_initial_delay", &self.backoff_initial_delay)
             .field("max_retry_after", &self.max_retry_after)
@@ -316,6 +380,7 @@ impl CalendarClient {
             max_stale_cache_age: Some(Duration::from_secs(36 * 3600)),
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             max_event_count: DEFAULT_MAX_EVENT_COUNT,
+            min_expected_events: 1,
             max_retries: 2,
             backoff_initial_delay: Duration::from_millis(500),
             max_retry_after: Duration::from_secs(10),
@@ -398,6 +463,25 @@ impl CalendarClient {
     #[must_use]
     pub fn max_event_count(&self) -> usize {
         self.max_event_count
+    }
+
+    /// Configure the plausibility floor for raw calendar events (defaults to 1).
+    /// Responses with fewer events than this threshold are treated as empty feeds.
+    #[must_use]
+    pub fn with_min_expected_events(mut self, min_events: usize) -> Self {
+        self.min_expected_events = min_events;
+        self
+    }
+
+    /// Set minimum expected events plausibility floor.
+    pub fn set_min_expected_events(&mut self, min_events: usize) {
+        self.min_expected_events = min_events;
+    }
+
+    /// Minimum expected events plausibility floor.
+    #[must_use]
+    pub fn min_expected_events(&self) -> usize {
+        self.min_expected_events
     }
 
     /// Configure maximum HTTP retry attempts for transient errors (429, 408, 5xx).
@@ -534,7 +618,8 @@ impl CalendarClient {
     ///
     /// If an [`overall_timeout`](Self::with_overall_timeout) is set, the entire operation across all candidates
     /// is terminated when the deadline expires.
-    pub async fn fetch_remote(&self) -> Result<Vec<RawCalendarEvent>> {
+    /// Fetch calendar events from the remote endpoint with ingest statistics.
+    pub async fn fetch_remote_with_stats(&self) -> Result<(Vec<RawCalendarEvent>, IngestStats)> {
         if let Some(timeout) = self.overall_timeout {
             tokio::time::timeout(timeout, self.fetch_remote_candidates())
                 .await
@@ -549,14 +634,30 @@ impl CalendarClient {
         }
     }
 
-    async fn fetch_remote_candidates(&self) -> Result<Vec<RawCalendarEvent>> {
+    /// Fetch fresh calendar events directly from the remote API with bounded retry, response size checks,
+    /// and fallback URL failover.
+    ///
+    /// # Latency Ceiling Guarantee
+    ///
+    /// Worst-case wall-clock latency per URL candidate is strictly bounded:
+    /// with default settings (30s request timeout, 2 retries, 10s max backoff), worst-case latency under
+    /// total network timeouts is `(1 + 2) * 30s + 20s = 110s`. Under immediate 429/5xx status responses,
+    /// worst-case latency is `<= 21s`.
+    ///
+    /// If an [`overall_timeout`](Self::with_overall_timeout) is set, the entire operation across all candidates
+    /// is terminated when the deadline expires.
+    pub async fn fetch_remote(&self) -> Result<Vec<RawCalendarEvent>> {
+        Ok(self.fetch_remote_with_stats().await?.0)
+    }
+
+    async fn fetch_remote_candidates(&self) -> Result<(Vec<RawCalendarEvent>, IngestStats)> {
         let mut candidate_urls: Vec<&str> = Vec::with_capacity(1 + self.fallback_urls.len());
         candidate_urls.push(&self.calendar_url);
         for fb in &self.fallback_urls {
             candidate_urls.push(fb);
         }
 
-        let mut last_error = None;
+        let mut candidate_errors: Vec<(String, String)> = Vec::new();
 
         for (url_idx, &url) in candidate_urls.iter().enumerate() {
             #[cfg(test)]
@@ -631,10 +732,14 @@ impl CalendarClient {
                                 Ok(raw_items) => {
                                     let total_count = raw_items.len();
                                     if total_count > self.max_event_count {
-                                        return Err(crate::error::RedFolderError::Calendar(format!(
+                                        let msg = format!(
                                             "upstream response contained {total_count} events, exceeding limit of {}",
                                             self.max_event_count
-                                        )));
+                                        );
+                                        url_error = Some(crate::error::RedFolderError::Calendar(
+                                            format!("{msg} (url: {url})"),
+                                        ));
+                                        break;
                                     }
 
                                     let mut events = Vec::with_capacity(total_count);
@@ -659,10 +764,11 @@ impl CalendarClient {
                                     }
 
                                     if total_count > 0 && malformed_count == total_count {
-                                        return Err(crate::error::RedFolderError::Calendar(
-                                            "all upstream calendar events were malformed"
-                                                .to_string(),
+                                        let msg = "all upstream calendar events were malformed";
+                                        url_error = Some(crate::error::RedFolderError::Calendar(
+                                            format!("{msg} (url: {url})"),
                                         ));
+                                        break;
                                     }
 
                                     if malformed_count > 0 {
@@ -672,19 +778,34 @@ impl CalendarClient {
                                             "some upstream events failed validation"
                                         );
                                         if malformed_count * 5 > total_count {
-                                            return Err(crate::error::RedFolderError::Calendar(format!(
+                                            let msg = format!(
                                                 "upstream response corrupted: {malformed_count}/{total_count} events malformed"
-                                            )));
+                                            );
+                                            url_error =
+                                                Some(crate::error::RedFolderError::Calendar(
+                                                    format!("{msg} (url: {url})"),
+                                                ));
+                                            break;
                                         }
                                     }
 
                                     // Run pluggable integrity validator if configured
                                     if let Some(ref validator) = self.integrity_validator {
-                                        validator(&events)?;
+                                        if let Err(e) = validator(&events) {
+                                            warn!(url = %url, err = %e, "integrity validator rejected payload");
+                                            url_error = Some(e);
+                                            break;
+                                        }
                                     }
 
-                                    info!(url=%url, count = %events.len(), "downloaded calendar events successfully");
-                                    return Ok(events);
+                                    let stats = IngestStats {
+                                        received: total_count,
+                                        malformed: malformed_count,
+                                        kept: events.len(),
+                                        unparseable: 0,
+                                    };
+                                    info!(url=%url, ?stats, "downloaded calendar events successfully");
+                                    return Ok((events, stats));
                                 }
                                 Err(e) => {
                                     warn!(err = %e, attempt, url = %url, "failed to parse calendar response JSON");
@@ -750,15 +871,24 @@ impl CalendarClient {
 
             if let Some(err) = url_error {
                 warn!(url=%url, err=%err, "calendar candidate endpoint failed; trying next fallback if available");
-                last_error = Some(err);
+                candidate_errors.push((url.to_string(), err.to_string()));
             }
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            crate::error::RedFolderError::Calendar(
+        if candidate_errors.is_empty() {
+            Err(crate::error::RedFolderError::Calendar(
                 "fetch failed after retries on all candidate endpoints".into(),
-            )
-        }))
+            ))
+        } else {
+            let details: Vec<String> = candidate_errors
+                .into_iter()
+                .map(|(u, e)| format!("{u}: {e}"))
+                .collect();
+            Err(crate::error::RedFolderError::Calendar(format!(
+                "all calendar endpoints failed: [{}]",
+                details.join("; ")
+            )))
+        }
     }
 
     /// Save raw calendar events to the local disk cache atomically (if cache path is set).
@@ -955,96 +1085,166 @@ impl CalendarClient {
         }
     }
 
-    /// Fetch fresh calendar events directly from the remote API, bypassing cache,
-    /// protecting against empty responses overwriting good data, and saving to cache on success.
-    pub async fn force_fetch(&self) -> Result<Vec<RawCalendarEvent>> {
-        let events = self.fetch_remote().await?;
-        if events.is_empty() {
-            warn!("remote calendar returned 0 events during forced fetch; checking disk cache to protect existing data");
-            if let Some(cached) = self.load_cache() {
-                if !cached.is_empty() {
-                    warn!(count=%cached.len(), "preserved valid disk cache instead of overwriting with empty remote response");
-                    return Ok(cached);
-                }
-            }
-            Ok(events)
-        } else {
-            if let Err(e) = self.save_cache(&events) {
-                warn!(err=%e, "failed to persist calendar cache");
-            }
-            Ok(events)
+    /// Check whether cached calendar data is acceptable as a degraded fallback.
+    ///
+    /// Returns `None` if acceptable, or `Some(reason)` explaining rejection.
+    #[must_use]
+    pub fn cache_rejection(&self, data: &CachedCalendarData, now: DateTime<Utc>) -> Option<String> {
+        if data.events.is_empty() {
+            return Some("cache contains no events".into());
         }
+        if data.metadata.version == 0 {
+            return Some("legacy cache has no fetch timestamp".into());
+        }
+        let Some(max_stale) = self.max_stale_cache_age else {
+            return Some("stale-cache fallback is disabled".into());
+        };
+        let max =
+            chrono::Duration::from_std(max_stale).unwrap_or_else(|_| chrono::Duration::hours(36));
+        let age = now - data.metadata.fetched_at;
+        if age < -MAX_CLOCK_SKEW {
+            return Some(format!(
+                "cache fetched_at {} is in the future",
+                data.metadata.fetched_at
+            ));
+        }
+        if age > max {
+            return Some(format!(
+                "cache is {}h old (limit {}h)",
+                age.num_hours(),
+                max.num_hours()
+            ));
+        }
+        None
     }
 
-    /// Fetch fresh events from the remote API, automatically saving to cache on success,
-    /// or falling back to local cache if the remote request fails.
-    ///
-    /// Respects configured cache TTL and protects against empty responses overwriting good data.
-    pub async fn fetch_or_cached(&self) -> Result<Vec<RawCalendarEvent>> {
-        // 1. If TTL is active and disk cache is valid and non-empty, use cache
-        if self.cache_ttl.is_some() && self.is_cache_valid() {
-            if let Some(cached) = self.load_cache() {
-                if !cached.is_empty() {
-                    debug!(count=%cached.len(), "serving calendar from valid local cache (TTL active)");
-                    return Ok(cached);
+    fn fallback_snapshot(
+        &self,
+        source: SnapshotSource,
+        reason: String,
+        stats: IngestStats,
+    ) -> Option<CalendarSnapshot> {
+        let data = self.load_cache_data()?;
+        if let Some(why) = self.cache_rejection(&data, Utc::now()) {
+            warn!(%why, %reason, "cache not acceptable as fallback");
+            return None;
+        }
+        warn!(
+            fetched_at = %data.metadata.fetched_at,
+            %reason,
+            ?source,
+            "serving degraded calendar snapshot from cache"
+        );
+        Some(CalendarSnapshot {
+            data_fetched_at: data.metadata.fetched_at,
+            events: data.events,
+            source,
+            remote_error: Some(reason),
+            stats,
+        })
+    }
+
+    /// Fetch calendar snapshot with provenance metadata (source, fetched_at, stats).
+    pub async fn fetch_snapshot(&self) -> Result<CalendarSnapshot> {
+        self.fetch_snapshot_inner(true, true).await
+    }
+
+    /// Bypasses TTL cache and fallback: the caller explicitly wants remote data.
+    pub async fn force_fetch_snapshot(&self) -> Result<CalendarSnapshot> {
+        self.fetch_snapshot_inner(false, false).await
+    }
+
+    async fn fetch_snapshot_inner(
+        &self,
+        use_ttl: bool,
+        allow_fallback: bool,
+    ) -> Result<CalendarSnapshot> {
+        // 1. TTL cache
+        if use_ttl && self.cache_ttl.is_some() && self.is_cache_valid() {
+            if let Some(c) = self.load_cache_data() {
+                if !c.events.is_empty() {
+                    return Ok(CalendarSnapshot {
+                        stats: IngestStats {
+                            received: c.metadata.event_count,
+                            kept: c.events.len(),
+                            ..Default::default()
+                        },
+                        data_fetched_at: c.metadata.fetched_at,
+                        events: c.events,
+                        source: SnapshotSource::TtlCache,
+                        remote_error: None,
+                    });
                 }
             }
         }
 
-        // 2. Otherwise fetch from remote with protection against empty / failed responses
-        match self.fetch_remote().await {
-            Ok(events) => {
-                if events.is_empty() {
-                    warn!("remote calendar returned 0 events; checking disk cache to protect existing data");
-                    if let Some(cached) = self.load_cache() {
-                        if !cached.is_empty() {
-                            warn!(count=%cached.len(), "preserved valid disk cache instead of overwriting with empty remote response");
-                            return Ok(cached);
-                        }
-                    }
-                    Ok(events)
-                } else {
-                    if let Err(e) = self.save_cache(&events) {
-                        warn!(err=%e, "failed to persist calendar cache");
-                    }
-                    Ok(events)
+        // 2. Remote
+        match self.fetch_remote_with_stats().await {
+            Ok((events, stats)) if events.len() >= self.min_expected_events => {
+                let fetched_at = Utc::now();
+                if let Err(e) = self.save_cache_at(&events, fetched_at) {
+                    warn!(err = %e, "failed to persist calendar cache");
                 }
+                Ok(CalendarSnapshot {
+                    events,
+                    source: SnapshotSource::Remote,
+                    data_fetched_at: fetched_at,
+                    remote_error: None,
+                    stats,
+                })
+            }
+            Ok((events, stats)) => {
+                let reason = if events.is_empty() {
+                    "remote returned 0 events".to_string()
+                } else {
+                    format!(
+                        "remote returned {} events (below plausibility floor of {})",
+                        events.len(),
+                        self.min_expected_events
+                    )
+                };
+                if allow_fallback {
+                    if let Some(s) = self.fallback_snapshot(
+                        SnapshotSource::EmptyFeedCache,
+                        reason.clone(),
+                        stats,
+                    ) {
+                        return Ok(s);
+                    }
+                }
+                Err(crate::error::RedFolderError::Calendar(format!(
+                    "{reason} and no acceptable cache is available"
+                )))
             }
             Err(e) => {
-                error!(err=%e, "failed to download calendar; checking disk cache fallback");
-                if let Some(cached_data) = self.load_cache_data() {
-                    if !cached_data.events.is_empty() {
-                        if cached_data.metadata.version == 0 {
-                            warn!(
-                                path = %self.cache_path.as_deref().unwrap_or(Path::new("")).display(),
-                                "legacy cache lacks fetch timestamp; rejecting as stale fallback"
-                            );
-                            return Err(e);
-                        }
-
-                        let is_acceptable = if let Some(max_stale) = self.max_stale_cache_age {
-                            let max_stale_chrono = chrono::Duration::from_std(max_stale)
-                                .unwrap_or_else(|_| chrono::Duration::hours(36));
-                            let age = Utc::now() - cached_data.metadata.fetched_at;
-                            age <= max_stale_chrono
-                        } else {
-                            false
-                        };
-
-                        if is_acceptable {
-                            warn!(count=%cached_data.events.len(), "using fallback cached calendar data");
-                            return Ok(cached_data.events);
-                        } else {
-                            warn!(
-                                fetched_at = %cached_data.metadata.fetched_at,
-                                "cached calendar data is too stale or stale fallback disabled; rejecting fallback"
-                            );
-                        }
+                if allow_fallback {
+                    if let Some(s) = self.fallback_snapshot(
+                        SnapshotSource::FallbackCache,
+                        e.to_string(),
+                        IngestStats::default(),
+                    ) {
+                        return Ok(s);
                     }
                 }
                 Err(e)
             }
         }
+    }
+
+    /// Fetch fresh calendar events directly from the remote API, bypassing cache.
+    ///
+    /// Discards provenance. Prefer [`fetch_snapshot`][Self::fetch_snapshot].
+    pub async fn force_fetch(&self) -> Result<Vec<RawCalendarEvent>> {
+        Ok(self.force_fetch_snapshot().await?.events)
+    }
+
+    /// Fetch fresh events from the remote API, automatically saving to cache on success,
+    /// or falling back to local cache if the remote request fails.
+    ///
+    /// Discards provenance. Prefer [`fetch_snapshot`][Self::fetch_snapshot]; stale-cache
+    /// fallback is indistinguishable from a fresh download here.
+    pub async fn fetch_or_cached(&self) -> Result<Vec<RawCalendarEvent>> {
+        Ok(self.fetch_snapshot().await?.events)
     }
 }
 
