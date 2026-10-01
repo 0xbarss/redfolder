@@ -528,6 +528,9 @@ redfolder sync
 | `with_max_retries` | `fn(self, usize) -> Self` | Sets maximum HTTP retry attempts on transient network errors (default 3). |
 | `with_backoff` | `fn(self, Duration, Duration) -> Self` | Configures initial backoff delay and max retry-after cap for exponential backoff. |
 | `with_overall_timeout` | `fn(self, Duration) -> Self` | Enforces hard wall-clock latency ceiling across the entire fetch-and-retry cycle. |
+| `with_url_policy` | `fn(self, UrlPolicy) -> Result<Self>` | Configures URL security policy enforcing HTTPS, host allow-lists, private IP blocking, and redirect limits. |
+| `try_with_fallback_url` | `fn(self, impl Into<String>) -> Result<Self>` | Adds a fallback mirror URL validated against the active URL policy. |
+| `with_user_agent_str` | `fn(self, impl Into<String>) -> Result<Self>` | Configures a custom User-Agent string and rebuilds the HTTP client preserving active policies. |
 | `with_integrity_validator` | `fn(self, impl Fn(&[RawCalendarEvent]) -> Result<()>) -> Self` | Injects custom cryptographic verification or semantic sanity checks on fetched events. |
 | `with_timezone` | `fn(self, chrono_tz::Tz) -> Self` | Configures default source timezone for resolving naive calendar timestamps. |
 | `with_max_stale_age` | `fn(self, Option<Duration>) -> Self` | Sets maximum allowable cache age for fallback on network failure. |
@@ -582,6 +585,7 @@ redfolder sync
 - **`Currency`**: Strongly-typed enum with variants `USD`, `EUR`, `GBP`, `JPY`, `CAD`, `AUD`, `NZD`, `CHF`, and `Custom(String)`. Supports case-insensitive string parsing, matching, and deserialization.
 - **`Impact`**: Enum with variants `High`, `Medium`, `Low`, `NonEconomic`, `Custom(String)`. Supports case-insensitive string matching (`"red"`, `"high"`).
 - **`WeekendMode`**: Enum with variants `Short` (Friday evening window) and `Weekend` (Friday evening through Monday 00:00 UTC). Supports case-insensitive deserialization and default derivation.
+- **`UrlPolicy`**: Security policy governing transport schemes (`https_only`), hostname allow-lists (`allowed_hosts`), private/loopback/link-local IP blocking (`block_private_ips`), and HTTP redirect limits (`max_redirects`).
 
 ---
 
@@ -649,6 +653,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 | **Stale Calendar Policy: Fail-Open** | Maintains normal trading execution when calendar synchronization fails under `FailOpen` mode. | Verified |
 | **Stale Calendar Policy: Fail-Closed** | Defensively triggers continuous safety blackout during feed outages under `FailClosed` prop firm mode. | Verified |
 | **Daylight Saving Time (DST) Transitions** | Resolves spring-forward gaps and fall-back ambiguities in US Eastern / configured timezones deterministically. | Verified |
+| **URL Security Policy & SSRF Blocking** | Rejects unencrypted HTTP endpoints, non-whitelisted hosts, private/internal IPs, and excessive HTTP redirects via configurable `UrlPolicy`. | Verified by `test_url_policy_rejects_http_in_fetch`, `test_url_policy_blocks_redirect_to_private_ip`, `test_url_policy_allows_matching_allowed_host_and_blocks_unmatched`, `test_url_policy_redirect_limit_enforced` |
 | **CLI Binary Subcommands & JSON Output** | Verifies `status`, `upcoming`, and flag parsing across isolated environments via command execution. | Verified |
 
 ---

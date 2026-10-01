@@ -248,6 +248,153 @@ impl CalendarSnapshot {
 
 const MAX_CLOCK_SKEW: chrono::Duration = chrono::Duration::minutes(5);
 
+/// Security policy governing calendar endpoint URLs, transport schemes, and HTTP redirects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UrlPolicy {
+    /// When true, only HTTPS endpoints are permitted. Plaintext HTTP endpoints are rejected.
+    pub https_only: bool,
+    /// Optional allow-list of permissible hostnames (case-insensitive exact match).
+    /// If `None`, any hostname complying with other policy constraints is permitted.
+    pub allowed_hosts: Option<Vec<String>>,
+    /// When true, private, loopback, link-local, broadcast, unspecified, and cloud metadata
+    /// IP addresses are strictly rejected to mitigate SSRF and internal scanning.
+    pub block_private_ips: bool,
+    /// Maximum number of consecutive HTTP redirects allowed before terminating.
+    pub max_redirects: usize,
+}
+
+impl Default for UrlPolicy {
+    fn default() -> Self {
+        Self {
+            https_only: true,
+            allowed_hosts: None,
+            block_private_ips: true,
+            max_redirects: 3,
+        }
+    }
+}
+
+impl UrlPolicy {
+    /// Creates a new `UrlPolicy` with default secure settings:
+    /// HTTPS only, private IPs blocked, no host restrictions, max 3 redirects.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enforces or relaxes the HTTPS requirement.
+    #[must_use]
+    pub fn with_https_only(mut self, https_only: bool) -> Self {
+        self.https_only = https_only;
+        self
+    }
+
+    /// Restricts permissible endpoints to an explicit allow-list of hostnames.
+    #[must_use]
+    pub fn with_allowed_hosts<I, S>(mut self, hosts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed_hosts = Some(hosts.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Enables or disables blocking of private, loopback, and internal IP addresses.
+    #[must_use]
+    pub fn with_block_private_ips(mut self, block: bool) -> Self {
+        self.block_private_ips = block;
+        self
+    }
+
+    /// Configures the maximum allowable HTTP redirects.
+    #[must_use]
+    pub fn with_max_redirects(mut self, max: usize) -> Self {
+        self.max_redirects = max;
+        self
+    }
+
+    /// Validates a parsed [`reqwest::Url`] against this policy.
+    ///
+    /// # Returns
+    /// - `Ok(())` if the URL complies with all active policy constraints.
+    /// - `Err(String)` describing the specific policy violation if rejected.
+    ///
+    /// # Limitations & SSRF Defense-in-Depth
+    ///
+    /// Note that IP-based filtering evaluates literal IP addresses in URLs. It does not perform
+    /// synchronous DNS resolution at check time and therefore cannot prevent Time-of-Check to
+    /// Time-of-Use (TOCTOU) DNS rebinding attacks where a hostile public domain name resolves to
+    /// an internal IP. For zero-trust environments, combine `UrlPolicy` with network-level
+    /// firewall/proxy egress filtering.
+    pub fn check(&self, url: &reqwest::Url) -> std::result::Result<(), String> {
+        if self.https_only && url.scheme() != "https" {
+            return Err(format!("{url}: https required"));
+        }
+
+        if let Some(allowed) = &self.allowed_hosts {
+            let host = url.host_str().unwrap_or_default();
+            if !allowed.iter().any(|a| a.eq_ignore_ascii_case(host)) {
+                return Err(format!("host {host} is not allow-listed"));
+            }
+        }
+
+        if self.block_private_ips {
+            if let Some(host_str) = url.host_str() {
+                let clean_host = host_str.trim_start_matches('[').trim_end_matches(']');
+                if clean_host.eq_ignore_ascii_case("localhost") {
+                    return Err(format!("{clean_host} is a non-public address"));
+                }
+                if let Ok(ip) = clean_host.parse::<std::net::IpAddr>() {
+                    match ip {
+                        std::net::IpAddr::V4(ipv4) => {
+                            if ipv4.is_loopback()
+                                || ipv4.is_private()
+                                || ipv4.is_link_local()
+                                || ipv4.is_unspecified()
+                                || ipv4.is_broadcast()
+                            {
+                                return Err(format!("{ipv4} is a non-public address"));
+                            }
+                        }
+                        std::net::IpAddr::V6(ipv6) => {
+                            if let Some(ipv4) = ipv6.to_ipv4_mapped() {
+                                if ipv4.is_loopback()
+                                    || ipv4.is_private()
+                                    || ipv4.is_link_local()
+                                    || ipv4.is_unspecified()
+                                    || ipv4.is_broadcast()
+                                {
+                                    return Err(format!("{ipv6} is a non-public address"));
+                                }
+                            }
+                            let seg0 = ipv6.segments()[0];
+                            let is_ula = (seg0 & 0xfe00) == 0xfc00;
+                            let is_link_local = (seg0 & 0xffc0) == 0xfe80;
+                            if ipv6.is_loopback()
+                                || ipv6.is_unspecified()
+                                || is_ula
+                                || is_link_local
+                            {
+                                return Err(format!("{ipv6} is a non-public address"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Helper to parse and check a URL string against this policy.
+    pub fn check_url_str(&self, url_str: &str) -> std::result::Result<(), String> {
+        let parsed =
+            reqwest::Url::parse(url_str).map_err(|e| format!("invalid URL {url_str:?}: {e}"))?;
+        self.check(&parsed)
+    }
+}
+
 /// Client responsible for fetching economic calendar releases over HTTP and managing disk caching.
 #[derive(Clone)]
 pub struct CalendarClient {
@@ -268,6 +415,8 @@ pub struct CalendarClient {
     max_retry_after: Duration,
     overall_timeout: Option<Duration>,
     integrity_validator: Option<CalendarIntegrityValidator>,
+    user_agent: String,
+    url_policy: Option<UrlPolicy>,
 }
 
 impl std::fmt::Debug for CalendarClient {
@@ -295,6 +444,8 @@ impl std::fmt::Debug for CalendarClient {
                     .as_ref()
                     .map(|_| "<custom_validator>"),
             )
+            .field("user_agent", &self.user_agent)
+            .field("url_policy", &self.url_policy)
             .finish()
     }
 }
@@ -439,12 +590,9 @@ impl CalendarClient {
             .timeout(Duration::from_secs(30))
             .user_agent(user_agent)
             .build()?;
-        Ok(Self::with_options(
-            client,
-            CALENDAR_URL,
-            dir,
-            Duration::from_secs(30),
-        ))
+        let mut client_obj = Self::with_options(client, CALENDAR_URL, dir, Duration::from_secs(30));
+        client_obj.user_agent = user_agent.to_string();
+        Ok(client_obj)
     }
 
     /// Create with custom options.
@@ -473,13 +621,100 @@ impl CalendarClient {
             max_retry_after: Duration::from_secs(10),
             overall_timeout: Some(DEFAULT_OVERALL_TIMEOUT),
             integrity_validator: None,
+            user_agent: DEFAULT_USER_AGENT.to_string(),
+            url_policy: None,
         }
+    }
+
+    /// Returns the active [`UrlPolicy`], if configured.
+    #[must_use]
+    pub fn url_policy(&self) -> Option<&UrlPolicy> {
+        self.url_policy.as_ref()
+    }
+
+    /// Returns the configured User-Agent string.
+    #[must_use]
+    pub fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
+    /// Configures a [`UrlPolicy`] for URL validation and redirect handling.
+    ///
+    /// Validates the current primary calendar URL and any configured fallback URLs against the policy,
+    /// and configures the underlying HTTP client with custom redirect handling enforcing `max_redirects`
+    /// and redirect target policy compliance.
+    pub fn with_url_policy(mut self, policy: UrlPolicy) -> Result<Self> {
+        policy
+            .check_url_str(&self.calendar_url)
+            .map_err(crate::error::RedFolderError::Calendar)?;
+        for fallback in &self.fallback_urls {
+            policy
+                .check_url_str(fallback)
+                .map_err(crate::error::RedFolderError::Calendar)?;
+        }
+
+        let p = policy.clone();
+        self.client = Client::builder()
+            .user_agent(&self.user_agent)
+            .timeout(self.request_timeout)
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                if attempt.previous().len() >= p.max_redirects {
+                    return attempt.error("too many redirects");
+                }
+                match p.check(attempt.url()) {
+                    Ok(()) => attempt.follow(),
+                    Err(why) => attempt.error(why),
+                }
+            }))
+            .build()?;
+        self.url_policy = Some(policy);
+        Ok(self)
+    }
+
+    /// Configures a custom User-Agent string and rebuilds the HTTP client preserving active timeout and redirect policy.
+    pub fn with_user_agent_str(mut self, user_agent: impl Into<String>) -> Result<Self> {
+        self.user_agent = user_agent.into();
+        let mut builder = Client::builder()
+            .user_agent(&self.user_agent)
+            .timeout(self.request_timeout);
+        if let Some(ref policy) = self.url_policy {
+            let p = policy.clone();
+            builder = builder.redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                if attempt.previous().len() >= p.max_redirects {
+                    return attempt.error("too many redirects");
+                }
+                match p.check(attempt.url()) {
+                    Ok(()) => attempt.follow(),
+                    Err(why) => attempt.error(why),
+                }
+            }));
+        }
+        self.client = builder.build()?;
+        Ok(self)
+    }
+
+    /// Adds a fallback calendar URL after validating it against the configured [`UrlPolicy`] (if any).
+    pub fn try_with_fallback_url(mut self, url: impl Into<String>) -> Result<Self> {
+        let u = url.into();
+        if let Some(ref policy) = self.url_policy {
+            policy
+                .check_url_str(&u)
+                .map_err(crate::error::RedFolderError::Calendar)?;
+        }
+        self.fallback_urls.push(u);
+        Ok(self)
     }
 
     /// Add a fallback calendar endpoint URL used if the primary URL fails.
     #[must_use]
     pub fn with_fallback_url(mut self, url: impl Into<String>) -> Self {
-        self.fallback_urls.push(url.into());
+        let u = url.into();
+        if let Some(ref policy) = self.url_policy {
+            if let Err(why) = policy.check_url_str(&u) {
+                warn!(url = %u, err = %why, "fallback URL violates active UrlPolicy");
+            }
+        }
+        self.fallback_urls.push(u);
         self
     }
 
@@ -508,12 +743,24 @@ impl CalendarClient {
 
     /// Set the primary calendar URL.
     pub fn set_calendar_url(&mut self, url: impl Into<String>) {
-        self.calendar_url = url.into();
+        let u = url.into();
+        if let Some(ref policy) = self.url_policy {
+            if let Err(why) = policy.check_url_str(&u) {
+                warn!(url = %u, err = %why, "primary calendar URL violates active UrlPolicy");
+            }
+        }
+        self.calendar_url = u;
     }
 
     /// Add a fallback calendar URL.
     pub fn add_fallback_url(&mut self, url: impl Into<String>) {
-        self.fallback_urls.push(url.into());
+        let u = url.into();
+        if let Some(ref policy) = self.url_policy {
+            if let Err(why) = policy.check_url_str(&u) {
+                warn!(url = %u, err = %why, "fallback URL violates active UrlPolicy");
+            }
+        }
+        self.fallback_urls.push(u);
     }
 
     /// Configure the maximum response body size in bytes to prevent unbounded allocations.
@@ -797,6 +1044,24 @@ impl CalendarClient {
             }
             debug!(url=%url, url_idx, "fetching economic calendar");
             let mut url_error = None;
+
+            if let Some(ref policy) = self.url_policy {
+                match reqwest::Url::parse(url) {
+                    Ok(parsed_url) => {
+                        if let Err(why) = policy.check(&parsed_url) {
+                            warn!(url = %url, err = %why, "calendar endpoint rejected by URL policy");
+                            candidate_errors.push((url.to_string(), why));
+                            continue 'candidates;
+                        }
+                    }
+                    Err(e) => {
+                        let why = format!("invalid URL {url:?}: {e}");
+                        warn!(url = %url, err = %why, "calendar endpoint URL cannot be parsed");
+                        candidate_errors.push((url.to_string(), why));
+                        continue 'candidates;
+                    }
+                }
+            }
 
             for attempt in 0..=self.max_retries {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -2093,5 +2358,144 @@ mod tests {
             CalendarClient::without_cache().overall_timeout(),
             Some(DEFAULT_OVERALL_TIMEOUT)
         );
+    }
+
+    #[test]
+    fn test_url_policy_defaults_and_builder() {
+        let policy = UrlPolicy::new();
+        assert!(policy.https_only);
+        assert_eq!(policy.allowed_hosts, None);
+        assert!(policy.block_private_ips);
+        assert_eq!(policy.max_redirects, 3);
+
+        let customized = policy
+            .with_https_only(false)
+            .with_allowed_hosts(vec!["example.com", "api.internal.com"])
+            .with_block_private_ips(false)
+            .with_max_redirects(5);
+
+        assert!(!customized.https_only);
+        assert_eq!(
+            customized.allowed_hosts,
+            Some(vec![
+                "example.com".to_string(),
+                "api.internal.com".to_string()
+            ])
+        );
+        assert!(!customized.block_private_ips);
+        assert_eq!(customized.max_redirects, 5);
+    }
+
+    #[test]
+    fn test_url_policy_https_enforcement() {
+        let policy = UrlPolicy::default();
+        let http_url = reqwest::Url::parse("http://example.com/calendar.json").unwrap();
+        let https_url = reqwest::Url::parse("https://example.com/calendar.json").unwrap();
+
+        assert!(policy.check(&http_url).is_err());
+        assert!(policy.check(&https_url).is_ok());
+
+        let relaxed = policy.with_https_only(false);
+        assert!(relaxed.check(&http_url).is_ok());
+    }
+
+    #[test]
+    fn test_url_policy_allowed_hosts_case_insensitive() {
+        let policy =
+            UrlPolicy::default().with_allowed_hosts(vec!["nfs.faireconomy.media", "Mirror.Org"]);
+
+        let allowed1 = reqwest::Url::parse("https://NFS.FairEconomy.Media/calendar.json").unwrap();
+        let allowed2 = reqwest::Url::parse("https://mirror.org/calendar.json").unwrap();
+        let forbidden = reqwest::Url::parse("https://evil.attacker.com/calendar.json").unwrap();
+
+        assert!(policy.check(&allowed1).is_ok());
+        assert!(policy.check(&allowed2).is_ok());
+        let err = policy.check(&forbidden).unwrap_err();
+        assert!(err.contains("host evil.attacker.com is not allow-listed"));
+    }
+
+    #[test]
+    fn test_url_policy_private_ip_blocking_ipv4() {
+        let policy = UrlPolicy::default().with_https_only(false);
+
+        // Loopback, private RFC1918, link-local, unspecified, broadcast, and localhost
+        let blocked = [
+            "http://127.0.0.1/cal.json",
+            "http://127.0.1.1/cal.json",
+            "http://10.0.0.1/cal.json",
+            "http://172.16.0.1/cal.json",
+            "http://192.168.1.1/cal.json",
+            "http://169.254.169.254/latest/meta-data",
+            "http://0.0.0.0/cal.json",
+            "http://255.255.255.255/cal.json",
+            "http://localhost/cal.json",
+            "http://localhost:8080/cal.json",
+        ];
+
+        for url_str in blocked {
+            let url = reqwest::Url::parse(url_str).unwrap();
+            assert!(
+                policy.check(&url).is_err(),
+                "expected {url_str} to be rejected as private IP"
+            );
+        }
+
+        // Public IP should pass
+        let public_url = reqwest::Url::parse("http://8.8.8.8/cal.json").unwrap();
+        assert!(policy.check(&public_url).is_ok());
+    }
+
+    #[test]
+    fn test_url_policy_private_ip_blocking_ipv6() {
+        let policy = UrlPolicy::default().with_https_only(false);
+
+        let blocked = [
+            "http://[::1]/cal.json",                    // loopback
+            "http://[::]/cal.json",                     // unspecified
+            "http://[fe80::1]/cal.json",                // link-local
+            "http://[fc00::1]/cal.json",                // ULA
+            "http://[fd12:3456:789a::1]/cal.json",      // ULA
+            "http://[::ffff:127.0.0.1]/cal.json",       // IPv4-mapped loopback
+            "http://[::ffff:10.0.0.1]/cal.json",        // IPv4-mapped private
+            "http://[::ffff:169.254.169.254]/cal.json", // IPv4-mapped link-local
+        ];
+
+        for url_str in blocked {
+            let url = reqwest::Url::parse(url_str).unwrap();
+            assert!(
+                policy.check(&url).is_err(),
+                "expected IPv6 {url_str} to be rejected as private IP"
+            );
+        }
+
+        // Public IPv6
+        let public_v6 = reqwest::Url::parse("http://[2606:4700:4700::1111]/cal.json").unwrap();
+        assert!(policy.check(&public_v6).is_ok());
+    }
+
+    #[test]
+    fn test_url_policy_eager_client_validation() {
+        let client_http = CalendarClient::without_cache();
+        let mut client_http = client_http;
+        client_http.set_calendar_url("http://insecure.internal/cal.json");
+
+        // with_url_policy should reject the client because calendar_url is HTTP
+        let res = client_http.with_url_policy(UrlPolicy::default());
+        assert!(res.is_err());
+
+        // Valid HTTPS client with policy
+        let client_https = CalendarClient::without_cache()
+            .with_url_policy(UrlPolicy::default())
+            .unwrap();
+
+        // try_with_fallback_url should reject HTTP fallback
+        let fallback_err = client_https
+            .clone()
+            .try_with_fallback_url("http://insecure.fallback/cal.json");
+        assert!(fallback_err.is_err());
+
+        // try_with_fallback_url should accept valid HTTPS fallback
+        let fallback_ok = client_https.try_with_fallback_url("https://secure.fallback/cal.json");
+        assert!(fallback_ok.is_ok());
     }
 }

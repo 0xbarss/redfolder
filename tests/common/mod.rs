@@ -12,6 +12,7 @@ pub const DEAD_URL: &str = "http://127.0.0.1:9/calendar.json";
 pub enum Reply {
     Json(String),
     Status(u16),
+    Redirect(u16, String),
     Hang,
 }
 
@@ -36,18 +37,22 @@ pub async fn spawn_mock(script: Vec<Reply>) -> MockServer {
             tokio::spawn(async move {
                 let mut buf = [0u8; 4096];
                 let _ = sock.read(&mut buf).await;
-                let (status, body) = match reply {
-                    Reply::Json(b) => (200, b),
-                    Reply::Status(s) => (s, String::new()),
+                let resp = match reply {
+                    Reply::Json(b) => format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",
+                        b.len()
+                    ),
+                    Reply::Status(s) => format!(
+                        "HTTP/1.1 {s} Status\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    ),
+                    Reply::Redirect(s, loc) => format!(
+                        "HTTP/1.1 {s} Found\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    ),
                     Reply::Hang => {
                         tokio::time::sleep(Duration::from_secs(3600)).await;
                         return;
                     }
                 };
-                let resp = format!(
-                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
                 let _ = sock.write_all(resp.as_bytes()).await;
                 let _ = sock.shutdown().await;
             });

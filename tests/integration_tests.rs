@@ -3147,3 +3147,179 @@ fn test_try_default_cache_dir_returns_valid_path() {
     let path = res.unwrap();
     assert!(path.to_string_lossy().contains("redfolder"));
 }
+
+#[tokio::test]
+async fn test_url_policy_rejects_http_in_fetch() {
+    let mock = common::spawn_mock(vec![common::Reply::Json("[]".into())]).await;
+    // mock.url is http://127.0.0.1:...
+    // Default policy requires https_only
+    let client = redfolder::CalendarClient::with_options(
+        reqwest::Client::new(),
+        "https://example.com/calendar.json",
+        None,
+        std::time::Duration::from_secs(2),
+    )
+    .with_url_policy(redfolder::UrlPolicy::default())
+    .expect("valid initial https client")
+    .with_fallback_url(&mock.url)
+    .with_max_retries(0);
+
+    // Fetch should reject the mock HTTP fallback URL under https_only policy
+    let res = client.fetch_remote().await;
+    assert!(res.is_err());
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("https required"),
+        "expected error mentioning https required, got: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_url_policy_blocks_redirect_to_private_ip() {
+    let redirect_mock = common::spawn_mock(vec![common::Reply::Redirect(
+        302,
+        "http://10.0.0.1/calendar.json".into(),
+    )])
+    .await;
+
+    let policy = redfolder::UrlPolicy::default()
+        .with_https_only(false)
+        .with_block_private_ips(true);
+
+    let client = redfolder::CalendarClient::with_options(
+        reqwest::Client::new(),
+        "https://example.com/calendar.json",
+        None,
+        std::time::Duration::from_secs(2),
+    )
+    .with_max_retries(0)
+    .with_url_policy(policy)
+    .expect("client creation with relaxed policy");
+
+    let client = client.with_fallback_url(&redirect_mock.url);
+
+    let res = client.fetch_remote().await;
+    assert!(res.is_err());
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("non-public address") || err_msg.contains("error following redirect"),
+        "expected error mentioning private address or redirect error, got: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_url_policy_allows_matching_allowed_host_and_blocks_unmatched() {
+    let good_payload = common::feed_json(2, |i| format!("2026-10-02T{:02}:00:00Z", i + 10));
+    let mock = common::spawn_mock(vec![common::Reply::Json(good_payload)]).await;
+
+    // 1. Policy with non-matching allowed host
+    let policy_mismatch = redfolder::UrlPolicy::default()
+        .with_https_only(false)
+        .with_block_private_ips(false)
+        .with_allowed_hosts(vec!["strictly.other.host"]);
+
+    let client_blocked = redfolder::CalendarClient::with_options(
+        reqwest::Client::new(),
+        "http://strictly.other.host/cal.json",
+        None,
+        std::time::Duration::from_secs(2),
+    )
+    .with_url_policy(policy_mismatch)
+    .expect("valid client")
+    .with_fallback_url(&mock.url)
+    .with_max_retries(0);
+
+    let res_blocked = client_blocked.fetch_remote().await;
+    assert!(res_blocked.is_err());
+    let err_msg = res_blocked.unwrap_err().to_string();
+    assert!(err_msg.contains("not allow-listed"));
+
+    // 2. Policy with matching allowed host
+    let policy_allowed = redfolder::UrlPolicy::default()
+        .with_https_only(false)
+        .with_block_private_ips(false)
+        .with_allowed_hosts(vec!["127.0.0.1", "strictly.other.host"]);
+
+    let client_allowed = redfolder::CalendarClient::with_options(
+        reqwest::Client::new(),
+        &mock.url,
+        None,
+        std::time::Duration::from_secs(2),
+    )
+    .with_max_retries(0)
+    .with_url_policy(policy_allowed)
+    .expect("valid client");
+
+    let res_allowed = client_allowed.fetch_remote().await;
+    assert!(res_allowed.is_ok());
+    assert_eq!(res_allowed.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn test_url_policy_redirect_limit_enforced() {
+    let mock = common::spawn_mock(vec![common::Reply::Redirect(
+        302,
+        "http://loop/cal.json".into(),
+    )])
+    .await;
+    let url_loop = mock.url.clone();
+
+    let loop_mock = common::spawn_mock(vec![
+        common::Reply::Redirect(302, format!("{url_loop}?1")),
+        common::Reply::Redirect(302, format!("{url_loop}?2")),
+        common::Reply::Redirect(302, format!("{url_loop}?3")),
+        common::Reply::Redirect(302, format!("{url_loop}?4")),
+    ])
+    .await;
+
+    let policy = redfolder::UrlPolicy::default()
+        .with_https_only(false)
+        .with_block_private_ips(false)
+        .with_max_redirects(2);
+
+    let client = redfolder::CalendarClient::with_options(
+        reqwest::Client::new(),
+        &loop_mock.url,
+        None,
+        std::time::Duration::from_secs(2),
+    )
+    .with_max_retries(0)
+    .with_url_policy(policy)
+    .expect("valid client");
+
+    let res = client.fetch_remote().await;
+    assert!(res.is_err());
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("too many redirects") || err_msg.contains("redirect"),
+        "expected redirect limit error, got: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_url_policy_mirror_failover_when_primary_violates_policy() {
+    let good_payload = common::feed_json(3, |i| format!("2026-10-02T{:02}:00:00Z", i + 10));
+    let mock = common::spawn_mock(vec![common::Reply::Json(good_payload)]).await;
+
+    // Primary host fails network connection; fallback mirror succeeds
+    let client_allowed = redfolder::CalendarClient::with_options(
+        reqwest::Client::new(),
+        "http://allowed.fake.org/cal.json",
+        None,
+        std::time::Duration::from_secs(2),
+    )
+    .with_fallback_url(&mock.url)
+    .with_max_retries(0)
+    .with_url_policy(
+        redfolder::UrlPolicy::default()
+            .with_https_only(false)
+            .with_block_private_ips(false)
+            .with_allowed_hosts(vec!["127.0.0.1", "allowed.fake.org"]),
+    )
+    .expect("client valid");
+
+    // Primary http://allowed.fake.org will fail connection, then failover to http://127.0.0.1:... which succeeds!
+    let res = client_allowed.fetch_remote().await;
+    assert!(res.is_ok());
+    assert_eq!(res.unwrap().len(), 3);
+}
