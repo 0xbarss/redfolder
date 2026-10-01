@@ -2311,6 +2311,168 @@ async fn test_cli_binary_execution() {
 }
 
 #[tokio::test]
+async fn test_cli_rejects_typo_impact() {
+    let bin_path = env!("CARGO_BIN_EXE_redfolder");
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+
+    let output = std::process::Command::new(bin_path)
+        .args([
+            "--cache-dir",
+            cache_dir.to_str().unwrap(),
+            "status",
+            "--impact",
+            "Hgh",
+        ])
+        .output()
+        .expect("failed to execute status subcommand");
+    assert!(
+        !output.status.success(),
+        "CLI must exit non-zero for typo in --impact"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Invalid configuration"));
+}
+
+#[tokio::test]
+async fn test_cli_min_impact_threshold() {
+    let bin_path = env!("CARGO_BIN_EXE_redfolder");
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+    let client = common::offline_client(Some(cache_dir.clone()));
+
+    // Create a high-impact event
+    let high_event = redfolder::RawCalendarEvent {
+        title: "US CPI High".into(),
+        country: "USD".into(),
+        date: (Utc::now() + Duration::hours(1)).to_rfc3339(),
+        time: "".into(),
+        impact: "High".into(),
+    };
+    client.save_cache(&[high_event]).unwrap();
+
+    // Query with --min-impact Medium: should include High event
+    let output = std::process::Command::new(bin_path)
+        .args([
+            "--cache-dir",
+            cache_dir.to_str().unwrap(),
+            "upcoming",
+            "--min-impact",
+            "Medium",
+            "--json",
+        ])
+        .output()
+        .expect("failed to execute upcoming subcommand");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json_arr: Vec<serde_json::Value> = serde_json::from_str(&stdout).expect("valid json array");
+    assert_eq!(json_arr.len(), 1);
+
+    // Query with exact --impact Low: should NOT include High event
+    let output_low = std::process::Command::new(bin_path)
+        .args([
+            "--cache-dir",
+            cache_dir.to_str().unwrap(),
+            "upcoming",
+            "--impact",
+            "Low",
+            "--json",
+        ])
+        .output()
+        .expect("failed to execute upcoming subcommand");
+    assert!(output_low.status.success());
+    let stdout_low = String::from_utf8_lossy(&output_low.stdout);
+    let json_arr_low: Vec<serde_json::Value> =
+        serde_json::from_str(&stdout_low).expect("valid json array");
+    assert_eq!(json_arr_low.len(), 0);
+}
+
+#[tokio::test]
+async fn test_cli_status_provenance_json_and_exit_codes() {
+    let bin_path = env!("CARGO_BIN_EXE_redfolder");
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_dir = temp_dir.path().to_path_buf();
+    let client = common::offline_client(Some(cache_dir.clone()));
+
+    // Case 1: Permitted trading (exit 0) + full provenance JSON
+    let future_event = redfolder::RawCalendarEvent {
+        title: "Future Event".into(),
+        country: "USD".into(),
+        date: (Utc::now() + Duration::hours(5)).to_rfc3339(),
+        time: "".into(),
+        impact: "High".into(),
+    };
+    client.save_cache(&[future_event]).unwrap();
+
+    let output_ok = std::process::Command::new(bin_path)
+        .args([
+            "--cache-dir",
+            cache_dir.to_str().unwrap(),
+            "status",
+            "--json",
+        ])
+        .output()
+        .expect("failed to execute status subcommand");
+    assert_eq!(output_ok.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output_ok.stdout);
+    let json_val: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
+    assert_eq!(json_val["in_blackout"], false);
+    assert_eq!(json_val["data"]["source"], "ttl_cache");
+    assert_eq!(json_val["data"]["stale"], false);
+    assert_eq!(json_val["data"]["degraded"], false);
+    assert!(json_val["data"]["fetched_at"].is_string());
+    assert!(json_val["data"]["ingest"]["kept"].as_u64().is_some());
+
+    // Case 2: Active blackout (exit 1)
+    let active_event = redfolder::RawCalendarEvent {
+        title: "Active Event".into(),
+        country: "USD".into(),
+        date: Utc::now().to_rfc3339(),
+        time: "".into(),
+        impact: "High".into(),
+    };
+    client.save_cache(&[active_event]).unwrap();
+
+    let output_blackout = std::process::Command::new(bin_path)
+        .args([
+            "--cache-dir",
+            cache_dir.to_str().unwrap(),
+            "status",
+            "--json",
+        ])
+        .output()
+        .expect("failed to execute status subcommand");
+    assert_eq!(output_blackout.status.code(), Some(1));
+    let stdout_bo = String::from_utf8_lossy(&output_blackout.stdout);
+    let json_bo: serde_json::Value = serde_json::from_str(&stdout_bo).expect("valid json");
+    assert_eq!(json_bo["in_blackout"], true);
+
+    // Case 3: Stale/degraded data with --fail-closed (exit 2)
+    let old_event = redfolder::RawCalendarEvent {
+        title: "Old Event".into(),
+        country: "USD".into(),
+        date: (Utc::now() - Duration::hours(40)).to_rfc3339(),
+        time: "".into(),
+        impact: "High".into(),
+    };
+    client
+        .save_cache_at(&[old_event], Utc::now() - Duration::hours(40))
+        .unwrap();
+
+    let output_fail_closed = std::process::Command::new(bin_path)
+        .args([
+            "--cache-dir",
+            cache_dir.to_str().unwrap(),
+            "status",
+            "--fail-closed",
+            "--json",
+        ])
+        .output()
+        .expect("failed to execute status subcommand");
+    assert_eq!(output_fail_closed.status.code(), Some(2));
+}
+
+#[tokio::test]
 async fn test_mock_server_scripted_replies_and_fixtures() {
     let raw_ev = common::usd_high_in(chrono::Duration::hours(1));
     assert_eq!(raw_ev.country, "USD");

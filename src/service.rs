@@ -435,6 +435,9 @@ impl RedFolderService {
     ) -> Result<R> {
         config.validate()?;
         let worker_id = worker_id.into();
+        for w in config.lint() {
+            warn!(worker=%worker_id, "{w}");
+        }
 
         let mut workers = self.workers.write().await;
         if workers.contains_key(&worker_id) {

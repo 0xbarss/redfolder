@@ -279,6 +279,36 @@ impl RedFolderConfig {
         Ok(())
     }
 
+    /// Human-readable warnings for non-standard (likely mistyped) values.
+    #[must_use]
+    pub fn lint(&self) -> Vec<String> {
+        let mut w = Vec::new();
+        for c in &self.currencies {
+            if let Currency::Custom(ref s) = c {
+                w.push(format!(
+                    "unknown currency {s:?} will match nothing unless the feed uses it"
+                ));
+            }
+        }
+        for i in &self.impacts {
+            if let Impact::Custom(ref s) = i {
+                w.push(format!(
+                    "unknown impact {s:?}: standard tiers are High, Medium, Low, Non-Economic"
+                ));
+            }
+        }
+        if self.fail_safe_mode.is_fail_open() {
+            w.push(
+                "fail_safe_mode = FailOpen: stale or missing calendar data will NOT block trading"
+                    .into(),
+            );
+        }
+        if !self.include_tentative {
+            w.push("include_tentative = false: events without a confirmed time are ignored".into());
+        }
+        w
+    }
+
     /// Return configured currencies as a slice of typed [`Currency`] variants.
     #[must_use]
     pub fn typed_currencies(&self) -> &[Currency] {
@@ -393,6 +423,19 @@ impl RedFolderConfigBuilder {
             self.custom_impacts = true;
         }
         self.config.impacts.push(impact.into());
+        self
+    }
+
+    /// Selects `floor` and every higher standard tier (Low => Low+Medium+High, Medium => Medium+High, High => High).
+    #[must_use]
+    pub fn min_impact(mut self, floor: impl Into<Impact>) -> Self {
+        self.config.impacts = match floor.into() {
+            Impact::High => vec![Impact::High],
+            Impact::Medium => vec![Impact::Medium, Impact::High],
+            Impact::Low => vec![Impact::Low, Impact::Medium, Impact::High],
+            other => vec![other],
+        };
+        self.custom_impacts = true;
         self
     }
 
@@ -717,5 +760,68 @@ mod tests {
             custom.fail_safe_mode,
             crate::types::FailSafeMode::FailClosed
         );
+    }
+
+    #[test]
+    fn test_min_impact_medium_includes_high() {
+        let cfg = RedFolderConfig::builder().min_impact("Medium").build();
+        assert_eq!(cfg.impacts, vec![Impact::Medium, Impact::High]);
+
+        let cfg_low = RedFolderConfig::builder().min_impact("Low").build();
+        assert_eq!(
+            cfg_low.impacts,
+            vec![Impact::Low, Impact::Medium, Impact::High]
+        );
+
+        let cfg_high = RedFolderConfig::builder().min_impact("High").build();
+        assert_eq!(cfg_high.impacts, vec![Impact::High]);
+    }
+
+    #[test]
+    fn test_exact_impact_medium_excludes_high() {
+        let cfg = RedFolderConfig::builder().impacts(["Medium"]).build();
+        assert_eq!(cfg.impacts, vec![Impact::Medium]);
+        assert!(!cfg.impacts.contains(&Impact::High));
+    }
+
+    #[test]
+    fn test_min_impact_custom_is_not_above_high() {
+        let res = RedFolderConfig::builder()
+            .min_impact("Hgh")
+            .try_build_strict();
+        assert!(
+            res.is_err(),
+            "min_impact with typo should fail strict build"
+        );
+    }
+
+    #[test]
+    fn test_lint_flags_typos() {
+        let cfg = RedFolderConfig::builder()
+            .currencies(["USDD"])
+            .impacts(["Hgh"])
+            .include_tentative(false)
+            .build();
+        let warnings = cfg.lint();
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("unknown currency \"USDD\"")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("unknown impact \"hgh\"")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("fail_safe_mode = FailOpen")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("include_tentative = false")));
+    }
+
+    #[test]
+    fn test_presets_pass_validate_strict() {
+        assert!(RedFolderConfig::prop_firm_strict()
+            .validate_strict()
+            .is_ok());
+        assert!(RedFolderConfig::conservative().validate_strict().is_ok());
     }
 }

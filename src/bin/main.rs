@@ -32,9 +32,17 @@ enum Commands {
         #[arg(short, long, default_value = "USD")]
         currency: String,
 
-        /// Minimum impact level to consider (High, Medium, Low)
-        #[arg(short, long, default_value = "High")]
-        impact: String,
+        /// Impact tier(s) to include, comma-separated (e.g. High,Medium). Exact match: `Medium` does NOT include `High`.
+        #[arg(short, long, value_delimiter = ',', default_value = "High")]
+        impact: Vec<String>,
+
+        /// Include this impact tier and everything above it (e.g. `Medium` = Medium + High). Overrides --impact.
+        #[arg(long, conflicts_with = "impact")]
+        min_impact: Option<String>,
+
+        /// Enforce fail-closed safety policy (halts trading when calendar data is unavailable, empty, or stale)
+        #[arg(long)]
+        fail_closed: bool,
 
         /// Output results as JSON
         #[arg(long)]
@@ -51,9 +59,17 @@ enum Commands {
         #[arg(short, long, default_value = "USD")]
         currency: String,
 
-        /// Minimum impact level to consider (High, Medium, Low)
-        #[arg(short, long, default_value = "High")]
-        impact: String,
+        /// Impact tier(s) to include, comma-separated (e.g. High,Medium). Exact match: `Medium` does NOT include `High`.
+        #[arg(short, long, value_delimiter = ',', default_value = "High")]
+        impact: Vec<String>,
+
+        /// Include this impact tier and everything above it (e.g. `Medium` = Medium + High). Overrides --impact.
+        #[arg(long, conflicts_with = "impact")]
+        min_impact: Option<String>,
+
+        /// Enforce fail-closed safety policy (halts trading when calendar data is unavailable, empty, or stale)
+        #[arg(long)]
+        fail_closed: bool,
 
         /// Output results as JSON
         #[arg(long)]
@@ -73,21 +89,42 @@ enum Commands {
         #[arg(short, long, default_value = "USD")]
         currency: String,
 
-        /// Minimum impact level
-        #[arg(short, long, default_value = "High")]
-        impact: String,
+        /// Impact tier(s) to include, comma-separated (e.g. High,Medium). Exact match: `Medium` does NOT include `High`.
+        #[arg(short, long, value_delimiter = ',', default_value = "High")]
+        impact: Vec<String>,
+
+        /// Include this impact tier and everything above it (e.g. `Medium` = Medium + High). Overrides --impact.
+        #[arg(long, conflicts_with = "impact")]
+        min_impact: Option<String>,
+
+        /// Enforce fail-closed safety policy (halts trading when calendar data is unavailable, empty, or stale)
+        #[arg(long)]
+        fail_closed: bool,
     },
 }
 
-fn build_cli_config(currency: String, impact: String) -> Result<RedFolderConfig> {
-    RedFolderConfig::builder()
-        .currencies(vec![currency])
-        .impacts(vec![impact])
-        .try_build()
-        .map_err(|e| {
-            eprintln!("{}: {}", "Invalid configuration".red().bold(), e);
-            e
-        })
+fn build_cli_config(
+    currency: String,
+    impacts: Vec<String>,
+    min_impact: Option<String>,
+    fail_closed: bool,
+) -> Result<RedFolderConfig> {
+    let mut b = RedFolderConfig::builder().currencies(vec![currency]);
+    b = match min_impact {
+        Some(m) => b.min_impact(m.as_str()),
+        None => b.impacts(impacts),
+    };
+    if fail_closed {
+        b = b.fail_safe_mode(redfolder::types::FailSafeMode::FailClosed);
+    }
+    let cfg = b.try_build_strict().map_err(|e| {
+        eprintln!("{}: {}", "Invalid configuration".red().bold(), e);
+        e
+    })?;
+    for w in cfg.lint() {
+        eprintln!("{}: {}", "Warning".yellow().bold(), w);
+    }
+    Ok(cfg)
 }
 
 #[tokio::main]
@@ -104,23 +141,63 @@ async fn main() -> Result<()> {
         Commands::Status {
             currency,
             impact,
+            min_impact,
+            fail_closed,
             json,
         } => {
-            let events = client.fetch_or_cached().await?;
-            let config = build_cli_config(currency.clone(), impact)?;
+            let config = build_cli_config(currency.clone(), impact, min_impact, fail_closed)?;
+            let snap = match client.fetch_snapshot().await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "{}: Failed to fetch calendar snapshot: {e}",
+                        "Error".red().bold()
+                    );
+                    if fail_closed {
+                        std::process::exit(2);
+                    } else {
+                        return Err(e);
+                    }
+                }
+            };
 
-            let engine = BlackoutEngine::compile(&events, &[&config], chrono::Utc::now());
+            let max_age = chrono::Duration::hours(36);
+            let engine = BlackoutEngine::compile_snapshot(
+                &snap,
+                &[&config],
+                chrono::Utc::now(),
+                None,
+                max_age,
+            );
             let current = engine.status(&config);
+            let stale = engine.is_stale_at(chrono::Utc::now());
 
             if json {
                 let status_json = serde_json::json!({
                     "currency": currency,
                     "in_blackout": current.is_some(),
                     "active_window": current,
+                    "data": {
+                        "source": snap.source,
+                        "fetched_at": snap.data_fetched_at,
+                        "age_minutes": snap.age_at(chrono::Utc::now()).num_minutes(),
+                        "stale": stale,
+                        "degraded": snap.is_degraded(),
+                        "remote_error": snap.remote_error,
+                        "ingest": snap.stats,
+                    }
                 });
                 println!("{}", serde_json::to_string_pretty(&status_json)?);
             } else {
-                match current {
+                if snap.is_degraded() {
+                    eprintln!(
+                        "{} using cached data from {} ({})",
+                        "⚠".yellow().bold(),
+                        snap.data_fetched_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                        snap.remote_error.as_deref().unwrap_or("degraded source")
+                    );
+                }
+                match current.as_ref() {
                     Some(window) => {
                         println!(
                             "\n{}",
@@ -195,23 +272,47 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+
+            if fail_closed && (stale || snap.is_degraded()) {
+                std::process::exit(2);
+            } else if current.is_some() {
+                std::process::exit(1);
+            } else {
+                std::process::exit(0);
+            }
         }
 
         Commands::Upcoming {
             hours,
             currency,
             impact,
+            min_impact,
+            fail_closed,
             json,
         } => {
-            let events = client.fetch_or_cached().await?;
-            let config = build_cli_config(currency.clone(), impact)?;
-
-            let engine = BlackoutEngine::compile(&events, &[&config], chrono::Utc::now());
+            let config = build_cli_config(currency.clone(), impact, min_impact, fail_closed)?;
+            let snap = client.fetch_snapshot().await?;
+            let max_age = chrono::Duration::hours(36);
+            let engine = BlackoutEngine::compile_snapshot(
+                &snap,
+                &[&config],
+                chrono::Utc::now(),
+                None,
+                max_age,
+            );
             let upcoming = engine.upcoming_blackouts(&config, hours);
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&upcoming)?);
             } else {
+                if snap.is_degraded() {
+                    eprintln!(
+                        "{} using cached data from {} ({})",
+                        "⚠".yellow().bold(),
+                        snap.data_fetched_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                        snap.remote_error.as_deref().unwrap_or("degraded source")
+                    );
+                }
                 println!(
                     "\n{}",
                     format!("── Upcoming Blackout Windows (Next {hours} Hours, {currency}) ──")
@@ -281,26 +382,40 @@ async fn main() -> Result<()> {
             interval,
             currency,
             impact,
+            min_impact,
+            fail_closed,
         } => {
             println!(
                 "{}",
                 "Starting live RedFolder watcher (press Ctrl+C to exit)...".cyan()
             );
-            let config = build_cli_config(currency.clone(), impact)?;
+            let config = build_cli_config(currency.clone(), impact, min_impact, fail_closed)?;
+            let max_age = chrono::Duration::hours(36);
 
-            let mut events = client.fetch_or_cached().await?;
-            let mut engine = BlackoutEngine::compile(&events, &[&config], chrono::Utc::now());
+            let mut snap = client.fetch_snapshot().await?;
+            let mut engine = BlackoutEngine::compile_snapshot(
+                &snap,
+                &[&config],
+                chrono::Utc::now(),
+                None,
+                max_age,
+            );
             let mut last_fetch = std::time::Instant::now();
             let mut last_status = false;
 
             loop {
                 // Re-fetch calendar only when cache TTL (15 minutes) expires
                 if last_fetch.elapsed() >= Duration::from_secs(900) {
-                    match client.fetch_or_cached().await {
-                        Ok(new_events) => {
-                            events = new_events;
-                            engine =
-                                BlackoutEngine::compile(&events, &[&config], chrono::Utc::now());
+                    match client.fetch_snapshot().await {
+                        Ok(new_snap) => {
+                            snap = new_snap;
+                            engine = BlackoutEngine::compile_snapshot(
+                                &snap,
+                                &[&config],
+                                chrono::Utc::now(),
+                                None,
+                                max_age,
+                            );
                             last_fetch = std::time::Instant::now();
                         }
                         Err(e) => {
