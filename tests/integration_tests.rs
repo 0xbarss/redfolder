@@ -1951,6 +1951,33 @@ async fn test_retry_latency_ceiling_bounded() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_total_latency_bounded_across_dead_fallbacks() {
+    let hang = common::spawn_mock(vec![common::Reply::Hang]).await;
+    let client = redfolder::CalendarClient::with_options(
+        reqwest::Client::new(),
+        &hang.url,
+        None,
+        std::time::Duration::from_secs(1),
+    )
+    .with_fallback_urls([
+        hang.url.clone(),
+        format!("{}?b", hang.url),
+        format!("{}?c", hang.url),
+    ])
+    .with_max_retries(2)
+    .with_overall_timeout(std::time::Duration::from_secs(3));
+
+    let t = std::time::Instant::now();
+    let res = client.fetch_remote().await;
+    assert!(res.is_err(), "must fail across all dead endpoints");
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(4),
+        "total elapsed time ({:?}) must be bounded by overall timeout",
+        t.elapsed()
+    );
+}
+
 #[test]
 fn test_cache_integrity_checksum_tamper_detection() {
     let temp_dir = tempfile::tempdir().unwrap();

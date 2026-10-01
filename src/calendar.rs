@@ -21,6 +21,15 @@ pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 /// Default maximum raw event count permitted from upstream feed.
 pub const DEFAULT_MAX_EVENT_COUNT: usize = 50_000;
 
+/// Default overall wall-clock deadline spanning all candidate URLs, attempts, and backoff delays (60 seconds).
+pub const DEFAULT_OVERALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Default maximum backoff delay duration (10 seconds).
+pub const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(10);
+
+/// Maximum permissible HTTP retry attempts for transient errors.
+pub const MAX_RETRIES_LIMIT: usize = 10;
+
 /// Default User-Agent header used for calendar HTTP requests.
 ///
 /// FairEconomy / ForexFactory endpoints block generic bot User-Agents (including the default
@@ -185,6 +194,7 @@ pub struct CalendarClient {
     min_expected_events: usize,
     max_retries: usize,
     backoff_initial_delay: Duration,
+    max_backoff: Duration,
     max_retry_after: Duration,
     overall_timeout: Option<Duration>,
     integrity_validator: Option<CalendarIntegrityValidator>,
@@ -205,6 +215,7 @@ impl std::fmt::Debug for CalendarClient {
             .field("min_expected_events", &self.min_expected_events)
             .field("max_retries", &self.max_retries)
             .field("backoff_initial_delay", &self.backoff_initial_delay)
+            .field("max_backoff", &self.max_backoff)
             .field("max_retry_after", &self.max_retry_after)
             .field("overall_timeout", &self.overall_timeout)
             .field(
@@ -383,8 +394,9 @@ impl CalendarClient {
             min_expected_events: 1,
             max_retries: 2,
             backoff_initial_delay: Duration::from_millis(500),
+            max_backoff: DEFAULT_MAX_BACKOFF,
             max_retry_after: Duration::from_secs(10),
-            overall_timeout: None,
+            overall_timeout: Some(DEFAULT_OVERALL_TIMEOUT),
             integrity_validator: None,
         }
     }
@@ -484,10 +496,10 @@ impl CalendarClient {
         self.min_expected_events
     }
 
-    /// Configure maximum HTTP retry attempts for transient errors (429, 408, 5xx).
+    /// Configure maximum HTTP retry attempts for transient errors (429, 408, 5xx), capped at [`MAX_RETRIES_LIMIT`].
     #[must_use]
     pub fn with_max_retries(mut self, max_retries: usize) -> Self {
-        self.max_retries = max_retries;
+        self.max_retries = max_retries.min(MAX_RETRIES_LIMIT);
         self
     }
 
@@ -503,6 +515,19 @@ impl CalendarClient {
         self.backoff_initial_delay = initial_delay;
         self.max_retry_after = max_retry_after;
         self
+    }
+
+    /// Configure the maximum backoff delay duration.
+    #[must_use]
+    pub fn with_max_backoff(mut self, max_backoff: Duration) -> Self {
+        self.max_backoff = max_backoff;
+        self
+    }
+
+    /// Configured maximum backoff delay duration.
+    #[must_use]
+    pub fn max_backoff(&self) -> Duration {
+        self.max_backoff
     }
 
     /// Initial exponential backoff delay duration.
@@ -524,10 +549,37 @@ impl CalendarClient {
         self
     }
 
+    /// Explicitly remove any overall wall-clock timeout ceiling.
+    #[must_use]
+    pub fn without_overall_timeout(mut self) -> Self {
+        self.overall_timeout = None;
+        self
+    }
+
     /// Overall wall-clock timeout ceiling if set.
     #[must_use]
     pub fn overall_timeout(&self) -> Option<Duration> {
         self.overall_timeout
+    }
+
+    /// Calculate exponential backoff delay for the given retry attempt, capped at [`max_backoff`](Self::max_backoff).
+    #[must_use]
+    pub fn backoff_delay(&self, attempt: usize) -> Duration {
+        let factor = 1u32 << attempt.min(16);
+        self.backoff_initial_delay
+            .saturating_mul(factor)
+            .min(self.max_backoff)
+    }
+
+    /// Returns the candidate URLs to try in priority order (primary URL followed by fallback URLs),
+    /// with duplicates removed.
+    #[must_use]
+    pub fn candidate_urls(&self) -> Vec<&str> {
+        let mut seen = std::collections::HashSet::new();
+        std::iter::once(self.calendar_url.as_str())
+            .chain(self.fallback_urls.iter().map(String::as_str))
+            .filter(|u| seen.insert(*u))
+            .collect()
     }
 
     /// Configure a custom pluggable integrity validator callback.
@@ -611,14 +663,14 @@ impl CalendarClient {
     ///
     /// # Latency Ceiling Guarantee
     ///
-    /// Worst-case wall-clock latency per URL candidate is strictly bounded:
-    /// with default settings (30s request timeout, 2 retries, 10s max backoff), worst-case latency under
-    /// total network timeouts is `(1 + 2) * 30s + 20s = 110s`. Under immediate 429/5xx status responses,
-    /// worst-case latency is `<= 21s`.
+    /// Worst-case wall-clock latency per URL candidate is bounded by:
+    /// `Σ (request_timeout) + Σ backoff_delay(attempt)`.
+    /// With default settings (30s request timeout, 2 retries, 0.5s/1s backoff, 10s max backoff),
+    /// worst-case latency under network timeouts is ~91.5s per URL candidate.
+    /// Under repeated 429 status responses with `Retry-After >= 10s`, latency is ~21s per URL candidate.
     ///
-    /// If an [`overall_timeout`](Self::with_overall_timeout) is set, the entire operation across all candidates
-    /// is terminated when the deadline expires.
-    /// Fetch calendar events from the remote endpoint with ingest statistics.
+    /// An [`overall_timeout`](Self::with_overall_timeout) (default 60s) caps the total elapsed time across
+    /// all URL candidates and retries.
     pub async fn fetch_remote_with_stats(&self) -> Result<(Vec<RawCalendarEvent>, IngestStats)> {
         if let Some(timeout) = self.overall_timeout {
             tokio::time::timeout(timeout, self.fetch_remote_candidates())
@@ -639,27 +691,26 @@ impl CalendarClient {
     ///
     /// # Latency Ceiling Guarantee
     ///
-    /// Worst-case wall-clock latency per URL candidate is strictly bounded:
-    /// with default settings (30s request timeout, 2 retries, 10s max backoff), worst-case latency under
-    /// total network timeouts is `(1 + 2) * 30s + 20s = 110s`. Under immediate 429/5xx status responses,
-    /// worst-case latency is `<= 21s`.
+    /// Worst-case wall-clock latency per URL candidate is bounded by:
+    /// `Σ (request_timeout) + Σ backoff_delay(attempt)`.
+    /// With default settings (30s request timeout, 2 retries, 0.5s/1s backoff, 10s max backoff),
+    /// worst-case latency under network timeouts is ~91.5s per URL candidate.
+    /// Under repeated 429 status responses with `Retry-After >= 10s`, latency is ~21s per URL candidate.
     ///
-    /// If an [`overall_timeout`](Self::with_overall_timeout) is set, the entire operation across all candidates
-    /// is terminated when the deadline expires.
+    /// An [`overall_timeout`](Self::with_overall_timeout) (default 60s) caps the total elapsed time across
+    /// all URL candidates and retries.
     pub async fn fetch_remote(&self) -> Result<Vec<RawCalendarEvent>> {
         Ok(self.fetch_remote_with_stats().await?.0)
     }
 
     async fn fetch_remote_candidates(&self) -> Result<(Vec<RawCalendarEvent>, IngestStats)> {
-        let mut candidate_urls: Vec<&str> = Vec::with_capacity(1 + self.fallback_urls.len());
-        candidate_urls.push(&self.calendar_url);
-        for fb in &self.fallback_urls {
-            candidate_urls.push(fb);
-        }
+        let candidate_urls = self.candidate_urls();
+        let deadline =
+            tokio::time::Instant::now() + self.overall_timeout.unwrap_or(Duration::from_secs(3600));
 
         let mut candidate_errors: Vec<(String, String)> = Vec::new();
 
-        for (url_idx, &url) in candidate_urls.iter().enumerate() {
+        'candidates: for (url_idx, &url) in candidate_urls.iter().enumerate() {
             #[cfg(test)]
             {
                 if std::env::var("REDFOLDER_TEST_OFFLINE").as_deref() == Ok("1") {
@@ -673,10 +724,21 @@ impl CalendarClient {
             let mut url_error = None;
 
             for attempt in 0..=self.max_retries {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    let err = url_error.unwrap_or_else(|| {
+                        crate::error::RedFolderError::Calendar(
+                            "overall timeout deadline expired".into(),
+                        )
+                    });
+                    candidate_errors.push((url.to_string(), err.to_string()));
+                    break 'candidates;
+                }
+
                 match self
                     .client
                     .get(url)
-                    .timeout(self.request_timeout)
+                    .timeout(self.request_timeout.min(remaining))
                     .send()
                     .await
                 {
@@ -721,8 +783,10 @@ impl CalendarClient {
                                 warn!(err = %e, attempt, url = %url, "failed streaming response body");
                                 url_error = Some(e);
                                 if attempt < self.max_retries {
-                                    let delay = self.backoff_initial_delay * (1 << attempt);
-                                    tokio::time::sleep(delay).await;
+                                    let delay = self.backoff_delay(attempt);
+                                    let remaining = deadline
+                                        .saturating_duration_since(tokio::time::Instant::now());
+                                    tokio::time::sleep(delay.min(remaining)).await;
                                     continue;
                                 }
                                 break;
@@ -811,8 +875,10 @@ impl CalendarClient {
                                     warn!(err = %e, attempt, url = %url, "failed to parse calendar response JSON");
                                     url_error = Some(crate::error::RedFolderError::Json(e));
                                     if attempt < self.max_retries {
-                                        let delay = self.backoff_initial_delay * (1 << attempt);
-                                        tokio::time::sleep(delay).await;
+                                        let delay = self.backoff_delay(attempt);
+                                        let remaining = deadline
+                                            .saturating_duration_since(tokio::time::Instant::now());
+                                        tokio::time::sleep(delay.min(remaining)).await;
                                         continue;
                                     }
                                 }
@@ -850,10 +916,12 @@ impl CalendarClient {
                                 break;
                             }
 
-                            let delay = retry_after_duration
-                                .unwrap_or_else(|| self.backoff_initial_delay * (1 << attempt));
+                            let delay =
+                                retry_after_duration.unwrap_or_else(|| self.backoff_delay(attempt));
                             debug!(delay = ?delay, "sleeping before retrying rate-limited or transient failure");
-                            tokio::time::sleep(delay).await;
+                            let remaining =
+                                deadline.saturating_duration_since(tokio::time::Instant::now());
+                            tokio::time::sleep(delay.min(remaining)).await;
                             continue;
                         }
                     }
@@ -861,8 +929,10 @@ impl CalendarClient {
                         warn!(err = %e, attempt, url = %url, "calendar HTTP transport request failed");
                         url_error = Some(crate::error::RedFolderError::Http(e));
                         if attempt < self.max_retries {
-                            let delay = self.backoff_initial_delay * (1 << attempt);
-                            tokio::time::sleep(delay).await;
+                            let delay = self.backoff_delay(attempt);
+                            let remaining =
+                                deadline.saturating_duration_since(tokio::time::Instant::now());
+                            tokio::time::sleep(delay.min(remaining)).await;
                             continue;
                         }
                     }
@@ -1764,6 +1834,7 @@ mod tests {
             .with_max_event_count(10_000)
             .with_max_retries(4)
             .with_backoff(Duration::from_millis(200), Duration::from_secs(5))
+            .with_max_backoff(Duration::from_secs(8))
             .with_overall_timeout(Duration::from_secs(15));
 
         assert_eq!(client.fallback_urls().len(), 2);
@@ -1776,6 +1847,45 @@ mod tests {
         assert_eq!(client.max_retries(), 4);
         assert_eq!(client.backoff_initial_delay(), Duration::from_millis(200));
         assert_eq!(client.max_retry_after(), Duration::from_secs(5));
+        assert_eq!(client.max_backoff(), Duration::from_secs(8));
         assert_eq!(client.overall_timeout(), Some(Duration::from_secs(15)));
+
+        let client_no_timeout = client.without_overall_timeout();
+        assert_eq!(client_no_timeout.overall_timeout(), None);
+    }
+
+    #[test]
+    fn test_backoff_is_capped_and_never_overflows() {
+        let client = CalendarClient::without_cache()
+            .with_max_retries(1000)
+            .with_max_backoff(Duration::from_secs(10));
+        assert_eq!(client.max_retries(), MAX_RETRIES_LIMIT);
+        assert_eq!(client.backoff_delay(0), Duration::from_millis(500));
+        assert_eq!(client.backoff_delay(1), Duration::from_millis(1000));
+        assert_eq!(client.backoff_delay(2), Duration::from_millis(2000));
+        assert_eq!(client.backoff_delay(3), Duration::from_millis(4000));
+        assert_eq!(client.backoff_delay(4), Duration::from_millis(8000));
+        assert_eq!(client.backoff_delay(5), Duration::from_secs(10));
+        assert_eq!(client.backoff_delay(999), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_duplicate_fallbacks_are_ignored() {
+        let client = CalendarClient::without_cache()
+            .with_fallback_url(CALENDAR_URL)
+            .with_fallback_url("https://mirror1.internal/cal.json")
+            .with_fallback_url("https://mirror1.internal/cal.json");
+        let candidates = client.candidate_urls();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0], CALENDAR_URL);
+        assert_eq!(candidates[1], "https://mirror1.internal/cal.json");
+    }
+
+    #[tokio::test]
+    async fn test_default_client_has_overall_timeout() {
+        assert_eq!(
+            CalendarClient::without_cache().overall_timeout(),
+            Some(DEFAULT_OVERALL_TIMEOUT)
+        );
     }
 }

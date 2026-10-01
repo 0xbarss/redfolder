@@ -17,7 +17,8 @@ pub mod types;
 
 pub use calendar::{
     CacheMetadata, CachedCalendarData, CalendarClient, CalendarSnapshot, IngestStats,
-    RawCalendarEvent, SnapshotSource, CALENDAR_URL, DEFAULT_CACHE_FILENAME,
+    RawCalendarEvent, SnapshotSource, CALENDAR_URL, DEFAULT_CACHE_FILENAME, DEFAULT_MAX_BACKOFF,
+    DEFAULT_OVERALL_TIMEOUT, MAX_RETRIES_LIMIT,
 };
 pub use config::{RedFolderConfig, RedFolderConfigBuilder, MAX_BUFFER_MINUTES};
 pub use curfew::{

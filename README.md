@@ -185,9 +185,9 @@ Macroeconomic release schedules directly govern live trading execution and risk 
 ### Retry Latency Ceilings & Execution SLAs
 
 Gatekeeping real-time order execution requires strictly bounded network latency. `fetch_remote` provides deterministic latency boundaries:
-- **Bounded Exponential Backoff**: Retries are capped at `max_retries` (default: 2), initial backoff begins at 500ms, and `Retry-After` header values from upstream 429 responses are hard-capped at 10s.
-- **Worst-Case Wall-Clock Bounds**: Under total connection timeout conditions, total wall-clock latency per endpoint candidate is bounded to $(1 + 2) \times 30\text{s} + 20\text{s} = 110\text{s}$. Under instant HTTP 429/5xx status responses, maximum total latency is $\le 21\text{s}$.
-- **End-to-End Operation Timeout**: Callers can configure [`CalendarClient::with_overall_timeout`](#calendarclient) (e.g. 5s or 10s) to establish a firm cancellation deadline across all candidates and backoffs.
+- **Bounded Exponential Backoff**: Retries are capped at `max_retries` (default: 2, bounded by `MAX_RETRIES_LIMIT = 10`), initial backoff begins at 500ms, backoff is capped by `max_backoff` (default: 10s), and `Retry-After` header values from upstream 429 responses are hard-capped at 10s.
+- **Worst-Case Wall-Clock Bounds**: Under total connection timeout conditions, total wall-clock latency per endpoint candidate is bounded by $\sum \text{request\_timeout} + \sum \text{backoff\_delay}(\text{attempt})$ ($\approx 91.5\text{s}$ per endpoint under defaults). Under instant HTTP 429 status responses with $\text{Retry-After} \ge 10\text{s}$, maximum latency is $\approx 21\text{s}$ per endpoint.
+- **End-to-End Operation Timeout**: An overall wall-clock deadline (`overall_timeout`, default 60s, configurable via [`CalendarClient::with_overall_timeout`](#calendarclient) or [`without_overall_timeout`](#calendarclient)) strictly caps cumulative duration across all candidate URLs, retries, and backoffs.
 
 ### Fail-Safe Risk Policies (Fail-Open vs. Fail-Closed)
 
@@ -642,7 +642,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 | **Upstream Feed Primary Outage / Failover** | `fetch_remote` automatically fails over to configured secondary mirrors in order when primary fails. | Verified |
 | **Cache File & Directory Permissions** | Enforces POSIX `0o700` directory and `0o600` file permissions on Unix systems to protect against unauthorized multi-user access. | Verified |
 | **Sync Failure under Fail-Closed Policy** | Automatically injects a synthetic `Fail-Closed Safety Blackout` window for `FailClosed` workers, halting trading during feed outages. | Verified |
-| **Retry Latency Ceiling Exceeded** | Aborts retry loop once cumulative duration exceeds `overall_timeout` (default 30s), avoiding stalled caller tasks. | Verified |
+| **Retry Latency Ceiling Exceeded** | Aborts retry loop once cumulative duration exceeds `overall_timeout` (default 60s), avoiding stalled caller tasks. | Verified by `test_total_latency_bounded_across_dead_fallbacks`, `test_retry_latency_ceiling_bounded` |
 | **Disabled Weekend Config Validation** | `validate()` unconditionally checks weekend curfew parameters even when `weekend_enabled` is false, preventing latent runtime bugs. | Verified |
 | **Back-to-Back News Interval Merging** | Merges overlapping releases into unified intervals verified via $O(\log n)$ binary search lookup. | Verified |
 | **Weekend & Economic Overlap** | Seamlessly connects late Friday economic releases with weekend market curfews without coverage gap. | Verified |
