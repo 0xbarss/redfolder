@@ -2276,7 +2276,7 @@ async fn test_cli_binary_execution() {
         .expect("failed to execute redfolder binary");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("1.0.0"));
+    assert!(stdout.contains(env!("CARGO_PKG_VERSION")));
 
     // 3. status --json with isolated cache dir
     let temp_dir = tempfile::tempdir().unwrap();
