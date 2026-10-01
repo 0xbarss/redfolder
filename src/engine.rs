@@ -4,7 +4,7 @@ use crate::types::{
     BlackoutWindow, CustomEventKind, EconomicEvent, EventTiming, Impact, WindowEvent,
 };
 use chrono::{DateTime, Duration, Utc};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// In-memory engine that manages calendar events and derives per-worker blackout windows.
 #[derive(Debug, Clone, Default)]
@@ -23,6 +23,8 @@ pub struct BlackoutEngine {
     data_fetched_at: Option<DateTime<Utc>>,
     /// Maximum acceptable age before calendar data is considered stale.
     max_data_age: Option<Duration>,
+    /// Number of raw calendar events that could not be parsed and were dropped.
+    dropped: usize,
 }
 
 impl BlackoutEngine {
@@ -37,6 +39,7 @@ impl BlackoutEngine {
             stale: false,
             data_fetched_at: None,
             max_data_age: None,
+            dropped: 0,
         }
     }
 
@@ -52,25 +55,50 @@ impl BlackoutEngine {
         raw_events: &[RawCalendarEvent],
         default_tz: Option<chrono_tz::Tz>,
     ) -> Self {
-        let parsed_events: Vec<EconomicEvent> = raw_events
-            .iter()
-            .filter_map(|raw| {
-                let timing = parse_event_timing(raw, default_tz)?;
-                let dt = match &timing {
-                    EventTiming::Exact(dt) => *dt,
-                    EventTiming::AllDay(d) | EventTiming::TentativeDate(d) => {
-                        crate::calendar::date_to_utc_start(*d, default_tz)?
+        let mut dropped: Vec<&RawCalendarEvent> = Vec::new();
+        let mut parsed_events: Vec<EconomicEvent> = Vec::with_capacity(raw_events.len());
+
+        for raw in raw_events {
+            let Some(timing) = parse_event_timing(raw, default_tz) else {
+                dropped.push(raw);
+                continue;
+            };
+            let dt = match &timing {
+                EventTiming::Exact(dt) => *dt,
+                EventTiming::AllDay(d) | EventTiming::TentativeDate(d) => {
+                    match crate::calendar::date_to_utc_start(*d, default_tz) {
+                        Some(x) => x,
+                        None => {
+                            dropped.push(raw);
+                            continue;
+                        }
                     }
-                };
-                Some(EconomicEvent {
-                    title: raw.title.clone(),
-                    country: raw.country.clone(),
-                    impact: raw.impact.clone(),
-                    datetime: dt,
-                    timing,
-                })
-            })
-            .collect();
+                }
+            };
+            parsed_events.push(EconomicEvent {
+                title: raw.title.clone(),
+                country: raw.country.clone(),
+                impact: raw.impact.clone(),
+                datetime: dt,
+                timing,
+            });
+        }
+
+        if !dropped.is_empty() {
+            let sample: Vec<String> = dropped
+                .iter()
+                .take(3)
+                .map(|e| format!("{:?} date={:?} time={:?}", e.title, e.date, e.time))
+                .collect();
+            warn!(
+                dropped = dropped.len(),
+                total = raw_events.len(),
+                ?sample,
+                "calendar events could not be parsed and were ignored"
+            );
+        }
+
+        let dropped_count = dropped.len();
 
         Self {
             raw_events: raw_events.to_vec(),
@@ -80,6 +108,7 @@ impl BlackoutEngine {
             stale: false,
             data_fetched_at: None,
             max_data_age: None,
+            dropped: dropped_count,
         }
     }
 
@@ -244,6 +273,27 @@ impl BlackoutEngine {
         self
     }
 
+    /// Number of raw calendar events that could not be parsed and were dropped.
+    #[must_use]
+    pub fn dropped_count(&self) -> usize {
+        self.dropped
+    }
+
+    fn invalid_config_windows(&self, now: DateTime<Utc>) -> Vec<BlackoutWindow> {
+        vec![BlackoutWindow {
+            start: now - Duration::hours(1),
+            end: now + Duration::hours(24),
+            events: vec![WindowEvent {
+                is_custom: true,
+                custom_kind: Some(CustomEventKind::FailClosedSafety),
+                event_time: now,
+                country: "Global".into(),
+                impact: "High".into(),
+                title: "Invalid Configuration (Fail-Closed Safety Blackout)".into(),
+            }],
+        }]
+    }
+
     /// Derives worker-specific blackout windows at runtime using the worker's own
     /// timing buffers (`before_min`, `after_min`), merge threshold, currencies, impacts,
     /// and weekend curfew configuration.
@@ -257,9 +307,26 @@ impl BlackoutEngine {
             return Vec::new();
         }
 
-        let before_min = config.before_min;
-        let after_min = config.after_min;
-        let lower_cutoff = now - Duration::minutes(after_min);
+        if let Err(err) = config.validate() {
+            error!(err = %err, "invalid worker configuration; failing closed with safety blackout");
+            return self.invalid_config_windows(now);
+        }
+
+        let (Some(before), Some(after), Some(merge_gap)) = (
+            Duration::try_minutes(config.before_min),
+            Duration::try_minutes(config.after_min),
+            Duration::try_minutes(config.merge_threshold_min),
+        ) else {
+            error!("invalid buffer configuration; failing closed with safety blackout");
+            return self.invalid_config_windows(now);
+        };
+
+        let Some(lower_cutoff) = now.checked_sub_signed(after) else {
+            error!(
+                "timestamp underflow computing lower cutoff; failing closed with safety blackout"
+            );
+            return self.invalid_config_windows(now);
+        };
 
         let mut individual: Vec<(DateTime<Utc>, DateTime<Utc>, WindowEvent)> = Vec::new();
 
@@ -274,8 +341,14 @@ impl BlackoutEngine {
                     if *dt < lower_cutoff {
                         continue;
                     }
-                    let start = *dt - Duration::minutes(before_min);
-                    let end = *dt + Duration::minutes(after_min);
+                    let Some(start) = dt.checked_sub_signed(before) else {
+                        error!("timestamp underflow computing event blackout start");
+                        continue;
+                    };
+                    let Some(end) = dt.checked_add_signed(after) else {
+                        error!("timestamp overflow computing event blackout end");
+                        continue;
+                    };
                     individual.push((
                         start,
                         end,
@@ -415,7 +488,6 @@ impl BlackoutEngine {
         individual.sort_by_key(|(start, _, _)| *start);
 
         // 4. Merge overlapping or threshold-adjacent windows using worker's merge threshold
-        let merge_gap = Duration::minutes(config.merge_threshold_min);
         let mut merged: Vec<BlackoutWindow> = Vec::new();
 
         for (start, end, event) in individual {
@@ -448,6 +520,9 @@ impl BlackoutEngine {
     pub fn is_blackout_at(&self, config: &RedFolderConfig, time: DateTime<Utc>) -> bool {
         if !config.enabled {
             return false;
+        }
+        if config.validate().is_err() {
+            return true;
         }
         let windows = self.windows_for_config(config, time);
         find_window_binary_search(&windows, time).is_some()
@@ -511,7 +586,7 @@ impl BlackoutEngine {
 
 /// Binary search for an active blackout window covering `time` in a sorted, non-overlapping slice of windows.
 ///
-/// Returns `Some(&window)` if `time` falls between `window.start` and `window.end` (inclusive), or `None` otherwise.
+/// Returns `Some(&window)` if `time` falls between `window.start` and `window.end` (`[start, end)` half-open interval), or `None` otherwise.
 /// Runs in $O(\log n)$ time.
 #[must_use]
 pub fn find_window_binary_search(
@@ -524,7 +599,7 @@ pub fn find_window_binary_search(
     match windows.binary_search_by(|w| {
         if time < w.start {
             std::cmp::Ordering::Greater
-        } else if time > w.end {
+        } else if time >= w.end {
             std::cmp::Ordering::Less
         } else {
             std::cmp::Ordering::Equal
@@ -644,7 +719,7 @@ pub fn event_matches_economic_event(event: &EconomicEvent, config: &RedFolderCon
 pub fn event_matches_config(event: &WindowEvent, config: &RedFolderConfig) -> bool {
     if event.is_custom {
         if event.is_fail_closed_safety() {
-            config.enabled && config.fail_safe_mode.is_fail_closed()
+            config.enabled && (config.fail_safe_mode.is_fail_closed() || config.validate().is_err())
         } else {
             config.weekend_enabled
         }
@@ -938,5 +1013,98 @@ mod tests {
             .unwrap()
             .summary_title()
             .contains("Calendar Data Stale"));
+    }
+
+    #[test]
+    fn test_event_window_end_is_exclusive() {
+        use chrono::TimeZone;
+        let ev = Utc.with_ymd_and_hms(2026, 10, 2, 12, 30, 0).unwrap();
+        let cfg = RedFolderConfig {
+            weekend_enabled: false,
+            before_min: 5,
+            after_min: 5,
+            ..Default::default()
+        };
+        let raw = vec![RawCalendarEvent {
+            title: "CPI".into(),
+            country: "USD".into(),
+            date: ev.to_rfc3339(),
+            time: "".into(),
+            impact: "High".into(),
+        }];
+        let engine = BlackoutEngine::compile(&raw, &[&cfg], ev - Duration::hours(1));
+        assert!(engine.is_blackout_at(&cfg, ev - Duration::minutes(5))); // start inclusive
+        assert!(engine.is_blackout_at(&cfg, ev + Duration::minutes(5) - Duration::seconds(1)));
+        assert!(!engine.is_blackout_at(&cfg, ev + Duration::minutes(5))); // end exclusive
+    }
+
+    #[test]
+    fn test_huge_buffers_are_rejected_not_panicking() {
+        let cfg = RedFolderConfig {
+            before_min: i64::MAX,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+        let engine = BlackoutEngine::new();
+        assert!(engine.is_blackout_at(&cfg, Utc::now())); // fails closed, does not panic
+    }
+
+    #[test]
+    fn test_engine_all_unparseable_events_is_fail_closed() {
+        let raw = vec![RawCalendarEvent {
+            title: "Garbage Date Event".into(),
+            country: "USD".into(),
+            date: "not-a-date".into(),
+            time: "".into(),
+            impact: "High".into(),
+        }];
+        let cfg = RedFolderConfig {
+            fail_safe_mode: crate::types::FailSafeMode::FailClosed,
+            ..Default::default()
+        };
+        let engine = BlackoutEngine::compile(&raw, &[&cfg], Utc::now());
+        assert_eq!(engine.dropped_count(), 1);
+        assert_eq!(engine.raw_events().len(), 1);
+        assert!(engine.parsed_events().is_empty());
+        assert!(engine.is_blackout(&cfg)); // fails closed
+        let status = engine.status(&cfg).unwrap();
+        assert!(status.summary_title().contains("Calendar Data Unreadable"));
+    }
+
+    #[test]
+    fn test_binary_search_and_window_is_active_at_agree() {
+        use chrono::TimeZone;
+        let base = Utc.with_ymd_and_hms(2026, 10, 2, 10, 0, 0).unwrap();
+        let windows = vec![
+            BlackoutWindow {
+                start: base,
+                end: base + Duration::minutes(30),
+                events: vec![],
+            },
+            BlackoutWindow {
+                start: base + Duration::hours(1),
+                end: base + Duration::hours(2),
+                events: vec![],
+            },
+        ];
+
+        let test_points = vec![
+            base - Duration::seconds(1),
+            base,
+            base + Duration::minutes(15),
+            base + Duration::minutes(30) - Duration::seconds(1),
+            base + Duration::minutes(30),
+            base + Duration::minutes(45),
+            base + Duration::hours(1),
+            base + Duration::hours(2) - Duration::seconds(1),
+            base + Duration::hours(2),
+            base + Duration::hours(3),
+        ];
+
+        for t in test_points {
+            let bs_found = find_window_binary_search(&windows, t).is_some();
+            let linear_found = windows.iter().any(|w| w.is_active_at(t));
+            assert_eq!(bs_found, linear_found, "mismatch at {t:?}");
+        }
     }
 }

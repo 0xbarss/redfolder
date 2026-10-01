@@ -109,6 +109,23 @@ fn default_weekend_mode() -> WeekendMode {
     WeekendMode::Short
 }
 
+/// Maximum acceptable buffer duration in minutes (7 days = 10,080 minutes).
+pub const MAX_BUFFER_MINUTES: i64 = 7 * 24 * 60;
+
+fn check_minutes(name: &str, v: i64) -> crate::error::Result<()> {
+    if v < 0 {
+        return Err(crate::error::RedFolderError::Config(format!(
+            "{name} cannot be negative (got {v})"
+        )));
+    }
+    if v > MAX_BUFFER_MINUTES {
+        return Err(crate::error::RedFolderError::Config(format!(
+            "{name} must be between 0 and {MAX_BUFFER_MINUTES} minutes (got {v})"
+        )));
+    }
+    Ok(())
+}
+
 impl Default for RedFolderConfig {
     fn default() -> Self {
         Self {
@@ -220,31 +237,11 @@ impl RedFolderConfig {
                 ));
             }
         }
-        if self.before_min < 0 {
-            return Err(crate::error::RedFolderError::Config(format!(
-                "before_min cannot be negative (got {})",
-                self.before_min
-            )));
-        }
-        if self.after_min < 0 {
-            return Err(crate::error::RedFolderError::Config(format!(
-                "after_min cannot be negative (got {})",
-                self.after_min
-            )));
-        }
-        if self.merge_threshold_min < 0 {
-            return Err(crate::error::RedFolderError::Config(format!(
-                "merge_threshold_min cannot be negative (got {})",
-                self.merge_threshold_min
-            )));
-        }
+        check_minutes("before_min", self.before_min)?;
+        check_minutes("after_min", self.after_min)?;
+        check_minutes("merge_threshold_min", self.merge_threshold_min)?;
         if let Some(warn) = self.warning_before_min {
-            if warn < 0 {
-                return Err(crate::error::RedFolderError::Config(format!(
-                    "warning_before_min cannot be negative (got {})",
-                    warn
-                )));
-            }
+            check_minutes("warning_before_min", warn)?;
         }
 
         // Unconditionally validate weekend curfew time formats even if weekend_enabled is false

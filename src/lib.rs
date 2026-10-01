@@ -19,7 +19,7 @@ pub use calendar::{
     CacheMetadata, CachedCalendarData, CalendarClient, CalendarSnapshot, IngestStats,
     RawCalendarEvent, SnapshotSource, CALENDAR_URL, DEFAULT_CACHE_FILENAME,
 };
-pub use config::{RedFolderConfig, RedFolderConfigBuilder};
+pub use config::{RedFolderConfig, RedFolderConfigBuilder, MAX_BUFFER_MINUTES};
 pub use curfew::{
     next_weekend_window, parse_time, weekend_window_at, weekend_window_for_mode,
     weekend_window_title, weekend_window_title_for_mode, WeekendMode,
@@ -41,7 +41,7 @@ pub use types::{
 /// Common prelude items for quick import.
 pub mod prelude {
     pub use crate::calendar::{CalendarSnapshot, IngestStats, SnapshotSource};
-    pub use crate::config::{RedFolderConfig, RedFolderConfigBuilder};
+    pub use crate::config::{RedFolderConfig, RedFolderConfigBuilder, MAX_BUFFER_MINUTES};
     pub use crate::curfew::WeekendMode;
     pub use crate::engine::BlackoutEngine;
     pub use crate::error::{RedFolderError, Result};
