@@ -25,6 +25,8 @@ A reliable, asynchronous economic calendar client and event-driven trading black
   - [Cryptographic Disk Integrity & File Permissions](#cryptographic-disk-integrity--file-permissions)
   - [Retry Latency Ceilings & Execution SLAs](#retry-latency-ceilings--execution-slas)
   - [Fail-Safe Risk Policies (Fail-Open vs. Fail-Closed)](#fail-safe-risk-policies-fail-open-vs-fail-closed)
+  - [Data Freshness & Provenance](#data-freshness--provenance)
+  - [Production Deployment & Verification](#production-deployment--verification)
 - [Key Features](#key-features)
 - [Repository Structure](#repository-structure)
 - [Installation](#installation)
@@ -196,6 +198,53 @@ When upstream network feeds, fallback mirrors, and local disk caches fail concur
 - **`FailSafeMode::FailClosed`** (Defensive / Prop Firm Shield): If calendar data is missing, corrupted, or stale, the engine assumes an active blackout condition. A synthetic `Fail-Closed Safety Blackout` window is dynamically injected, immediately halting trades and protecting prop-firm challenge accounts from catastrophic disqualification during provider outages.
 - **Preset Defaults**: [`RedFolderConfig::prop_firm_strict`](#redfolderconfig) and [`RedFolderConfig::conservative`](#redfolderconfig) default to `FailSafeMode::FailClosed`.
 
+### Data Freshness & Provenance
+
+In financial infrastructure, knowing *where data came from and how old it is* is as critical as the data itself. `redfolder` makes provenance a first-class citizen:
+
+- **`CalendarSnapshot`**: Bundles event records with provenance metadata:
+  - `source`: `SnapshotSource::Remote`, `SnapshotSource::TtlCache`, `SnapshotSource::FallbackCache`, or `SnapshotSource::EmptyFeedCache`.
+  - `data_fetched_at`: Timestamp when the data was originally retrieved from the upstream provider, not when it was served from disk.
+  - `remote_error`: Reason upstream data was not used when serving degraded cache.
+  - `stats`: `IngestStats` tracking `received`, `malformed`, `kept`, and `unparseable` counts.
+- **`ServiceHealth`**: Telemetry snapshot returned by `service.health().await`, exposing operational metrics for monitoring:
+  - `stale`: Boolean indicating whether underlying data age exceeds `max_data_age`.
+  - `degraded`: Boolean indicating whether data was served from fallback cache due to an upstream outage.
+  - `background_task_restarts`: Counter tracking supervisor task restarts following unexpected panics.
+
+> [!WARNING]
+> Age-based fail-closed protection requires data-timestamp tracking (`RedFolderService`, or `BlackoutEngine::compile_snapshot`). `BlackoutEngine::compile(&Vec<RawCalendarEvent>, …)` has no notion of data age.
+
+### Production Deployment & Verification
+
+For mission-critical prop firm and live algorithmic deployments, adhere to these operational practices:
+
+1. **Order-Time Verification via `gate()`**:
+   Events (`RedFolderEvent`) are edge-triggered notifications and can be delayed or dropped under network or channel pressure. **Always evaluate `service.gate(worker_id)` or `engine.status(&config)` synchronously prior to dispatching new orders:**
+   ```rust
+   match service.gate("prop_scalper").await {
+       Gate::Allowed => {
+           // Clear of news blackouts; proceed with order execution
+           send_order(symbol, volume, price).await?;
+       }
+       Gate::Blocked(window) => {
+           tracing::warn!("Order rejected: active blackout until {}", window.end);
+       }
+       Gate::Unknown(reason) => {
+           // Service not running, worker unregistered, or calendar data stale
+           tracing::error!("Order rejected: safety gate indeterminate ({reason})");
+       }
+   }
+   ```
+   > *Events are notifications; they are edge-triggered and can be missed. The authoritative answer is `gate(worker)` / `status(&cfg)`, and it must be evaluated at order time.*
+
+2. **Host Clock Synchronization (NTP / chrony)**:
+   All age and window calculations rely on UTC wall-clock timestamps. Configure `chrony` or `systemd-timesyncd` with alerting on maximum clock offset (> 5s).
+3. **Egress Firewall Rules**:
+   Restrict outbound HTTP requests to allow-listed endpoints (`nfs.faireconomy.media`) and enable `UrlPolicy` to prevent SSRF vulnerabilities.
+4. **Enforce `FailClosed` for Prop Firm Challenges**:
+   Always use `RedFolderConfig::prop_firm_strict()` or set `fail_safe_mode(FailSafeMode::FailClosed)` on accounts where news trading violations lead to immediate disqualification.
+
 ---
 
 ## Key Features
@@ -241,7 +290,8 @@ redfolder/
 │   └── bin/
 │       └── main.rs                # Terminal CLI binary (status, upcoming, watch, sync)
 └── tests/
-    └── integration_tests.rs       # End-to-end integration test battery
+    ├── integration_tests.rs   # End-to-end integration test battery
+    └── property_tests.rs      # Proptest property-based fuzzing and invariant battery
 ```
 
 ---
@@ -252,7 +302,7 @@ Add `redfolder` to your project's `Cargo.toml`:
 
 ```toml
 [dependencies]
-redfolder = "1.0"
+redfolder = "1.1"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -466,6 +516,25 @@ redfolder watch --currency USD --interval 5
 redfolder sync
 ```
 
+#### System Health Diagnostics
+```bash
+# Query calendar synchronization health, age, and background supervisor status
+redfolder health
+
+# Output structured health telemetry JSON for automated monitoring alerts
+redfolder health --json
+```
+
+#### CLI Exit Codes (Shell Guard Protocol)
+
+When shell scripts or CI orchestrators gate order placement (`redfolder status --fail-closed && execute_order`), the command emits standardized exit codes:
+
+| Exit Code | Classification | Action / Safety State |
+| :---: | :--- | :--- |
+| `0` | **Trading Allowed** | Clear of active news blackouts; order entry allowed. |
+| `1` | **Blackout Active** | Currently within an active blackout window; trading blocked. |
+| `2` | **Data Unavailable / Stale** | Calendar feed unavailable, unparseable, or stale under `--fail-closed`. |
+
 ---
 
 ## API Reference
@@ -476,17 +545,22 @@ redfolder sync
 | :--- | :--- | :--- |
 | `new` | `fn(Option<PathBuf>) -> Self` | Initializes service with optional cache directory (defaults to platform cache dir). |
 | `with_client` | `fn(CalendarClient) -> Self` | Initializes service using a preconfigured `CalendarClient` instance. |
+| `with_event_capacity` | `fn(mut self, usize) -> Self` | Configures global event broadcast bus capacity (default 1024). |
 | `state` | `async fn(&self) -> ServiceState` | Returns the current lifecycle state (`Stopped`, `Starting`, `Running`, `Stopping`). |
+| `health` | `async fn(&self) -> ServiceHealth` | Returns comprehensive diagnostics (`stale`, `degraded`, `data_source`, `background_task_restarts`, `ingest`). |
+| `gate` | `async fn(&self, &str) -> Gate` | Evaluates 3-state order gate decision (`Allowed`, `Blocked`, `Unknown`) with explicit fail-open staleness protection. |
 | `is_running` | `async fn(&self) -> bool` | Checks if background worker tasks are active (`state == ServiceState::Running`). |
 | `subscribe` | `fn(&self) -> broadcast::Receiver<RedFolderEvent>` | Subscribes to global broadcast bus receiving all system events. |
-| `add_listener` | `async fn(&self, Arc<dyn EventListener>)` | Attaches an asynchronous trait-based callback listener (guarded with execution timeout). |
+| `subscribe_sequenced` | `fn(&self) -> broadcast::Receiver<SequencedEvent>` | Subscribes to global broadcast bus with monotonic sequence numbering and timestamps. |
+| `add_listener` | `async fn(&self, Arc<dyn EventListener>)` | Attaches an asynchronous trait-based callback listener using a bounded ordered queue (1024 slots). |
 | `register_worker_events` | `async fn(&self, &str, RedFolderConfig) -> Result<mpsc::UnboundedReceiver<RedFolderEvent>>` | Validates config, guards against duplicate registrations, and returns a typed stream of scoped events. |
 | `register_worker` | `async fn(&self, &str, RedFolderConfig) -> Result<mpsc::UnboundedReceiver<BlackoutNotification>>` | Legacy registration; validates config and guards against duplicate worker registrations. |
 | `reregister_worker_events` | `async fn(&self, &str, RedFolderConfig) -> Result<mpsc::UnboundedReceiver<RedFolderEvent>>` | Re-registers an existing worker with an updated configuration, replacing its event stream. |
 | `reregister_worker` | `async fn(&self, &str, RedFolderConfig) -> Result<mpsc::UnboundedReceiver<BlackoutNotification>>` | Re-registers an existing worker with an updated configuration, replacing its notification stream. |
 | `unregister_worker` | `async fn(&self, &str)` | Unregisters worker, cleans up state, and recalculates transition schedule. |
 | `windows_for_worker` | `async fn(&self, &str) -> Vec<BlackoutWindow>` | Returns active and upcoming blackout windows derived specifically for the worker's buffers. |
-| `start` | `async fn(&self) -> Result<()>` | Starts background daily refresh and transition-driven evaluation tasks. Reversible on error. |
+| `start` | `async fn(&self) -> Result<()>` | Starts background daily refresh and transition-driven evaluation tasks with auto-restarting supervision. |
+| `start_required` | `async fn(&self) -> Result<()>` | Starts background tasks, returning an error if no enabled workers are registered. |
 | `stop` | `async fn(&self)` | Gracefully terminates all background tasks and awaits their exit. |
 | `set_check_interval` | `async fn(&self, Duration) -> Result<()>` | Configures evaluation frequency; validates interval is at least 100ms to prevent busy loops. |
 | `refresh` | `async fn(&self) -> Result<()>` | Synchronizes calendar and recompiles blackout windows (allowing cached fallback). |
@@ -494,9 +568,9 @@ redfolder sync
 | `is_blackout` | `async fn(&self, &str) -> bool` | Checks if a specific registered worker is currently in blackout. |
 | `current_window` | `async fn(&self, &str) -> Option<BlackoutWindow>` | Returns active window details for a specific worker. |
 | `get_upcoming_blackouts` | `async fn(&self, &str, u32) -> Vec<BlackoutWindow>` | Returns upcoming blackout windows within $N$ hours. |
-| `last_sync_time` | `async fn(&self) -> Option<DateTime<Utc>>` | Returns timestamp of the most recent successful calendar synchronization. |
+| `last_sync_time` | `async fn(&self) -> Option<DateTime<Utc>>` | Returns timestamp when data was fetched by the provider. |
 | `last_sync_error` | `async fn(&self) -> Option<String>` | Returns description of the most recent failed sync attempt, or None if healthy. |
-| `is_calendar_stale` | `async fn(&self, Duration) -> bool` | Checks if the calendar has not successfully synchronized within the specified duration. |
+| `is_calendar_stale` | `async fn(&self) -> bool` | Checks if calendar data exceeds configured `max_data_age` or is uninitialized. |
 
 ### BlackoutEngine
 
@@ -591,7 +665,7 @@ redfolder sync
 
 ## Testing & Quality Assurance
 
-`redfolder` includes an automated test battery with **101 unit and integration tests** (51 unit + 50 integration) covering interval calculations, state machines, and resilience guarantees.
+`redfolder` includes an automated test battery with **160 unit, integration, and property tests** (73 unit + 84 integration + 3 proptest suites) covering interval calculations, state machines, and resilience guarantees.
 
 Run the test suite:
 
@@ -610,51 +684,53 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 | Scenario / Injected Condition | Expected Invariant / System Behavior | Status |
 | :--- | :--- | :---: |
-| **HTTP 429 Rate Limit from API** | Retries transient 429 honoring `Retry-After`; falls back to local cache if exhausted. | Verified |
-| **Network Partition / Host Offline** | Transparently serves existing cached calendar until network recovers. | Verified |
-| **Startup Failure (Network & Cache Fail)** | `start()` errors cleanly and resets state to `Stopped`; retries succeed without lockout. | Verified |
-| **Rapid Restart / Task Overlap** | `stop()` cleanly joins previous tasks; restarting creates zero duplicate loops. | Verified |
-| **Transition-Driven Timing** | Emits alerts at exact scheduled second rather than waiting for 15s polling cycle. | Verified |
-| **Evaluation Loop Lower Bound** | `set_check_interval` rejects zero or sub-100ms durations to prevent busy loops. | Verified |
-| **CalendarUpdated Event Dispatch** | Dispatches calendar sync updates to both broadcast bus and `EventListener` callbacks. | Verified |
-| **CalendarSyncFailed Event Dispatch** | Dispatches sync error event on network/parse failure; midnight task retries every 15m. | Verified |
-| **Duplicate Worker Registration Protection** | Rejects duplicate worker IDs with typed error; updates require `reregister_*`. | Verified |
-| **Atomic Status Accessor** | `engine.status(&config)` eliminates TOCTOU races between status check and window retrieval. | Verified |
-| **Cross-Platform Cache Resolution** | Resolves cache directory across Linux XDG, Windows `%LOCALAPPDATA%`/`%APPDATA%`, macOS, and temp. | Verified |
-| **Atomic Cache Write Resilience** | Writes via PID + nanosecond + atomic counter tmp file and atomic rename; prevents write collision. | Verified |
-| **Concurrent Refresh Serialization** | Serializes concurrent `refresh()` / `force_refresh()` calls; eliminates race conditions. | Verified |
-| **Cache Event Count Mismatch** | `load_cache_data` detects corrupted/truncated cache (`event_count != len`) and rejects it. | Verified |
-| **Bounded Stale Cache Fallback** | Rejects cache older than `max_stale_cache_age` on network failure; accepts within limit. | Verified |
-| **Legacy Cache Staleness Protection** | Rejects unversioned/unknown-age legacy cache files during stale fallback. | Verified |
-| **Impact & Currency Alias Normalization** | Matches `"Red"` vs `"High"`, `"med"` vs `"Medium"`, and currencies case-insensitively. | Verified |
-| **Semantic Config & Blank Item Checks** | Rejects blank or empty strings in currency/impact lists; offers `validate_strict()`. | Verified |
-| **All-Day & Tentative Events** | Default config ignores all-day/tentative events to avoid fake midnight spikes; 24h opt-in. | Verified |
-| **Missing Release Times** | Date-only events without time parsed as `TentativeDate`, preventing fake midnight spikes. | Verified |
-| **Timezone-Aware All-Day Boundaries** | Interprets all-day events in configured calendar timezone (e.g. `America/New_York`). | Verified |
-| **Naive Timestamps & DST Transition** | Converts naive times with EDT/EST DST accuracy; gaps advance 1h to valid daylight instant. | Verified |
-| **Half-Open Interval Semantics** | Window is active at exact start and inactive at exact end `[start, end)`. | Verified |
-| **Worker Registered in Active Blackout** | Newly registered worker immediately receives active blackout notification. | Verified |
-| **Overlapping Events within Threshold** | Merges closely spaced releases into single uninterrupted `BlackoutWindow`. | Verified |
-| **Zero Pre-Event Buffer (`before_min: 0`)** | Window begins precisely at scheduled event time; does not default to 30 min. | Verified |
-| **Weekend Curfew in `weekend` Mode** | Extends blackout window 51.5 hours through to Monday 00:00 UTC. | Verified |
-| **Cross-Midnight Short Curfew** | 23:00 -> 01:00 curfew rolls over to Saturday without inverting intervals. | Verified |
-| **Deterministic Timestamp Replay** | Historical queries evaluate deterministically without depending on `Utc::now()`. | Verified |
-| **Empty Upstream Feed Protection** | Preserves known-good cache if upstream returns 0 events or invalid array. | Verified |
-| **Service Concurrency & Restart** | Multiple `start()` calls error cleanly; `start -> stop -> start` restarts properly. | Verified |
-| **OOM Response / Payload Size Exceeded** | `fetch_remote` enforces `max_response_bytes` via `Content-Length` pre-check and streaming chunk counter, rejecting oversized payloads. | Verified |
-| **Cache Tampering / Checksum Mismatch** | `load_cache_data` verifies SHA-256 digest against `CacheMetadata.sha256`; rejects tampered or corrupted files. | Verified |
-| **Upstream Feed Primary Outage / Failover** | `fetch_remote` automatically fails over to configured secondary mirrors in order when primary fails. | Verified |
-| **Cache File & Directory Permissions** | Enforces POSIX `0o700` directory and `0o600` file permissions on Unix systems to protect against unauthorized multi-user access. | Verified |
-| **Sync Failure under Fail-Closed Policy** | Automatically injects a synthetic `Fail-Closed Safety Blackout` window for `FailClosed` workers, halting trading during feed outages. | Verified |
+| **HTTP 429 Rate Limit from API** | Retries transient 429 honoring `Retry-After`; falls back to local cache if exhausted. | Verified by `test_http_retry_on_429_with_recovery`, `test_http_retry_on_429_exhausted_falls_back_to_cache` |
+| **Network Partition / Host Offline** | Transparently serves existing cached calendar until network recovers. | Verified by `test_offline_cache_fallback` |
+| **Startup Failure (Network & Cache Fail)** | `start()` errors cleanly and resets state to `Stopped`; retries succeed without lockout. | Verified by `test_failed_startup_does_not_remain_running_and_can_retry` |
+| **Rapid Restart / Task Overlap** | `stop()` cleanly joins previous tasks; restarting creates zero duplicate loops. | Verified by `test_stop_waits_for_background_tasks_and_rapid_restart`, `test_service_restart_lifecycle` |
+| **Evaluation Loop Lower Bound** | `set_check_interval` rejects zero or sub-100ms durations to prevent busy loops. | Verified by `test_set_check_interval_validation` |
+| **CalendarUpdated Event Dispatch** | Dispatches calendar sync updates to both broadcast bus and `EventListener` callbacks. | Verified by `test_calendar_updated_reaches_both_broadcast_and_event_listener` |
+| **CalendarSyncFailed Event Dispatch** | Dispatches sync error event on network/parse failure; midnight task retries every 15m. | Verified by `test_calendar_sync_failed_event_reaches_listeners`, `test_calendar_sync_failed_event_dispatch` |
+| **Duplicate Worker Registration Protection** | Rejects duplicate worker IDs with typed error; updates require `reregister_*`. | Verified by `test_duplicate_worker_registration_rejected`, `test_register_worker_duplicate_id_protection_and_reregister` |
+| **Atomic Status Accessor** | `engine.status(&config)` eliminates TOCTOU races between status check and window retrieval. | Verified by `test_atomic_status_accessor_consistency`, `test_status_atomic_accessor` |
+| **Cross-Platform Cache Resolution** | Resolves cache directory across Linux XDG, Windows `%LOCALAPPDATA%`/`%APPDATA%`, macOS, and temp. | Verified by `test_try_default_cache_dir_returns_valid_path`, `test_default_cache_dir` |
+| **Atomic Cache Write Resilience** | Writes via PID + nanosecond + atomic counter tmp file and atomic rename; prevents write collision. | Verified by `test_atomic_cache_write_leaves_no_temporary_files`, `test_concurrent_save_cache_atomic` |
+| **Concurrent Refresh Serialization** | Serializes concurrent `refresh()` / `force_refresh()` calls; eliminates race conditions. | Verified by `test_concurrent_refreshes_are_serialized` |
+| **Cache Event Count Mismatch** | `load_cache_data` detects corrupted/truncated cache (`event_count != len`) and rejects it. | Verified by `test_cache_rejects_event_count_mismatch` |
+| **Bounded Stale Cache Fallback** | Rejects cache older than `max_stale_cache_age` on network failure; accepts within limit. | Verified by `test_stale_cache_policy_enforcement` |
+| **Legacy Cache Staleness Protection** | Rejects unversioned/unknown-age legacy cache files during stale fallback. | Verified by `test_legacy_cache_older_than_max_stale_age_rejected`, `test_legacy_cache_never_served_on_empty_feed` |
+| **Impact & Currency Alias Normalization** | Matches `"Red"` vs `"High"`, `"med"` vs `"Medium"`, and currencies case-insensitively. | Verified by `test_impact_aliases_high_vs_red_normalization`, `test_wildcard_currency_and_case_insensitivity` |
+| **Semantic Config & Blank Item Checks** | Rejects blank or empty strings in currency/impact lists; offers `validate_strict()`. | Verified by `test_empty_currency_and_impact_filters_are_rejected`, `test_validate_strict` |
+| **All-Day & Tentative Events** | Default config ignores all-day/tentative events to avoid fake midnight spikes; 24h opt-in. | Verified by `test_all_day_and_tentative_event_policies`, `test_all_day_and_tentative_parsing` |
+| **Missing Release Times** | Date-only events without time parsed as `TentativeDate`, preventing fake midnight spikes. | Verified by `test_date_only_event_without_time_is_tentative` |
+| **Timezone-Aware All-Day Boundaries** | Interprets all-day events in configured calendar timezone (e.g. `America/New_York`). | Verified by `test_all_day_events_in_non_utc_timezone` |
+| **Naive Timestamps & DST Transition** | Converts naive times with EDT/EST DST accuracy; gaps advance 1h to valid daylight instant. | Verified by `test_timezone_aware_naive_timestamp_and_dst`, `test_dst_spring_forward_gap_shift` |
+| **Half-Open Interval Semantics** | Window is active at exact start and inactive at exact end `[start, end)`. | Verified by `test_event_window_end_is_exclusive`, `test_weekend_window_exact_end_boundary` |
+| **Worker Registered in Active Blackout** | Newly registered worker immediately receives active blackout notification. | Verified by `test_immediate_notification_for_worker_registered_during_blackout` |
+| **Overlapping Events within Threshold** | Merges closely spaced releases into single uninterrupted `BlackoutWindow`. | Verified by `test_overlapping_event_merging`, `test_window_merging_invariants` (proptest) |
+| **Zero Pre-Event Buffer (`before_min: 0`)** | Window begins precisely at scheduled event time; does not default to 30 min. | Verified by `test_worker_specific_buffers_isolation` |
+| **Weekend Curfew in `weekend` Mode** | Extends blackout window 51.5 hours through to Monday 00:00 UTC. | Verified by `test_weekend_boundaries_and_determinism`, `test_next_weekend_window_weekend_mode` |
+| **Cross-Midnight Short Curfew** | 23:00 -> 01:00 curfew rolls over to Saturday without inverting intervals. | Verified by `test_cross_midnight_short_curfew` |
+| **Deterministic Timestamp Replay** | Historical queries evaluate deterministically without depending on `Utc::now()`. | Verified by `test_timestamp_determinism_historical_and_future` |
+| **Empty Upstream Feed Protection** | Preserves known-good cache if upstream returns 0 events or invalid array. | Verified by `test_cache_preservation_on_empty_response`, `test_empty_feed_accepts_recent_cache_but_flags_it` |
+| **Service Concurrency & Restart** | Multiple `start()` calls error cleanly; `start -> stop -> start` restarts properly. | Verified by `test_service_lifecycle_guards_and_restart` |
+| **OOM Response / Payload Size Exceeded** | `fetch_remote` enforces `max_response_bytes` via `Content-Length` pre-check and streaming chunk counter, rejecting oversized payloads. | Verified by `test_response_body_size_limit_rejection`, `test_cache_exceeding_max_response_bytes_is_rejected` |
+| **Cache Tampering / Checksum Mismatch** | `load_cache_data` verifies SHA-256 digest against `CacheMetadata.sha256`; rejects tampered or corrupted files. | Verified by `test_cache_integrity_checksum_tamper_detection`, `test_tampered_fetched_at_is_rejected` |
+| **Upstream Feed Primary Outage / Failover** | `fetch_remote` automatically fails over to configured secondary mirrors in order when primary fails. | Verified by `test_fallback_url_failover`, `test_corrupted_primary_fails_over_to_mirror` |
+| **Cache File & Directory Permissions** | Enforces POSIX `0o700` directory and `0o600` file permissions on Unix systems to protect against unauthorized multi-user access. | Verified by `test_cache_file_permissions_unix`, `test_group_writable_cache_dir_is_refused` |
+| **Sync Failure under Fail-Closed Policy** | Automatically injects a synthetic `Fail-Closed Safety Blackout` window for `FailClosed` workers, halting trading during feed outages. | Verified by `test_prop_firm_strict_defaults_to_fail_closed`, `test_fail_safe_closed_blackout` |
 | **Retry Latency Ceiling Exceeded** | Aborts retry loop once cumulative duration exceeds `overall_timeout` (default 60s), avoiding stalled caller tasks. | Verified by `test_total_latency_bounded_across_dead_fallbacks`, `test_retry_latency_ceiling_bounded` |
-| **Disabled Weekend Config Validation** | `validate()` unconditionally checks weekend curfew parameters even when `weekend_enabled` is false, preventing latent runtime bugs. | Verified |
-| **Back-to-Back News Interval Merging** | Merges overlapping releases into unified intervals verified via $O(\log n)$ binary search lookup. | Verified |
-| **Weekend & Economic Overlap** | Seamlessly connects late Friday economic releases with weekend market curfews without coverage gap. | Verified |
-| **Stale Calendar Policy: Fail-Open** | Maintains normal trading execution when calendar synchronization fails under `FailOpen` mode. | Verified |
-| **Stale Calendar Policy: Fail-Closed** | Defensively triggers continuous safety blackout during feed outages under `FailClosed` prop firm mode. | Verified |
-| **Daylight Saving Time (DST) Transitions** | Resolves spring-forward gaps and fall-back ambiguities in US Eastern / configured timezones deterministically. | Verified |
+| **Disabled Weekend Config Validation** | `validate()` unconditionally checks weekend curfew parameters even when `weekend_enabled` is false, preventing latent runtime bugs. | Verified by `test_weekend_validation_when_disabled`, `test_config_validation_negative_buffers_and_bad_formats` |
+| **Back-to-Back News Interval Merging** | Merges overlapping releases into unified intervals verified via binary search and property tests. | Verified by `test_back_to_back_news_merge`, `test_window_merging_invariants` (proptest) |
+| **Weekend & Economic Overlap** | Seamlessly connects late Friday economic releases with weekend market curfews without coverage gap. | Verified by `test_weekend_and_economic_overlap`, `test_weekend_and_news_overlap` |
+| **Stale Calendar Policy: Fail-Open** | Maintains normal trading execution when calendar synchronization fails under `FailOpen` mode. | Verified by `test_cold_start_fail_open`, `test_gate_three_state_flow_and_staleness_safety` |
+| **Stale Calendar Policy: Fail-Closed** | Defensively triggers continuous safety blackout during feed outages under `FailClosed` prop firm mode. | Verified by `test_cold_start_fail_closed`, `test_gate_three_state_flow_and_staleness_safety` |
+| **Daylight Saving Time (DST) Transitions** | Resolves spring-forward gaps and fall-back ambiguities in US Eastern / configured timezones deterministically. | Verified by `test_dst_transition`, `test_dst_boundary_parsing` |
 | **URL Security Policy & SSRF Blocking** | Rejects unencrypted HTTP endpoints, non-whitelisted hosts, private/internal IPs, and excessive HTTP redirects via configurable `UrlPolicy`. | Verified by `test_url_policy_rejects_http_in_fetch`, `test_url_policy_blocks_redirect_to_private_ip`, `test_url_policy_allows_matching_allowed_host_and_blocks_unmatched`, `test_url_policy_redirect_limit_enforced` |
-| **CLI Binary Subcommands & JSON Output** | Verifies `status`, `upcoming`, and flag parsing across isolated environments via command execution. | Verified |
+| **CLI Binary Subcommands & JSON Output** | Verifies `status`, `upcoming`, and flag parsing across isolated environments via command execution. | Verified by `test_cli_binary_execution`, `test_cli_status_provenance_json_and_exit_codes`, `test_cli_health_command` |
+| **Fuzzing & Invariant Testing** | Property-based fuzzing of timing strings, corrupt cache bytes, and interval merge invariants. | Verified by `test_window_merging_invariants`, `test_parse_timing_adversarial_input_never_panics`, `test_cache_loading_arbitrary_bytes_never_panics` (proptest) |
+| **Service Supervision & Task Restarts** | Supervised background worker tasks auto-restart on unexpected panics and increment restart counters. | Verified by `test_spawn_supervised_restarts_panicking_task`, `test_service_health_endpoint_fresh_degraded_stale` |
+| **Ordered Bounded Event Delivery** | Dispatches listener callbacks sequentially in FIFO order without unbound memory growth or channel starvation. | Verified by `test_listener_sequential_ordered_delivery`, `test_listener_bounded_queue_drops_excess_events` |
 
 ---
 
