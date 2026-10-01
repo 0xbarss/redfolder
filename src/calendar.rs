@@ -559,6 +559,15 @@ impl CalendarClient {
         let mut last_error = None;
 
         for (url_idx, &url) in candidate_urls.iter().enumerate() {
+            #[cfg(test)]
+            {
+                if std::env::var("REDFOLDER_TEST_OFFLINE").as_deref() == Ok("1") {
+                    assert!(
+                        !url.contains("faireconomy"),
+                        "Hermetic CI violation: attempt to fetch remote live feed at {url} while REDFOLDER_TEST_OFFLINE=1"
+                    );
+                }
+            }
             debug!(url=%url, url_idx, "fetching economic calendar");
             let mut url_error = None;
 
@@ -757,6 +766,15 @@ impl CalendarClient {
     /// On Unix systems, applies restrictive file permissions (0600) and directory permissions (0700)
     /// to prevent unauthorized access or tampering on shared multi-user hosts.
     pub fn save_cache(&self, events: &[RawCalendarEvent]) -> Result<()> {
+        self.save_cache_at(events, Utc::now())
+    }
+
+    /// Like `save_cache` but records an explicit `fetched_at`. Intended for tests and migrations.
+    pub fn save_cache_at(
+        &self,
+        events: &[RawCalendarEvent],
+        fetched_at: DateTime<Utc>,
+    ) -> Result<()> {
         let Some(path) = &self.cache_path else {
             return Ok(());
         };
@@ -770,7 +788,7 @@ impl CalendarClient {
             }
         }
 
-        let now = Utc::now();
+        let now = fetched_at;
         let expires_at = self
             .cache_ttl
             .and_then(|ttl| chrono::Duration::from_std(ttl).ok().map(|d| now + d));

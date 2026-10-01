@@ -1,3 +1,5 @@
+mod common;
+
 use chrono::{Duration, Utc};
 use redfolder::events::{EventListener, RedFolderEvent};
 use redfolder::prelude::*;
@@ -54,7 +56,7 @@ impl EventListener for MockAuditListener {
 
 #[tokio::test]
 async fn test_multi_worker_isolation_and_filtering() {
-    let service = RedFolderService::new(None);
+    let service = common::offline_service(None);
 
     let usd_cfg = RedFolderConfig::builder()
         .currencies(vec!["USD"])
@@ -113,7 +115,7 @@ async fn test_multi_worker_isolation_and_filtering() {
 
 #[tokio::test]
 async fn test_custom_event_listener_callback() {
-    let service = RedFolderService::new(None);
+    let service = common::offline_service(None);
     let listener = Arc::new(MockAuditListener::new());
 
     service.add_listener(listener.clone()).await;
@@ -177,7 +179,7 @@ async fn test_wildcard_currency_and_case_insensitivity() {
 
 #[tokio::test]
 async fn test_service_worker_unregistration() {
-    let service = RedFolderService::new(None);
+    let service = common::offline_service(None);
     let config = RedFolderConfig::default();
 
     let _rx = service
@@ -198,7 +200,7 @@ async fn test_service_worker_unregistration() {
 
 #[tokio::test]
 async fn test_multi_worker_buffer_isolation_in_service() {
-    let service = RedFolderService::new(None);
+    let service = common::offline_service(None);
 
     let scalper_cfg = RedFolderConfig::builder()
         .currency(Currency::USD)
@@ -254,7 +256,7 @@ async fn test_offline_cache_fallback() {
     let cache_dir = temp_dir.path().to_path_buf();
 
     // 1. First client saves events to cache
-    let client = redfolder::calendar::CalendarClient::new(Some(cache_dir.clone()));
+    let client = common::offline_client(Some(cache_dir.clone()));
     let events = vec![redfolder::calendar::RawCalendarEvent {
         title: "ECB Rate Announcement".into(),
         country: "EUR".into(),
@@ -494,7 +496,7 @@ async fn test_service_lifecycle_guards_and_restart() {
 
 #[tokio::test]
 async fn test_blackout_ended_event_preserves_active_window() {
-    let service = RedFolderService::new(None);
+    let service = common::offline_service(None);
     let mut broadcast_rx = service.subscribe();
 
     let config = RedFolderConfig::builder()
@@ -570,7 +572,7 @@ async fn test_cache_preservation_on_empty_response() {
     let cache_dir = temp_dir.path().to_path_buf();
 
     // 1. Populate disk cache with known-good events
-    let client = redfolder::calendar::CalendarClient::new(Some(cache_dir.clone()));
+    let client = common::offline_client(Some(cache_dir.clone()));
     let good_events = vec![redfolder::calendar::RawCalendarEvent {
         title: "Federal Reserve FOMC Minutes".into(),
         country: "USD".into(),
@@ -647,7 +649,7 @@ async fn test_failed_startup_does_not_remain_running_and_can_retry() {
         time: "".into(),
         impact: "High".into(),
     }];
-    let client = redfolder::calendar::CalendarClient::new(Some(cache_dir));
+    let client = common::offline_client(Some(cache_dir));
     client.save_cache(&good_events).unwrap();
 
     // 3. Retry startup - MUST succeed without "already running" error!
@@ -703,7 +705,7 @@ async fn test_stop_waits_for_background_tasks_and_rapid_restart() {
 fn test_cache_rejects_event_count_mismatch() {
     let temp_dir = tempfile::tempdir().unwrap();
     let cache_dir = temp_dir.path().to_path_buf();
-    let client = redfolder::calendar::CalendarClient::new(Some(cache_dir.clone()));
+    let client = common::offline_client(Some(cache_dir.clone()));
 
     // Cache with event_count = 10, but only 1 event in array (corrupted / truncated)
     let mismatch_cache = redfolder::calendar::CachedCalendarData {
@@ -939,7 +941,7 @@ async fn test_immediate_notification_for_worker_registered_during_blackout() {
         impact: "High".into(),
     }];
 
-    let service = RedFolderService::new(None);
+    let service = common::offline_service(None);
     let cfg = RedFolderConfig::builder()
         .currencies(vec!["USD"])
         .impacts(vec!["High"])
@@ -985,7 +987,7 @@ async fn test_windows_for_worker_isolation() {
         impact: "High".into(),
     }];
 
-    let service = RedFolderService::new(None);
+    let service = common::offline_service(None);
 
     let scalper_cfg = RedFolderConfig::builder()
         .currency(Currency::USD)
@@ -1131,7 +1133,7 @@ async fn test_force_refresh_bypasses_cache_with_mock_server() {
         time: "".into(),
         impact: "High".into(),
     }];
-    let setup_client = redfolder::calendar::CalendarClient::new(Some(cache_dir.clone()));
+    let setup_client = common::offline_client(Some(cache_dir.clone()));
     setup_client.save_cache(&initial_events).unwrap();
 
     // 2. Mock server returning Event B
@@ -1330,7 +1332,7 @@ async fn test_empty_remote_feed_preserves_cache_on_force_fetch() {
         time: "".into(),
         impact: "High".into(),
     }];
-    let client_setup = redfolder::calendar::CalendarClient::new(Some(cache_dir.clone()));
+    let client_setup = common::offline_client(Some(cache_dir.clone()));
     client_setup.save_cache(&good_events).unwrap();
 
     // 2. Mock server returning empty array `[]`
@@ -1394,7 +1396,7 @@ async fn test_refresh_reconciles_worker_state_immediately() {
         time: "".into(),
         impact: "High".into(),
     }];
-    let client2 = redfolder::calendar::CalendarClient::new(Some(cache_dir));
+    let client2 = common::offline_client(Some(cache_dir));
     client2.save_cache(&active_event).unwrap();
 
     // Refresh calendar
@@ -1417,7 +1419,7 @@ fn test_atomic_cache_write_leaves_no_temporary_files() {
     let temp_dir = tempfile::tempdir().unwrap();
     let cache_dir = temp_dir.path().to_path_buf();
 
-    let client = redfolder::calendar::CalendarClient::new(Some(cache_dir.clone()));
+    let client = common::offline_client(Some(cache_dir.clone()));
     let events = vec![redfolder::calendar::RawCalendarEvent {
         title: "Atomic Test".into(),
         country: "USD".into(),
@@ -1578,7 +1580,7 @@ async fn test_http_retry_on_429_exhausted_falls_back_to_cache() {
         time: "".into(),
         impact: "High".into(),
     }];
-    let client_setup = redfolder::calendar::CalendarClient::new(Some(cache_dir.clone()));
+    let client_setup = common::offline_client(Some(cache_dir.clone()));
     client_setup.save_cache(&good_events).unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1615,7 +1617,7 @@ async fn test_http_retry_on_429_exhausted_falls_back_to_cache() {
 
 #[tokio::test]
 async fn test_register_worker_rejects_unvalidated_deserialized_config() {
-    let service = RedFolderService::new(None);
+    let service = common::offline_service(None);
 
     // Simulate deserializing an invalid config directly from JSON with negative buffers
     let bad_json = r#"{
@@ -1646,7 +1648,7 @@ async fn test_register_worker_rejects_unvalidated_deserialized_config() {
 
 #[tokio::test]
 async fn test_register_worker_duplicate_id_protection_and_reregister() {
-    let service = RedFolderService::new(None);
+    let service = common::offline_service(None);
     let cfg = RedFolderConfig::default();
 
     // 1. Initial registration succeeds
@@ -1673,9 +1675,7 @@ async fn test_concurrent_save_cache_atomic() {
     let temp_dir = tempfile::tempdir().unwrap();
     let cache_dir = temp_dir.path().to_path_buf();
 
-    let client = Arc::new(redfolder::calendar::CalendarClient::new(Some(
-        cache_dir.clone(),
-    )));
+    let client = Arc::new(common::offline_client(Some(cache_dir.clone())));
 
     let mut handles = Vec::new();
     for i in 0..10 {
@@ -1944,7 +1944,7 @@ fn test_cache_integrity_checksum_tamper_detection() {
     let temp_dir = tempfile::tempdir().unwrap();
     let cache_dir = temp_dir.path().to_path_buf();
 
-    let client = redfolder::calendar::CalendarClient::new(Some(cache_dir.clone()));
+    let client = common::offline_client(Some(cache_dir.clone()));
     let events = vec![redfolder::calendar::RawCalendarEvent {
         title: "Integrity Release".into(),
         country: "USD".into(),
@@ -1976,7 +1976,7 @@ fn test_cache_integrity_checksum_tamper_detection() {
 
 #[tokio::test]
 async fn test_prop_firm_strict_defaults_to_fail_closed() {
-    let service = RedFolderService::new(None);
+    let service = common::offline_service(None);
     let config = RedFolderConfig::prop_firm_strict();
 
     assert!(config.fail_safe_mode.is_fail_closed());
@@ -2099,33 +2099,13 @@ fn test_weekend_and_economic_overlap() {
 }
 
 #[tokio::test]
-async fn test_stale_calendar_fail_open() {
-    // Stale calendar data with FailOpen policy: trades must NOT be blocked
+async fn test_cold_start_fail_open() {
+    // Cold start with no calendar sync and FailOpen policy: trades must NOT be blocked
     let temp_dir = tempfile::tempdir().unwrap();
     let cache_dir = temp_dir.path().to_path_buf();
 
-    // Create an expired cache file (2 hours old, max allowed is 30 mins)
-    let client = redfolder::CalendarClient::new(Some(cache_dir.clone()))
+    let client = common::offline_client(Some(cache_dir.clone()))
         .with_max_stale_age(Some(std::time::Duration::from_secs(1800)));
-
-    let past_events = vec![redfolder::RawCalendarEvent {
-        title: "Historical Past Event".into(),
-        country: "USD".into(),
-        date: (Utc::now() - Duration::hours(5)).to_rfc3339(),
-        time: "".into(),
-        impact: "High".into(),
-    }];
-    client.save_cache(&past_events).unwrap();
-
-    // Manually set cache metadata to 2 hours ago
-    let metadata_path = cache_dir.join("economic_calendar_metadata.json");
-    let stale_meta = serde_json::json!({
-        "fetched_at": (Utc::now() - Duration::hours(2)).to_rfc3339(),
-        "total_events": 1,
-        "source_url": "http://127.0.0.1/test",
-        "sha256": "dummy"
-    });
-    std::fs::write(&metadata_path, stale_meta.to_string()).unwrap();
 
     let service = RedFolderService::with_client(client);
     let fail_open_cfg = RedFolderConfig::builder()
@@ -2140,38 +2120,20 @@ async fn test_stale_calendar_fail_open() {
         .await
         .expect("registered");
 
-    // Staleness is detected, but FailOpen keeps trading active (NOT in blackout)
+    // Staleness is detected on cold start, but FailOpen keeps trading active (NOT in blackout)
     assert!(service.is_calendar_stale().await);
     assert!(!service.is_blackout("fail_open_trader").await);
     assert!(service.current_window("fail_open_trader").await.is_none());
 }
 
 #[tokio::test]
-async fn test_stale_calendar_fail_closed() {
-    // Stale calendar data with FailClosed policy (Prop firm mode): trading must be defensively halted
+async fn test_cold_start_fail_closed() {
+    // Cold start with no calendar sync and FailClosed policy: trading must be defensively halted
     let temp_dir = tempfile::tempdir().unwrap();
     let cache_dir = temp_dir.path().to_path_buf();
 
-    let client = redfolder::CalendarClient::new(Some(cache_dir.clone()))
+    let client = common::offline_client(Some(cache_dir.clone()))
         .with_max_stale_age(Some(std::time::Duration::from_secs(1800)));
-
-    let past_events = vec![redfolder::RawCalendarEvent {
-        title: "Past Release".into(),
-        country: "USD".into(),
-        date: (Utc::now() - Duration::hours(5)).to_rfc3339(),
-        time: "".into(),
-        impact: "High".into(),
-    }];
-    client.save_cache(&past_events).unwrap();
-
-    let metadata_path = cache_dir.join("economic_calendar_metadata.json");
-    let stale_meta = serde_json::json!({
-        "fetched_at": (Utc::now() - Duration::hours(2)).to_rfc3339(),
-        "total_events": 1,
-        "source_url": "http://127.0.0.1/test",
-        "sha256": "dummy"
-    });
-    std::fs::write(&metadata_path, stale_meta.to_string()).unwrap();
 
     let service = RedFolderService::with_client(client);
     let prop_cfg = RedFolderConfig::prop_firm_strict(); // Defaults to FailClosed
@@ -2286,7 +2248,7 @@ async fn test_cli_binary_execution() {
     // 3. status --json with isolated cache dir
     let temp_dir = tempfile::tempdir().unwrap();
     let cache_dir = temp_dir.path().to_path_buf();
-    let client = redfolder::CalendarClient::new(Some(cache_dir.clone()));
+    let client = common::offline_client(Some(cache_dir.clone()));
     let future_event = redfolder::RawCalendarEvent {
         title: "Federal Funds Rate".into(),
         country: "USD".into(),
@@ -2333,5 +2295,53 @@ async fn test_cli_binary_execution() {
     assert!(
         !json_arr.is_empty(),
         "upcoming should return compiled blackout window"
+    );
+}
+
+#[tokio::test]
+async fn test_mock_server_scripted_replies_and_fixtures() {
+    let raw_ev = common::usd_high_in(chrono::Duration::hours(1));
+    assert_eq!(raw_ev.country, "USD");
+    assert_eq!(raw_ev.impact, "High");
+
+    let feed = common::feed_json(2, |i| format!("2026-10-02T0{i}:00:00Z"));
+    let mock =
+        common::spawn_mock(vec![common::Reply::Json(feed), common::Reply::Status(503)]).await;
+
+    let client = redfolder::CalendarClient::with_options(
+        reqwest::Client::new(),
+        &mock.url,
+        None,
+        std::time::Duration::from_secs(2),
+    )
+    .with_max_retries(0);
+
+    let res1 = client.fetch_remote().await;
+    assert!(res1.is_ok(), "first reply should be Json with 2 events");
+    assert_eq!(res1.unwrap().len(), 2);
+    assert_eq!(mock.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let res2 = client.fetch_remote().await;
+    assert!(res2.is_err(), "second reply should be 503 error");
+    assert_eq!(mock.hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    assert_eq!(common::DEAD_URL, "http://127.0.0.1:9/calendar.json");
+}
+
+#[tokio::test]
+async fn test_mock_server_hang_triggers_client_timeout() {
+    let mock = common::spawn_mock(vec![common::Reply::Hang]).await;
+    let client = redfolder::CalendarClient::with_options(
+        reqwest::Client::new(),
+        &mock.url,
+        None,
+        std::time::Duration::from_millis(100),
+    )
+    .with_max_retries(0);
+
+    let res = client.fetch_remote().await;
+    assert!(
+        res.is_err(),
+        "hang reply should trigger client timeout error"
     );
 }
