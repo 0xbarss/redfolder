@@ -101,6 +101,13 @@ enum Commands {
         #[arg(long)]
         fail_closed: bool,
     },
+
+    /// Check economic calendar synchronization health and diagnostic metrics
+    Health {
+        /// Output results as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn build_cli_config(
@@ -475,6 +482,68 @@ async fn main() -> Result<()> {
                 }
                 std::io::Write::flush(&mut std::io::stdout()).ok();
                 tokio::time::sleep(Duration::from_secs(interval)).await;
+            }
+        }
+        Commands::Health { json } => {
+            let service = redfolder::RedFolderService::with_client(client);
+            let _ = service.refresh().await;
+            let h = service.health().await;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&h)?);
+            } else {
+                println!(
+                    "\n{}",
+                    "========================================================"
+                        .cyan()
+                        .bold()
+                );
+                println!(
+                    " {} {}",
+                    "SERVICE HEALTH:".bold(),
+                    format!("{:?}", h.state).cyan().bold()
+                );
+                println!(
+                    "{}",
+                    "========================================================"
+                        .cyan()
+                        .bold()
+                );
+                println!(
+                    " Stale: {}",
+                    if h.stale {
+                        "true".red().bold()
+                    } else {
+                        "false".green()
+                    }
+                );
+                println!(
+                    " Degraded: {}",
+                    if h.degraded {
+                        "true".yellow().bold()
+                    } else {
+                        "false".green()
+                    }
+                );
+                if let Some(src) = h.data_source {
+                    println!(" Data Source: {:?}", src);
+                }
+                if let Some(ts) = h.data_fetched_at {
+                    println!(" Data Fetched At: {}", ts.format("%Y-%m-%d %H:%M:%S UTC"));
+                }
+                if let Some(age) = h.data_age_minutes {
+                    println!(" Data Age: {} minutes", age);
+                }
+                if let Some(err) = &h.last_sync_error {
+                    println!(" Last Sync Error: {}", err.red());
+                }
+                if let Some(ingest) = &h.ingest {
+                    println!(
+                        " Ingestion: received={}, malformed={}, kept={}, unparseable={}",
+                        ingest.received, ingest.malformed, ingest.kept, ingest.unparseable
+                    );
+                }
+                println!(" Background Task Restarts: {}", h.background_task_restarts);
+                println!();
             }
         }
     }

@@ -3323,3 +3323,220 @@ async fn test_url_policy_mirror_failover_when_primary_violates_policy() {
     assert!(res.is_ok());
     assert_eq!(res.unwrap().len(), 3);
 }
+
+#[tokio::test]
+async fn test_service_health_endpoint_fresh_degraded_stale() {
+    let good_payload = common::feed_json(10, |i| format!("2026-10-02T{:02}:00:00Z", i + 10));
+    let mock = common::spawn_mock(vec![common::Reply::Json(good_payload)]).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let client = redfolder::CalendarClient::with_options(
+        reqwest::Client::new(),
+        &mock.url,
+        Some(dir.path().to_path_buf()),
+        std::time::Duration::from_secs(2),
+    )
+    .with_max_retries(0);
+
+    let service = redfolder::RedFolderService::with_client(client);
+    let cfg = RedFolderConfig::default();
+    service.register_worker("w1", cfg).await.unwrap();
+
+    // 1. Fresh health
+    service.refresh().await.unwrap();
+    let h1 = service.health().await;
+    assert!(!h1.stale);
+    assert!(!h1.degraded);
+    assert_eq!(h1.data_source, Some(redfolder::SnapshotSource::Remote));
+    assert!(h1.data_fetched_at.is_some());
+    assert!(h1.last_remote_success.is_some());
+    assert_eq!(h1.background_task_restarts, 0);
+
+    // 2. Degraded health
+    let fail_mock = common::spawn_mock(vec![common::Reply::Status(503)]).await;
+    let fallback_client = redfolder::CalendarClient::with_options(
+        reqwest::Client::new(),
+        &fail_mock.url,
+        Some(dir.path().to_path_buf()),
+        std::time::Duration::from_secs(2),
+    )
+    .with_max_retries(0);
+
+    let degraded_service = redfolder::RedFolderService::with_client(fallback_client);
+    degraded_service
+        .register_worker("w2", RedFolderConfig::default())
+        .await
+        .unwrap();
+    let outcome = degraded_service
+        .refresh_outcome(false, false)
+        .await
+        .unwrap();
+    assert!(outcome.is_degraded());
+
+    let h2 = degraded_service.health().await;
+    assert!(h2.degraded);
+    assert_eq!(
+        h2.data_source,
+        Some(redfolder::SnapshotSource::FallbackCache)
+    );
+    assert!(h2.last_sync_error.is_some());
+}
+
+#[tokio::test]
+async fn test_gate_three_state_flow_and_staleness_safety() {
+    let now = Utc::now();
+    let raw = vec![redfolder::calendar::RawCalendarEvent {
+        title: "High Impact Release".into(),
+        country: "USD".into(),
+        date: (now + chrono::Duration::minutes(5)).to_rfc3339(),
+        time: "".into(),
+        impact: "High".into(),
+    }];
+
+    let payload = serde_json::to_string(&raw).unwrap();
+    let mock = common::spawn_mock(vec![common::Reply::Json(payload)]).await;
+
+    let client = redfolder::CalendarClient::with_options(
+        reqwest::Client::new(),
+        &mock.url,
+        None,
+        std::time::Duration::from_secs(2),
+    )
+    .with_max_retries(0);
+
+    let service = redfolder::RedFolderService::with_client(client);
+
+    let open_cfg = RedFolderConfig::builder()
+        .currencies(vec!["USD"])
+        .impacts(vec!["High"])
+        .buffer_minutes(10, 10)
+        .fail_safe_mode(redfolder::types::FailSafeMode::FailOpen)
+        .build();
+
+    let closed_cfg = RedFolderConfig::builder()
+        .currencies(vec!["USD"])
+        .impacts(vec!["High"])
+        .buffer_minutes(10, 10)
+        .fail_safe_mode(redfolder::types::FailSafeMode::FailClosed)
+        .build();
+
+    service.register_worker("open_bot", open_cfg).await.unwrap();
+    service
+        .register_worker("closed_bot", closed_cfg)
+        .await
+        .unwrap();
+
+    // Before starting, gate must return Unknown (service not running)
+    let g_pre = service.gate("open_bot").await;
+    assert!(
+        matches!(g_pre, redfolder::Gate::Unknown(ref msg) if msg.contains("service is not running"))
+    );
+
+    // Start service
+    service.start().await.unwrap();
+
+    // Both workers are inside the 10-minute buffer window around the event
+    let g_open = service.gate("open_bot").await;
+    assert!(matches!(g_open, redfolder::Gate::Blocked(_)));
+
+    let g_closed = service.gate("closed_bot").await;
+    assert!(matches!(g_closed, redfolder::Gate::Blocked(_)));
+
+    service.stop().await;
+}
+
+#[tokio::test]
+async fn test_listener_sequential_ordered_delivery() {
+    struct OrderedListener {
+        received_seqs: Arc<tokio::sync::Mutex<Vec<usize>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl redfolder::EventListener for OrderedListener {
+        async fn on_event(&self, event: &redfolder::RedFolderEvent) {
+            if let redfolder::RedFolderEvent::CalendarUpdated { total_events, .. } = event {
+                // Introduce small artificial sleep to ensure sequential processing
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                self.received_seqs.lock().await.push(*total_events);
+            }
+        }
+    }
+
+    let service = redfolder::RedFolderService::new(None);
+    let received = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let listener = Arc::new(OrderedListener {
+        received_seqs: received.clone(),
+    });
+
+    service.add_listener(listener).await;
+
+    // Dispatch 15 events in order
+    for i in 0..15 {
+        service
+            .dispatch_event(redfolder::RedFolderEvent::CalendarUpdated {
+                total_events: i,
+                total_windows: 0,
+            })
+            .await;
+    }
+
+    // Wait for sequential worker to drain queue
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let seqs = received.lock().await.clone();
+    assert_eq!(seqs.len(), 15);
+    for (idx, &val) in seqs.iter().enumerate() {
+        assert_eq!(
+            val, idx,
+            "events must be received in strict sequential order"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_listener_bounded_queue_drops_excess_events() {
+    struct SlowHangingListener;
+
+    #[async_trait::async_trait]
+    impl redfolder::EventListener for SlowHangingListener {
+        async fn on_event(&self, _event: &redfolder::RedFolderEvent) {
+            // Hang for a long time
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
+    }
+
+    let service = redfolder::RedFolderService::new(None);
+    service.add_listener(Arc::new(SlowHangingListener)).await;
+
+    // Dispatching 1200 events rapidly must not block the caller even when listener queue is 1024
+    let start = std::time::Instant::now();
+    for i in 0..1200 {
+        service
+            .dispatch_event(redfolder::RedFolderEvent::CalendarUpdated {
+                total_events: i,
+                total_windows: 0,
+            })
+            .await;
+    }
+
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "dispatch_event must not block on full listener queue"
+    );
+}
+
+#[tokio::test]
+async fn test_cli_health_command() {
+    let bin_path = env!("CARGO_BIN_EXE_redfolder");
+    let mut cmd = std::process::Command::new(bin_path);
+    cmd.arg("health").arg("--json");
+    let output = cmd.output().expect("command execution failed");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let health_json: serde_json::Value = serde_json::from_str(&stdout).expect("valid health JSON");
+    assert!(health_json.get("state").is_some());
+    assert!(health_json.get("stale").is_some());
+    assert!(health_json.get("degraded").is_some());
+    assert!(health_json.get("background_task_restarts").is_some());
+}

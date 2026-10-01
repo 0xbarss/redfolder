@@ -8,10 +8,11 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Lifecycle state of the background synchronization and evaluation service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +51,47 @@ impl RefreshOutcome {
     }
 }
 
+/// Three-state order gating decision for algorithmic execution systems.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Gate {
+    /// No blackout active; order entry is permitted.
+    Allowed,
+    /// Currently within an active blackout window.
+    Blocked(BlackoutWindow),
+    /// Health or registration state is indeterminate; orders should not be placed.
+    Unknown(String),
+}
+
+/// Comprehensive service health and synchronization status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceHealth {
+    pub state: ServiceState,
+    pub data_fetched_at: Option<DateTime<Utc>>,
+    pub data_age_minutes: Option<i64>,
+    pub data_source: Option<SnapshotSource>,
+    pub last_remote_success: Option<DateTime<Utc>>,
+    pub stale: bool,
+    pub degraded: bool,
+    pub last_sync_error: Option<String>,
+    pub ingest: Option<IngestStats>,
+    pub last_evaluation_at: Option<DateTime<Utc>>,
+    pub background_task_restarts: u32,
+}
+
+/// An event on the broadcast bus tagged with a monotonically increasing sequence number and timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequencedEvent {
+    pub seq: u64,
+    pub at: DateTime<Utc>,
+    pub event: RedFolderEvent,
+}
+
+/// Dedicated delivery queue slot for an individual registered `EventListener`.
+struct ListenerSlot {
+    tx: mpsc::Sender<RedFolderEvent>,
+    dropped: Arc<AtomicU64>,
+}
+
 /// Default maximum acceptable age for calendar data (36 hours).
 pub const DEFAULT_MAX_DATA_AGE: std::time::Duration = std::time::Duration::from_secs(36 * 3600);
 
@@ -79,6 +121,8 @@ struct ServiceSyncMeta {
     last_sync_error: Option<String>,
     max_data_age: std::time::Duration,
     max_unparseable_ratio: f64,
+    task_restarts: u32,
+    last_evaluation_at: Option<DateTime<Utc>>,
 }
 
 /// Async service that orchestrates daily economic calendar synchronization and event-driven blackout alerts.
@@ -96,10 +140,12 @@ struct ServiceSyncMeta {
 pub struct RedFolderService {
     engine: Arc<RwLock<BlackoutEngine>>,
     workers: Arc<RwLock<HashMap<String, WorkerState>>>,
-    listeners: Arc<RwLock<Vec<Arc<dyn EventListener>>>>,
+    listeners: Arc<RwLock<Vec<ListenerSlot>>>,
     sync_meta: Arc<Mutex<ServiceSyncMeta>>,
     refresh_lock: Arc<Mutex<()>>,
     broadcast_tx: broadcast::Sender<RedFolderEvent>,
+    sequenced_broadcast_tx: broadcast::Sender<SequencedEvent>,
+    seq_counter: Arc<AtomicU64>,
     cancel_token: Arc<Mutex<Option<CancellationToken>>>,
     task_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     notify: Arc<Notify>,
@@ -133,7 +179,8 @@ impl RedFolderService {
 
     /// Create with an existing `CalendarClient`.
     pub fn with_client(client: CalendarClient) -> Self {
-        let (broadcast_tx, _) = broadcast::channel(256);
+        let (broadcast_tx, _) = broadcast::channel(1024);
+        let (sequenced_broadcast_tx, _) = broadcast::channel(1024);
         let notify = Arc::new(Notify::new());
         let max_data_age = client.max_stale_cache_age().unwrap_or(DEFAULT_MAX_DATA_AGE);
         Self {
@@ -152,13 +199,28 @@ impl RedFolderService {
                 last_sync_error: None,
                 max_data_age,
                 max_unparseable_ratio: DEFAULT_MAX_UNPARSEABLE_RATIO,
+                task_restarts: 0,
+                last_evaluation_at: None,
             })),
             refresh_lock: Arc::new(Mutex::new(())),
             broadcast_tx,
+            sequenced_broadcast_tx,
+            seq_counter: Arc::new(AtomicU64::new(0)),
             cancel_token: Arc::new(Mutex::new(None)),
             task_handles: Arc::new(Mutex::new(Vec::new())),
             notify,
         }
+    }
+
+    /// Configure the global event broadcast bus buffer capacity (default 1024).
+    #[must_use]
+    pub fn with_event_capacity(mut self, capacity: usize) -> Self {
+        let cap = capacity.max(16);
+        let (broadcast_tx, _) = broadcast::channel(cap);
+        let (sequenced_broadcast_tx, _) = broadcast::channel(cap);
+        self.broadcast_tx = broadcast_tx;
+        self.sequenced_broadcast_tx = sequenced_broadcast_tx;
+        self
     }
 
     /// Current lifecycle state of the service.
@@ -166,17 +228,102 @@ impl RedFolderService {
         self.sync_meta.lock().await.state
     }
 
+    /// Query comprehensive health status and data freshness metrics of the service.
+    pub async fn health(&self) -> ServiceHealth {
+        let stale = self.check_calendar_staleness().await;
+        let m = self.sync_meta.lock().await;
+        let now = Utc::now();
+        ServiceHealth {
+            state: m.state,
+            data_fetched_at: m.last_sync_time,
+            data_age_minutes: m.last_sync_time.map(|t| (now - t).num_minutes()),
+            data_source: m.data_source,
+            last_remote_success: m.last_remote_success,
+            stale,
+            degraded: matches!(m.data_source, Some(s) if !s.is_fresh()),
+            last_sync_error: m.last_sync_error.clone(),
+            ingest: m.ingest.clone(),
+            last_evaluation_at: m.last_evaluation_at,
+            background_task_restarts: m.task_restarts,
+        }
+    }
+
+    /// Evaluate three-state order gating decision for a specific worker.
+    ///
+    /// Returns:
+    /// - [`Gate::Allowed`] if trading is explicitly permitted.
+    /// - [`Gate::Blocked`] if currently within an active news blackout window.
+    /// - [`Gate::Unknown`] if worker is not registered, service is not running,
+    ///   or calendar data is stale for a FailOpen worker.
+    pub async fn gate(&self, worker_id: &str) -> Gate {
+        let Some(cfg) = self
+            .workers
+            .read()
+            .await
+            .get(worker_id)
+            .map(|w| w.config.clone())
+        else {
+            return Gate::Unknown(format!("worker {worker_id} is not registered"));
+        };
+        if self.state().await != ServiceState::Running {
+            return Gate::Unknown("service is not running".into());
+        }
+        if self.check_calendar_staleness().await && !cfg.fail_safe_mode.is_fail_closed() {
+            return Gate::Unknown("calendar data is stale".into());
+        }
+        match self.engine.read().await.status(&cfg) {
+            Some(w) => Gate::Blocked(w),
+            None => Gate::Allowed,
+        }
+    }
+
     /// Subscribe to the global broadcast event bus.
     ///
     /// Any system component (e.g. risk manager, Telegram bot, MT5 bridge)
     /// can receive a cloned stream of all `RedFolderEvent`s.
+    /// Receivers must handle [`tokio::sync::broadcast::error::RecvError::Lagged`]
+    /// by querying current service state (e.g. via [`Self::gate`]) rather than assuming
+    /// events were not missed.
     pub fn subscribe(&self) -> broadcast::Receiver<RedFolderEvent> {
         self.broadcast_tx.subscribe()
     }
 
+    /// Subscribe to the global broadcast event bus with monotonic sequence numbers and timestamps.
+    ///
+    /// Receivers must handle [`tokio::sync::broadcast::error::RecvError::Lagged`]
+    /// by querying current service state (e.g. via [`Self::gate`]) rather than assuming
+    /// events were not missed.
+    pub fn subscribe_sequenced(&self) -> broadcast::Receiver<SequencedEvent> {
+        self.sequenced_broadcast_tx.subscribe()
+    }
+
     /// Add an asynchronous event listener implementing `EventListener`.
+    ///
+    /// Delivers events sequentially to each listener using an isolated bounded queue (1024 events),
+    /// strictly preserving event order and protecting the service against panics or slow consumers.
     pub async fn add_listener(&self, listener: Arc<dyn EventListener>) {
-        self.listeners.write().await.push(listener);
+        let (tx, mut rx) = mpsc::channel::<RedFolderEvent>(1024);
+        let dropped = Arc::new(AtomicU64::new(0));
+        tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                let l = listener.clone();
+                let ev_inner = ev.clone();
+                let r = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    tokio::spawn(async move { l.on_event(&ev_inner).await }),
+                )
+                .await;
+                match r {
+                    Err(_) => warn!("listener timed out after 10s"),
+                    Ok(Err(e)) if e.is_panic() => error!("listener panicked"),
+                    _ => {}
+                }
+            }
+        });
+        self.listeners
+            .write()
+            .await
+            .push(ListenerSlot { tx, dropped });
     }
 
     /// Configure the periodic evaluation loop frequency or watchdog interval.
@@ -198,6 +345,7 @@ impl RedFolderService {
     /// Manually trigger blackout evaluation and worker notifications immediately.
     pub async fn evaluate_and_notify(&self) {
         self.check_and_notify_workers().await;
+        self.sync_meta.lock().await.last_evaluation_at = Some(Utc::now());
     }
 
     /// Set an explicit `BlackoutEngine` instance for testing or simulation.
@@ -408,19 +556,21 @@ impl RedFolderService {
     }
 
     /// Dispatches an event to the global broadcast bus and registered event listeners.
-    async fn dispatch_event(&self, event: RedFolderEvent) {
+    pub async fn dispatch_event(&self, event: RedFolderEvent) {
+        let seq = self.seq_counter.fetch_add(1, Ordering::SeqCst);
+        let sequenced = SequencedEvent {
+            seq,
+            at: Utc::now(),
+            event: event.clone(),
+        };
         self.broadcast_tx.send(event.clone()).ok();
+        self.sequenced_broadcast_tx.send(sequenced).ok();
         let listeners_guard = self.listeners.read().await;
-        for listener in listeners_guard.iter() {
-            let listener_clone = listener.clone();
-            let ev_clone = event.clone();
-            tokio::spawn(async move {
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    listener_clone.on_event(&ev_clone),
-                )
-                .await;
-            });
+        for slot in listeners_guard.iter() {
+            if slot.tx.try_send(event.clone()).is_err() {
+                let n = slot.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                warn!(dropped_total = n, "listener queue full; event dropped");
+            }
         }
     }
 
@@ -642,6 +792,68 @@ impl RedFolderService {
         self.sync_meta.lock().await.state == ServiceState::Running
     }
 
+    /// Start the background synchronization and evaluation loops, requiring at least one enabled worker.
+    ///
+    /// Unlike [`Self::start`], which returns `Ok(())` if no enabled workers exist,
+    /// `start_required` returns an error to ensure systems do not run unconfigured.
+    pub async fn start_required(&self) -> Result<()> {
+        {
+            let workers = self.workers.read().await;
+            if workers.is_empty() {
+                return Err(crate::error::RedFolderError::Service(
+                    "no workers registered — cannot start service".to_string(),
+                ));
+            }
+            if !workers.values().any(|w| w.config.enabled) {
+                return Err(crate::error::RedFolderError::Service(
+                    "all registered worker blackout configs are disabled — cannot start service"
+                        .to_string(),
+                ));
+            }
+        }
+        self.start().await
+    }
+
+    /// Spawn a supervised background task that automatically restarts on panic.
+    pub(crate) fn spawn_supervised<F, Fut>(
+        &self,
+        name: &'static str,
+        token: CancellationToken,
+        make: F,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let this = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let mut inner = tokio::spawn(make());
+                tokio::select! {
+                    res = &mut inner => match res {
+                        Ok(()) => break,
+                        Err(e) if e.is_panic() => {
+                            error!(task = name, "background task panicked; restarting");
+                            {
+                                let mut m = this.sync_meta.lock().await;
+                                m.task_restarts = m.task_restarts.saturating_add(1);
+                            }
+                            tokio::select! {
+                                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                                _ = token.cancelled() => break,
+                            }
+                        }
+                        Err(_) => break,
+                    },
+                    _ = token.cancelled() => {
+                        inner.abort();
+                        break;
+                    }
+                }
+            }
+        })
+    }
+
     /// Start the background synchronization and evaluation loops.
     pub async fn start(&self) -> Result<()> {
         {
@@ -653,11 +865,11 @@ impl RedFolderService {
             }
             let workers = self.workers.read().await;
             if workers.is_empty() {
-                warn!("no workers registered — RedFolderService not starting");
+                error!("no workers registered — RedFolderService not starting");
                 return Ok(());
             }
             if !workers.values().any(|w| w.config.enabled) {
-                info!("all registered worker blackout configs are disabled");
+                error!("all registered worker blackout configs are disabled — RedFolderService not starting");
                 return Ok(());
             }
             meta.state = ServiceState::Starting;
@@ -680,33 +892,37 @@ impl RedFolderService {
 
         let mut handles = Vec::new();
 
-        // 1. Daily midnight fetch loop with single retry cadence ladder
+        // 1. Daily midnight fetch loop with single retry cadence ladder (supervised)
         {
-            let this = self.clone();
-            let token = cancel_token.child_token();
-            let handle = tokio::spawn(async move {
-                let mut delay = first_delay;
-                let mut failures = 0usize;
-                loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep(delay) => {}
-                        _ = token.cancelled() => break,
-                    }
-                    let outcome = tokio::select! {
-                        res = this.refresh_outcome(false, true) => res,
-                        _ = token.cancelled() => break,
-                    };
-                    match outcome {
-                        Ok(RefreshOutcome::Fresh) => {
-                            failures = 0;
-                            delay = until_next_midnight();
+            let this1 = self.clone();
+            let token1 = cancel_token.child_token();
+            let handle = self.spawn_supervised("daily_refresh", token1.clone(), move || {
+                let this = this1.clone();
+                let token = token1.clone();
+                async move {
+                    let mut delay = first_delay;
+                    let mut failures = 0usize;
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {}
+                            _ = token.cancelled() => break,
                         }
-                        Ok(RefreshOutcome::Degraded) | Err(_) => {
-                            delay = std::time::Duration::from_secs(
-                                RETRY_LADDER[failures.min(RETRY_LADDER.len() - 1)],
-                            );
-                            failures = failures.saturating_add(1);
-                            warn!(?delay, "calendar not freshly synchronized; retrying");
+                        let outcome = tokio::select! {
+                            res = this.refresh_outcome(false, true) => res,
+                            _ = token.cancelled() => break,
+                        };
+                        match outcome {
+                            Ok(RefreshOutcome::Fresh) => {
+                                failures = 0;
+                                delay = until_next_midnight();
+                            }
+                            Ok(RefreshOutcome::Degraded) | Err(_) => {
+                                delay = std::time::Duration::from_secs(
+                                    RETRY_LADDER[failures.min(RETRY_LADDER.len() - 1)],
+                                );
+                                failures = failures.saturating_add(1);
+                                warn!(?delay, "calendar not freshly synchronized; retrying");
+                            }
                         }
                     }
                 }
@@ -714,30 +930,37 @@ impl RedFolderService {
             handles.push(handle);
         }
 
-        // 2. Transition-driven blackout evaluation loop (with watchdog and interruptible notify)
+        // 2. Transition-driven blackout evaluation loop with watchdog (supervised)
         {
-            let this = self.clone();
-            let token = cancel_token.child_token();
-            let notify = self.notify.clone();
+            let this2 = self.clone();
+            let token2 = cancel_token.child_token();
+            let handle = self.spawn_supervised("worker_evaluation", token2.clone(), move || {
+                let this = this2.clone();
+                let token = token2.clone();
+                let notify = this.notify.clone();
+                async move {
+                    loop {
+                        let next_transition = this.check_and_notify_workers().await;
+                        {
+                            let mut m = this.sync_meta.lock().await;
+                            m.last_evaluation_at = Some(Utc::now());
+                        }
+                        let check_interval = this.sync_meta.lock().await.check_interval;
 
-            let handle = tokio::spawn(async move {
-                loop {
-                    let next_transition = this.check_and_notify_workers().await;
-                    let check_interval = this.sync_meta.lock().await.check_interval;
+                        let now = Utc::now();
+                        let sleep_duration = if let Some(target) = next_transition {
+                            let dur = (target - now).to_std().unwrap_or(std::time::Duration::ZERO);
+                            dur.min(check_interval)
+                        } else {
+                            check_interval
+                        };
 
-                    let now = Utc::now();
-                    let sleep_duration = if let Some(target) = next_transition {
-                        let dur = (target - now).to_std().unwrap_or(std::time::Duration::ZERO);
-                        dur.min(check_interval)
-                    } else {
-                        check_interval
-                    };
-
-                    tokio::select! {
-                        _ = tokio::time::sleep(sleep_duration) => {}
-                        _ = notify.notified() => {}
-                        _ = token.cancelled() => {
-                            break;
+                        tokio::select! {
+                            _ = tokio::time::sleep(sleep_duration) => {}
+                            _ = notify.notified() => {}
+                            _ = token.cancelled() => {
+                                break;
+                            }
                         }
                     }
                 }
@@ -1203,5 +1426,127 @@ mod tests {
             .expect("must receive initial notification");
         assert!(notification.active);
         assert!(notification.window.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_service_health_and_gate_evaluation() {
+        let service = RedFolderService::new(None);
+
+        let initial_health = service.health().await;
+        assert_eq!(initial_health.state, ServiceState::Stopped);
+        assert!(initial_health.stale);
+        assert_eq!(initial_health.background_task_restarts, 0);
+        assert!(initial_health.data_fetched_at.is_none());
+
+        // 1. Gate on unregistered worker returns Unknown
+        let unknown_gate = service.gate("unregistered_bot").await;
+        assert!(matches!(unknown_gate, Gate::Unknown(ref msg) if msg.contains("not registered")));
+
+        // 2. Gate on registered worker while service is stopped returns Unknown
+        let cfg = RedFolderConfig::builder()
+            .weekend_curfew(false, "20:00", "21:00", "short")
+            .fail_safe_mode(crate::types::FailSafeMode::FailOpen)
+            .build();
+        service.register_worker("my_bot", cfg).await.unwrap();
+
+        let stopped_gate = service.gate("my_bot").await;
+        assert!(
+            matches!(stopped_gate, Gate::Unknown(ref msg) if msg.contains("service is not running"))
+        );
+
+        // 3. Evaluation updates last_evaluation_at timestamp
+        assert!(service.health().await.last_evaluation_at.is_none());
+        service.evaluate_and_notify().await;
+        assert!(service.health().await.last_evaluation_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_start_required_semantics() {
+        let service = RedFolderService::new(None);
+
+        // 1. Rejects when no workers are registered
+        let err1 = service.start_required().await;
+        assert!(err1.is_err());
+        assert!(err1
+            .unwrap_err()
+            .to_string()
+            .contains("no workers registered"));
+
+        // 2. Rejects when only disabled workers are registered
+        let disabled_cfg = RedFolderConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        service
+            .register_worker("disabled_bot", disabled_cfg)
+            .await
+            .unwrap();
+
+        let err2 = service.start_required().await;
+        assert!(err2.is_err());
+        assert!(err2
+            .unwrap_err()
+            .to_string()
+            .contains("all registered worker blackout configs are disabled"));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_supervised_restarts_panicking_task() {
+        let service = RedFolderService::new(None);
+        let token = CancellationToken::new();
+
+        let run_count = Arc::new(AtomicU64::new(0));
+        let rc = run_count.clone();
+
+        let handle = service.spawn_supervised("test_panicking_worker", token.clone(), move || {
+            let rc = rc.clone();
+            async move {
+                let count = rc.fetch_add(1, Ordering::SeqCst);
+                if count < 2 {
+                    panic!("simulated transient task panic");
+                }
+            }
+        });
+
+        // Allow supervisor to handle panic and restart
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        token.cancel();
+        let _ = handle.await;
+
+        let health = service.health().await;
+        assert!(
+            health.background_task_restarts >= 1,
+            "background_task_restarts must be incremented on panic"
+        );
+        assert!(
+            run_count.load(Ordering::SeqCst) >= 2,
+            "task must be restarted by supervisor"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_sequenced_monotonicity() {
+        let service = RedFolderService::new(None);
+        let mut seq_rx = service.subscribe_sequenced();
+
+        let ev1 = RedFolderEvent::CalendarUpdated {
+            total_events: 10,
+            total_windows: 2,
+        };
+        let ev2 = RedFolderEvent::CalendarSyncFailed {
+            error: "test err".into(),
+        };
+
+        service.dispatch_event(ev1.clone()).await;
+        service.dispatch_event(ev2.clone()).await;
+
+        let s1 = seq_rx.recv().await.unwrap();
+        assert_eq!(s1.seq, 0);
+        assert_eq!(s1.event, ev1);
+
+        let s2 = seq_rx.recv().await.unwrap();
+        assert_eq!(s2.seq, 1);
+        assert_eq!(s2.event, ev2);
+        assert!(s2.at >= s1.at);
     }
 }
